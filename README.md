@@ -51,6 +51,13 @@ cross-tool banks); this bundle owns three things it does not provide:
    choice with its reason and the per-tier counts (`status --json` carries the
    same as data). `budgetPolicy: off` keeps the single hard ceiling.
 
+   Duplicate governance is separate from the budget: with `repeatPolicy: skip`
+   (default `inject`), a recall that mostly repeats the previous turn's text
+   (line overlap ≥ `repeatThreshold`, default 0.9) is not injected again at all.
+   The earlier message is still in the conversation, so the content is not lost;
+   `status` reports the skipped turns, the tokens saved and the last repeat
+   ratio, and the recall line shows the turn as `last ~N → ~0 tok`.
+
 3. **A diagnosis that does not lie.** With no token configured, the integration
    fails silently on every turn (`pages_failed`, `inject_unchanged`, `401` in
    its own journal). `/hindsight` reports the endpoint, token source, bank and
@@ -167,6 +174,8 @@ survives upgrades):
 | `tokenBudgetMode` | `fast` | `fast` estimate or `accurate` tokenizer (optional `js-tiktoken`) |
 | `budgetPolicy` | `adaptive` in the shipped row (`off` default) | `adaptive` picks a per-turn ceiling from `budgetTiers`; `off` uses the cap |
 | `budgetTiers` | `{ light: 800, normal: 1600, deep: 3000 }` | Tier ceilings, each ≤ `maxInjectTokens`; must be ordered light ≤ normal ≤ deep |
+| `repeatPolicy` | `skip` in the shipped row (`inject` default) | `skip` drops a recall that repeats the previous turn; `inject` always injects |
+| `repeatThreshold` | `0.9` | Line-overlap ratio at which a recall counts as a repeat (0.5..1) |
 | `sourceKind` | `plugin:hindsight` | Recall message kind to cap |
 | `allowAgentWrites` | `false` | Expose tool writes; without it the tool is read-only |
 

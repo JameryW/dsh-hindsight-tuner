@@ -181,6 +181,14 @@ assert.deepEqual(
   validateSettings({ autoInject: 'pages', injectTimeoutMs: 7000, observationScopes: 'shared', recallMaxTokens: 2000, maxInjectTokens: 3000, sourceKind: 'plugin:x', tokenBudgetMode: 'fast', budgetPolicy: 'sometimes' }).issues.map((issue) => issue.field),
   ['budgetPolicy'],
 )
+assert.deepEqual(
+  validateSettings({ autoInject: 'pages', injectTimeoutMs: 7000, observationScopes: 'shared', recallMaxTokens: 2000, maxInjectTokens: 3000, sourceKind: 'plugin:x', tokenBudgetMode: 'fast', repeatPolicy: 'sometimes' }).issues.map((issue) => issue.field),
+  ['repeatPolicy'],
+)
+assert.deepEqual(
+  validateSettings({ autoInject: 'pages', injectTimeoutMs: 7000, observationScopes: 'shared', recallMaxTokens: 2000, maxInjectTokens: 3000, sourceKind: 'plugin:x', tokenBudgetMode: 'fast', repeatPolicy: 'skip', repeatThreshold: 1.2 }).issues.map((issue) => issue.field),
+  ['repeatThreshold'],
+)
 
 // --- shared config tuning ---------------------------------------------------
 const preset = [
@@ -565,6 +573,31 @@ assert.ok(estimateTokens(injectedText(tightTurn)) <= 150, 'the configured cap st
 for (const dispose of adaptive.disposers) dispose()
 for (const dispose of tight.disposers) dispose()
 
+// --- duplicate governance ---------------------------------------------------
+// A recall the model already received last turn is not re-sent; the earlier
+// message is still in the conversation, so only the duplicate is removed.
+const skipping = makeHarness()
+apply(skipping.ctx, { autoTune: false, maxInjectTokens: 600, repeatPolicy: 'skip', repeatThreshold: 0.9 })
+const skipExec = { agent: { session: { header: { id: 'skip', cwd: process.cwd() } } } }
+const skipTurn = (id, text) => waterfall(skipping, 'agent/pre-step', { agent: { session: { header: { id: 'skip' } } } }, async () => ({
+  kind: 'enter',
+  messages: [human, adaptiveRecall(id, text)],
+}))
+const firstSkip = await skipTurn('first', big)
+assert.equal(firstSkip.messages.length, 2, 'the first recall is injected')
+const duplicateSkip = await skipTurn('duplicate', big)
+assert.equal(duplicateSkip.messages.length, 1, 'an identical recall is not injected twice')
+assert.equal(duplicateSkip.messages.some((message) => message.source?.kind === 'plugin:hindsight'), false)
+const skipStatus = JSON.parse(await skipping.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status', json: true }, skipExec))
+assert.equal(skipStatus.budget.repeatPolicy, 'skip')
+assert.equal(skipStatus.budget.repeatSkips, 1)
+assert.ok(skipStatus.budget.savedTokens > 0, 'the skipped payload is accounted as saved')
+assert.equal(skipStatus.budget.session.lastInjected, 0, 'a skipped turn injected nothing')
+assert.match(await skipping.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status' }, skipExec), /repeat skip ≥90% · skipped 1 \(~\d+ tok saved\)/)
+const changedSkip = await skipTurn('changed', long.toUpperCase().repeat(3))
+assert.equal(changedSkip.messages.length, 2, 'a different recall is still injected')
+for (const dispose of skipping.disposers) dispose()
+
 // A second memory plugin injecting on the same turn is visible and flagged.
 const mnemonMessage = {
   id: 'mnemon-1',
@@ -745,7 +778,7 @@ try {
 
 // --- package contract -------------------------------------------------------
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
-assert.equal(pkg.version, '0.8.0', 'version matches this release')
+assert.equal(pkg.version, '0.9.0', 'version matches this release')
 assert.ok(pkg.engines?.node?.includes('>=22'), 'declares a Node floor the tests can rely on')
 assert.equal(pkg.license, 'MIT')
 assert.ok(pkg.files.includes('docs'), 'docs ship with the bundle')

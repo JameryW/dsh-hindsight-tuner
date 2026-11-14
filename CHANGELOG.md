@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.0
+
+- Duplicate governance (`repeatPolicy: skip`, `repeatThreshold`, default 0.9):
+  when the recall for a turn largely repeats the text injected on the previous
+  turn, the duplicate message is removed instead of re-sent. The previous
+  message is still in the conversation, so no context is lost — only the
+  duplicate tokens are. The check is line-overlap based (the same signal the
+  adaptive tiers use), and `status` reports the threshold, how many turns were
+  skipped, the tokens saved and the last repeat ratio. `repeatPolicy: inject`
+  keeps the upstream behaviour.
+- A skipped turn is accounted honestly: the recall line shows `last ~N → ~0 tok`
+  and the budget line says what was saved, so the skip is visible rather than
+  looking like a recall that silently vanished.
+
 ## 0.8.0
 
 - Adaptive budget tiers (`budgetPolicy: adaptive`, `budgetTiers`): a turn's

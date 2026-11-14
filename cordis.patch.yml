@@ -27,4 +27,8 @@
           light: 800
           normal: 1600
           deep: 3000
+        # skip: a recall that mostly repeats what the model already received is
+        # not injected again (the earlier message is still in context).
+        repeatPolicy: skip
+        repeatThreshold: 0.9
         allowAgentWrites: false

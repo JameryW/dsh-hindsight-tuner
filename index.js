@@ -91,6 +91,13 @@ function normalizeConfig(input) {
       normal: number(raw.budgetTiers?.normal, 1600),
       deep: number(raw.budgetTiers?.deep, 3000),
     },
+    // inject: every turn gets the recall again (the integration's behaviour).
+    // skip: a recall that mostly repeats what the model already received last
+    // turn is dropped instead of re-sent; the earlier message is still in the
+    // conversation, so the content is not lost, only the duplicate.
+    repeatPolicy: text(raw.repeatPolicy, 'inject').toLowerCase() === 'skip' ? 'skip' : 'inject',
+    repeatThreshold: Math.min(1, Math.max(0.5, number(raw.repeatThreshold, 0.9))),
+
     // fast: dependency-free estimate. accurate: the model tokenizer when one is
     // installed, with a labelled fallback when it is not.
     tokenBudgetMode: text(raw.tokenBudgetMode, 'fast').toLowerCase(),
@@ -283,55 +290,71 @@ function createGovernor(settings, stats, meter) {
     const combined = candidates.map((candidate) => candidate.text).join('\n')
     const cap = settings.maxInjectTokens
     const session = sessionOf(sessionId)
+    const repeatRatio = session.turns > 0 && session.lastRaw
+      ? (combined === session.lastRaw ? 1 : overlapRatio(session.lastRaw, combined))
+      : 0
+    stats.lastRepeat = repeatRatio
+    // The previous recall is still in the conversation, so re-sending it costs
+    // tokens without adding context. This is deliberately separate from the
+    // budget: skipping is about duplication, not about the ceiling.
+    const skipRepeat = settings.repeatPolicy === 'skip' && session.turns > 0 && repeatRatio >= settings.repeatThreshold
+
     let budget = cap
     let tier = null
-
-    if (cap && settings.budgetPolicy === 'adaptive') {
-      tier = chooseTier(settings.budgetTiers, session, combined, total)
-      budget = Math.min(cap, tier.ceiling)
-      session.tier = tier.name
-      stats.tiers[tier.name] = (stats.tiers[tier.name] ?? 0) + 1
-      stats.lastTier = { ...tier, budget, requested: total }
-      record({ event: 'tier_selected', session: sessionId, tier: tier.name, ceiling: tier.ceiling, budget, requested: total, reason: tier.reason })
-    }
-
     let after = total
     let removed = new Set()
     let dropped = 0
     let messages = decision.messages
 
-    if (budget && total > budget) {
-      const allocations = allocateBudget(candidates.map((candidate) => candidate.tokens), budget)
-      messages = decision.messages.slice()
+    if (skipRepeat) {
+      removed = new Set(candidates.map((candidate) => candidate.index))
       after = 0
-      candidates.forEach((candidate, position) => {
-        const allotted = allocations[position]
-        if (candidate.tokens <= allotted) {
-          after += candidate.tokens
-          return
-        }
-        const marker = `\n\n…[dsh-hindsight-tuner: cut from ~${candidate.tokens} to ~${allotted} tokens. Ask Hindsight for the full recall explicitly, or raise maxInjectTokens.]`
-        const trimmed = allotted > 0 ? trimToBudget(candidate.text, allotted, marker, meter.count) : ''
-        if (!trimmed) {
-          removed.add(candidate.index)
-          dropped += 1
-          return
-        }
-        const otherBlocks = Array.isArray(candidate.message.content)
-          ? candidate.message.content.filter((block) => block?.type !== 'text')
-          : []
-        messages[candidate.index] = { ...candidate.message, content: [{ type: 'text', text: trimmed }, ...otherBlocks] }
-        after += meter.count(trimmed)
-      })
-      stats.capped += 1
-      stats.dropped += dropped
-      stats.last = { before: total, after, at: new Date().toISOString() }
-      record({ event: 'inject_capped', session: sessionId, before: total, after, dropped, mode: meter.mode })
+      stats.repeatSkips += 1
+      stats.savedTokens += total
+      record({ event: 'inject_skipped', session: sessionId, reason: 'repeat', ratio: repeatRatio, saved: total })
+    } else {
+      if (cap && settings.budgetPolicy === 'adaptive') {
+        tier = chooseTier(settings.budgetTiers, session, combined, total)
+        budget = Math.min(cap, tier.ceiling)
+        session.tier = tier.name
+        stats.tiers[tier.name] = (stats.tiers[tier.name] ?? 0) + 1
+        stats.lastTier = { ...tier, budget, requested: total }
+        record({ event: 'tier_selected', session: sessionId, tier: tier.name, ceiling: tier.ceiling, budget, requested: total, reason: tier.reason })
+      }
+
+      if (budget && total > budget) {
+        const allocations = allocateBudget(candidates.map((candidate) => candidate.tokens), budget)
+        messages = decision.messages.slice()
+        after = 0
+        candidates.forEach((candidate, position) => {
+          const allotted = allocations[position]
+          if (candidate.tokens <= allotted) {
+            after += candidate.tokens
+            return
+          }
+          const marker = `\n\n…[dsh-hindsight-tuner: cut from ~${candidate.tokens} to ~${allotted} tokens. Ask Hindsight for the full recall explicitly, or raise maxInjectTokens.]`
+          const trimmed = allotted > 0 ? trimToBudget(candidate.text, allotted, marker, meter.count) : ''
+          if (!trimmed) {
+            removed.add(candidate.index)
+            dropped += 1
+            return
+          }
+          const otherBlocks = Array.isArray(candidate.message.content)
+            ? candidate.message.content.filter((block) => block?.type !== 'text')
+            : []
+          messages[candidate.index] = { ...candidate.message, content: [{ type: 'text', text: trimmed }, ...otherBlocks] }
+          after += meter.count(trimmed)
+        })
+        stats.capped += 1
+        stats.dropped += dropped
+        stats.last = { before: total, after, at: new Date().toISOString() }
+        record({ event: 'inject_capped', session: sessionId, before: total, after, dropped, mode: meter.mode })
+      }
     }
 
     // Accounting records both what Hindsight wanted and what actually reached
-    // the model, so a capped turn never looks like an uncapped one.
-    const cappedThisTurn = Boolean(budget && total > budget)
+    // the model, so a capped or skipped turn never looks like an uncapped one.
+    const cappedThisTurn = Boolean(!skipRepeat && budget && total > budget)
     session.turns += 1
     session.last = total
     session.lastInjected = after
@@ -339,13 +362,13 @@ function createGovernor(settings, stats, meter) {
     session.tokens += total
     session.injected = (session.injected ?? 0) + after
     session.lastCapped = cappedThisTurn
-    if (settings.budgetPolicy === 'adaptive') session.lastRaw = combined.slice(0, 20_000)
+    if (settings.budgetPolicy === 'adaptive' || settings.repeatPolicy === 'skip') session.lastRaw = combined.slice(0, 20_000)
     stats.turns += 1
     stats.lastTurnTokens = total
     stats.maxTurnTokens = Math.max(stats.maxTurnTokens, total)
     stats.seen += candidates.length
 
-    if (cappedThisTurn) {
+    if (skipRepeat || cappedThisTurn) {
       return { ...decision, messages: messages.filter((_, index) => !removed.has(index)) }
     }
     return decision
@@ -568,6 +591,11 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
       tiers: settings.budgetTiers,
       tier: stats.lastTier,
       tierCounts: { ...stats.tiers },
+      repeatPolicy: settings.repeatPolicy,
+      repeatThreshold: settings.repeatThreshold,
+      repeatSkips: stats.repeatSkips,
+      savedTokens: stats.savedTokens,
+      lastRepeat: stats.lastRepeat,
       turns: stats.turns,
       seen: stats.seen,
       lastTurnTokens: stats.lastTurnTokens,
@@ -669,7 +697,7 @@ function formatStatus(status) {
     recall && recall.turns > 0
       ? `  recall   ${recall.turns} turns · last ~${recall.last}${recall.lastInjected !== recall.last ? ` → ~${recall.lastInjected}` : ''} tok · wanted max ~${recall.max} tok · avg ~${Math.round(recall.tokens / recall.turns)} tok`
       : '  recall   no Hindsight recall observed in this session yet',
-    `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · dropped ${status.budget.dropped} · ${formatTier(status.budget)}`,
+    `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · dropped ${status.budget.dropped} · ${formatTier(status.budget)} · ${formatRepeat(status.budget)}`,
     `  tokens   ${formatTokens(status.tokens)}`,
   ]
 
@@ -733,6 +761,16 @@ function formatTier(budget) {
   const used = Number.isFinite(last.budget) ? last.budget : last.ceiling
   const wanted = Number.isFinite(last.requested) ? `; ~${last.requested} wanted` : ''
   return `adaptive ${table} · last ${last.name} ${used} (${last.reason}${wanted})`
+}
+
+/** Duplicate governance: what was suppressed, and how much it saved. */
+function formatRepeat(budget) {
+  if (budget.repeatPolicy !== 'skip') return 'repeat inject'
+  const threshold = Math.round((budget.repeatThreshold ?? 0.9) * 100)
+  const last = Number.isFinite(budget.lastRepeat) && budget.lastRepeat > 0
+    ? ` · last ${Math.round(budget.lastRepeat * 100)}% repeat`
+    : ''
+  return `repeat skip ≥${threshold}% · skipped ${budget.repeatSkips} (~${budget.savedTokens} tok saved)${last}`
 }
 
 function formatTune(result) {
@@ -801,6 +839,9 @@ export function apply(ctx, rawConfig) {
     sources: {},
     tiers: { light: 0, normal: 0, deep: 0 },
     lastTier: null,
+    repeatSkips: 0,
+    savedTokens: 0,
+    lastRepeat: 0,
     ratios: [],
     tokenizer: { mode: settings.tokenBudgetMode, name: null, ready: settings.tokenBudgetMode === 'fast' },
   }
