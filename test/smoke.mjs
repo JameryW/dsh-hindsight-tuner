@@ -155,11 +155,12 @@ assert.deepEqual(recoveredRevert.reverted.map((entry) => entry.path), ['autoInje
 assert.equal(readConfigFile().config.autoInject, undefined)
 
 // --- effective config resolution -------------------------------------------
+const mapRoot = join(scratch, 'shared-repo')
 writeFileSync(process.env.HINDSIGHT_CONFIG, JSON.stringify({
   autoInject: 'pages',
   observationScopes: 'shared',
   bankIdTemplate: 'coding-agent::{gitProject}',
-  mapPathToBank: { 'C:\\work\\shared-repo': 'coding-agent::shared' },
+  mapPathToBank: { [mapRoot]: 'coding-agent::shared' },
   harnesses: { dsh: { autoInject: 'recall', injectTimeoutMs: 4000 } },
 }, null, 2))
 
@@ -177,7 +178,7 @@ assert.equal(envLayers.envKeys.length, 2)
 const baseOnly = effectiveConfig({ autoInject: 'pages', harnesses: { dsh: { autoInject: 'recall' } } }, { env: { HINDSIGHT_AUTO_INJECT: 'reflect' } })
 assert.equal(baseOnly.config.autoInject, 'recall', 'cumulative precedence')
 
-const mapped = bankResolution(readConfigFile().config, 'repo', 'C:\\work\\shared-repo\\sub')
+const mapped = bankResolution(readConfigFile().config, 'repo', join(mapRoot, 'sub'))
 assert.equal(mapped.bank, 'coding-agent::shared')
 assert.equal(mapped.source, 'mapPathToBank')
 const staticBank = bankResolution({ bankId: 'coding-agent::fixed' }, 'repo', '/tmp/repo')
