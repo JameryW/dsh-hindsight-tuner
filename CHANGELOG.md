@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.11.0
+
+- Trust governance (`verifyReminder`, on in the shipped row): a recall is
+  evidence, not authority. When enabled, the injected recall opens with one
+  short line asking the model to verify remembered claims against the current
+  code and tests before acting. The reminder is part of the measured payload, so
+  it is paid for out of the same per-turn ceiling rather than added on top; a
+  `trust` line in `/hindsight` reports whether it is active, and
+  `budget.verifyReminder` carries the same as data in `status --json`.
+- The activity cache key now includes a hash of the journal tail as well as
+  size and nanosecond mtime. A test or another writer replacing the journal
+  within one clock tick used to reuse a stale parse (caught by the stale-process
+  test under a fast Windows run); the cache now follows content changes.
+
 ## 0.10.0
 
 - The plugin's own journal is buffered: a turn can emit several events, and one

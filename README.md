@@ -105,6 +105,15 @@ cross-tool banks); this bundle owns three things it does not provide:
    a flag the model fills in is not a permission boundary. The user-typed
    `/hindsight tune` / `/hindsight revert` command is the intended write path.
 
+6. **A recall is evidence, not authority.** Pages are written by an earlier
+   session; by the time they are injected the code they describe may already
+   have changed. With `verifyReminder: true` (on in the shipped row), the
+   injected recall opens with one short line telling the model to check the
+   current code and tests before acting on remembered claims. The reminder is
+   part of the measured payload, so it is counted against the same ceiling as
+   the recall itself — turning it on cannot silently overrun the budget. The
+   `trust` line in `/hindsight` reports whether it is active.
+
 The plugin's own journal (`<DSH_HOME>/storages/dsh-hindsight-tuner/tuner.jsonl`)
 is buffered rather than written on every event: entries are flushed in one
 append after 250 ms, immediately when 500 are pending, on dispose, and on a
@@ -183,6 +192,7 @@ survives upgrades):
 | `budgetTiers` | `{ light: 800, normal: 1600, deep: 3000 }` | Tier ceilings, each ≤ `maxInjectTokens`; must be ordered light ≤ normal ≤ deep |
 | `repeatPolicy` | `skip` in the shipped row (`inject` default) | `skip` drops a recall that repeats the previous turn; `inject` always injects |
 | `repeatThreshold` | `0.9` | Line-overlap ratio at which a recall counts as a repeat (0.5..1) |
+| `verifyReminder` | `true` in the shipped row (`false` default) | Prefix the recall with a one-line "verify against current code/tests" reminder, counted in the cap |
 | `sourceKind` | `plugin:hindsight` | Recall message kind to cap |
 | `allowAgentWrites` | `false` | Expose tool writes; without it the tool is read-only |
 

@@ -31,4 +31,7 @@
         # not injected again (the earlier message is still in context).
         repeatPolicy: skip
         repeatThreshold: 0.9
+        # A recall is evidence, not authority: open it with a one-line reminder
+        # to verify against the current code/tests. Counted in the same ceiling.
+        verifyReminder: true
         allowAgentWrites: false

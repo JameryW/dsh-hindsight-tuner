@@ -197,6 +197,11 @@ assert.deepEqual(
   validateSettings({ autoInject: 'pages', injectTimeoutMs: 7000, observationScopes: 'shared', recallMaxTokens: 2000, maxInjectTokens: 3000, sourceKind: 'plugin:x', tokenBudgetMode: 'fast', repeatPolicy: 'skip', repeatThreshold: 1.2 }).issues.map((issue) => issue.field),
   ['repeatThreshold'],
 )
+assert.deepEqual(
+  validateSettings({ autoInject: 'pages', injectTimeoutMs: 7000, observationScopes: 'shared', recallMaxTokens: 2000, maxInjectTokens: 3000, sourceKind: 'plugin:x', tokenBudgetMode: 'fast', verifyReminder: 'yes' }).issues.map((issue) => issue.field),
+  ['verifyReminder'],
+  'the trust reminder is a boolean, not a stringly-typed setting',
+)
 
 // --- shared config tuning ---------------------------------------------------
 const preset = [
@@ -607,6 +612,26 @@ const changedSkip = await skipTurn('changed', long.toUpperCase().repeat(3))
 assert.equal(changedSkip.messages.length, 2, 'a different recall is still injected')
 for (const dispose of skipping.disposers) dispose()
 
+// --- trust reminder ---------------------------------------------------------
+// The recall is evidence, not authority: with the reminder on, the injected text
+// opens by telling the model to check current code and tests, and the reminder
+// itself is paid for out of the same ceiling.
+const trusting = makeHarness()
+apply(trusting.ctx, { autoTune: false, maxInjectTokens: 500, verifyReminder: true })
+const trustExec = { agent: { session: { header: { id: 'trust', cwd: process.cwd() } } } }
+const trustTurn = await waterfall(trusting, 'agent/pre-step', { agent: { session: { header: { id: 'trust' } } } }, async () => ({
+  kind: 'enter',
+  messages: [human, adaptiveRecall('trust', big)],
+}))
+const trustedText = injectedText(trustTurn)
+assert.ok(trustedText.startsWith('[verify:'), 'the recall opens with the verification reminder')
+assert.ok(estimateTokens(trustedText) <= 500, 'the reminder is counted in the measured budget, not added on top')
+const trustStatus = JSON.parse(await trusting.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status', json: true }, trustExec))
+assert.equal(trustStatus.budget.verifyReminder, true)
+assert.match(await trusting.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status' }, trustExec), /trust\s+the recall opens with a verify-before-acting reminder/)
+assert.equal(JSON.parse(await trusting.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status', json: true }, { agent: { session: { header: { id: 'other' } } } })).budget.verifyReminder, true)
+for (const dispose of trusting.disposers) dispose()
+
 // A second memory plugin injecting on the same turn is visible and flagged.
 const mnemonMessage = {
   id: 'mnemon-1',
@@ -788,7 +813,7 @@ try {
 
 // --- package contract -------------------------------------------------------
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
-assert.equal(pkg.version, '0.10.0', 'version matches this release')
+assert.equal(pkg.version, '0.11.0', 'version matches this release')
 assert.ok(pkg.engines?.node?.includes('>=22'), 'declares a Node floor the tests can rely on')
 assert.equal(pkg.license, 'MIT')
 assert.ok(pkg.files.includes('docs'), 'docs ship with the bundle')

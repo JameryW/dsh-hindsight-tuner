@@ -97,6 +97,10 @@ function normalizeConfig(input) {
     // conversation, so the content is not lost, only the duplicate.
     repeatPolicy: text(raw.repeatPolicy, 'inject').toLowerCase() === 'skip' ? 'skip' : 'inject',
     repeatThreshold: Math.min(1, Math.max(0.5, number(raw.repeatThreshold, 0.9))),
+    // A recall is evidence, not authority: the pages were written by an earlier
+    // session and may describe code that has since changed. With this on, the
+    // injected text opens with a short reminder to verify before acting.
+    verifyReminder: raw.verifyReminder === true,
 
     // fast: dependency-free estimate. accurate: the model tokenizer when one is
     // installed, with a labelled fallback when it is not.
@@ -135,6 +139,14 @@ function textOf(message) {
  * reported instead of being silently trusted.
  */
 const TESTED_INTEGRATION = { line: '0.8', version: '0.8.7' }
+
+/**
+ * Trust governance: pages are written by an earlier session, so by the time
+ * they are recalled the code they describe may already have changed. The
+ * reminder is deliberately one short line and is measured like any other token,
+ * so turning it on cannot silently break the ceiling.
+ */
+const VERIFY_REMINDER = '[verify: memory may be stale — check the current code and tests before acting]\n\n'
 
 let integrationMemo = null
 
@@ -286,6 +298,23 @@ function createGovernor(settings, stats, meter) {
     })
     if (candidates.length === 0) return decision
 
+    // A recall is evidence, not authority: it was written by an earlier session
+    // and may describe code that has since changed. The reminder is part of the
+    // injected text and therefore part of the measured budget, never a freebie.
+    const remind = Boolean(settings.verifyReminder && candidates.length > 0)
+    let messages = decision.messages
+    if (remind) {
+      const first = candidates[0]
+      first.text = `${VERIFY_REMINDER}${first.text}`
+      first.tokens = meter.measure(first.text)
+      const otherBlocks = Array.isArray(first.message.content)
+        ? first.message.content.filter((block) => block?.type !== 'text')
+        : []
+      first.message = { ...first.message, content: [{ type: 'text', text: first.text }, ...otherBlocks] }
+      messages = decision.messages.slice()
+      messages[first.index] = first.message
+    }
+
     const total = candidates.reduce((sum, candidate) => sum + candidate.tokens, 0)
     const combined = candidates.map((candidate) => candidate.text).join('\n')
     const cap = settings.maxInjectTokens
@@ -304,7 +333,6 @@ function createGovernor(settings, stats, meter) {
     let after = total
     let removed = new Set()
     let dropped = 0
-    let messages = decision.messages
 
     if (skipRepeat) {
       removed = new Set(candidates.map((candidate) => candidate.index))
@@ -369,7 +397,7 @@ function createGovernor(settings, stats, meter) {
     stats.maxTurnTokens = Math.max(stats.maxTurnTokens, total)
     stats.seen += candidates.length
 
-    if (skipRepeat || cappedThisTurn) {
+    if (skipRepeat || cappedThisTurn || remind) {
       return { ...decision, messages: messages.filter((_, index) => !removed.has(index)) }
     }
     return decision
@@ -594,6 +622,7 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
       tierCounts: { ...stats.tiers },
       repeatPolicy: settings.repeatPolicy,
       repeatThreshold: settings.repeatThreshold,
+      verifyReminder: settings.verifyReminder,
       repeatSkips: stats.repeatSkips,
       savedTokens: stats.savedTokens,
       trimmedTokens: stats.trimmedTokens,
@@ -700,6 +729,7 @@ function formatStatus(status) {
       ? `  recall   ${recall.turns} turns · last ~${recall.last}${recall.lastInjected !== recall.last ? ` → ~${recall.lastInjected}` : ''} tok · wanted max ~${recall.max} tok · avg ~${Math.round(recall.tokens / recall.turns)} tok`
       : '  recall   no Hindsight recall observed in this session yet',
     `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · dropped ${status.budget.dropped} · ${formatTier(status.budget)} · ${formatRepeat(status.budget)}${formatSavings(status.budget)}`,
+    `  trust    ${status.budget.verifyReminder ? 'the recall opens with a verify-before-acting reminder (counted in the cap)' : 'injected as-is (verifyReminder off)'}`,
     `  tokens   ${formatTokens(status.tokens)}`,
   ]
 
