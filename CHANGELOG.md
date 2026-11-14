@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.2
+
+- Diagnosis: effective config now also applies the integration's per-directory
+  layers — a matching `paths.<directory>` section and the `banks.<id>` section,
+  including a `banks.<id>.bank` rename. `layers` names every override.
+- `optInOnly` is evaluated for the session directory (a `mapPathToBank` hit
+  counts as opted in), so a lane that will never inject is reported as disabled
+  instead of healthy.
+- Recall accounting shows what Hindsight wanted and what reached the model
+  (`last ~22611 → ~593 tok`) instead of a raw size that reads like a leak.
+
 ## 0.3.1
 
 - Correctness: the budget now actually applies. The tuner registers as the
@@ -18,9 +29,8 @@
   touching the file. A crash between journal and config is recovered on the
   next change or revert.
 - Diagnosis: `effective` shows the config the integration actually reads
-  (environment < file < `harnesses.dsh`), `layers` shows overrides, `bank`
-  names the routing rule (`mapPathToBank` / `bankId` / template), and
-  `pages`/`recall` are reported as two separate ceilings.
+  (environment < file < `harnesses.dsh`), and `pages`/`recall` are reported as
+  two separate ceilings.
 - `stack` now only flags plugins that inject in the *same* turn; per-session
   recall counts are tracked separately instead of one instance-wide total.
 - Journal path honours `HINDSIGHT_DIAG_FILE`.

@@ -34,7 +34,7 @@ for (const name of ['HINDSIGHT_AUTO_INJECT', 'HINDSIGHT_API_URL', 'HINDSIGHT_API
 
 const { estimateTokens, truncateToBudget, allocateBudget } = await import('../lib/tokens.js')
 const { applyTuning, revertTuning, readConfigFile, getPath } = await import('../lib/config-file.js')
-const { bankResolution, diagPath, effectiveConfig } = await import('../lib/diagnostics.js')
+const { bankResolution, diagPath, effectiveConfig, optedOut } = await import('../lib/diagnostics.js')
 
 // --- token estimation and truncation ---------------------------------------
 assert.equal(estimateTokens(''), 0)
@@ -187,6 +187,26 @@ assert.equal(staticBank.source, 'bankId')
 const templated = bankResolution({}, 'repo', '/tmp/repo')
 assert.equal(templated.bank, 'coding-agent::repo')
 assert.equal(templated.source, 'bankIdTemplate')
+
+// `paths`/`banks` sections are the integration's per-directory override, and a
+// banks section may rename the bank itself.
+const sectionConfig = {
+  autoInject: 'pages',
+  paths: { [mapRoot]: { autoInject: 'recall', pageSearchLimit: 4 } },
+  banks: { 'coding-agent::repo': { observationScopes: 'per_source', bank: 'coding-agent::forced' } },
+}
+const sectioned = effectiveConfig(sectionConfig, { env: {}, cwd: join(mapRoot, 'sub'), bank: 'coding-agent::repo' })
+assert.equal(sectioned.config.autoInject, 'recall', 'paths section wins over the base')
+assert.equal(sectioned.config.pageSearchLimit, 4)
+assert.equal(sectioned.config.observationScopes, 'per_source', 'banks section applies too')
+assert.deepEqual(sectioned.sections, [`paths.${mapRoot}`, 'banks.coding-agent::repo'])
+const renamed = bankResolution(sectionConfig, 'repo', join(scratch, 'elsewhere'))
+assert.equal(renamed.bank, 'coding-agent::forced', 'banks.<id>.bank renames the bank')
+assert.equal(renamed.source, 'bankSection')
+assert.equal(renamed.base, 'coding-agent::repo')
+assert.equal(optedOut({ optInOnly: true, optInPaths: [join(scratch, 'elsewhere')] }, mapRoot), true, 'opt-in excludes other directories')
+assert.equal(optedOut({ optInOnly: true, optInPaths: [mapRoot] }, join(mapRoot, 'sub')), false)
+assert.equal(optedOut({ optInOnly: true, mapPathToBank: { [mapRoot]: 'coding-agent::shared' } }, mapRoot), false, 'a mapped path counts as opted in')
 
 // --- plugin surface: hooks, tool, command ----------------------------------
 writeFileSync(process.env.HINDSIGHT_CONFIG, JSON.stringify({
@@ -352,7 +372,7 @@ assert.match(status, /Hindsight memory —/)
 assert.match(status, /127\.0\.0\.1:9/)
 assert.match(status, /unreachable/)
 assert.match(status, /drift\s+observationScopes shared ≠ per_source/)
-assert.match(status, /layers\s+overrides autoInject=recall/, 'harness override is surfaced')
+assert.match(status, /layers\s+.*overrides autoInject=recall/, 'harness override is surfaced')
 assert.ok(status.includes('dsh-mnemon 0.5.45'), 'lists a stacked memory bundle')
 assert.ok(status.includes('dsh-context 0.84.1 (disabled)'), 'marks a declared but inactive bundle')
 assert.match(status, /plugin:hindsight \d+ turns/, 'counts Hindsight turns')

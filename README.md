@@ -125,9 +125,13 @@ survives upgrades):
 - Behavioural keys are read by the integration per workspace, so a change
   applies to new sessions; `apiToken` is re-read after a rejected request.
 - The effective config is the one the integration reads: environment
-  (`HINDSIGHT_*`) first, then the file, then `harnesses.dsh`. `status` shows
-  `layers` whenever those layers change a value the preset would otherwise
-  report as correct.
+  (`HINDSIGHT_*`) first, then the file, then `harnesses.dsh`, then a matching
+  `paths.<directory>` section, then the `banks.<id>` section (which may also
+  rename the bank). `status` shows `layers` whenever one of those layers changes
+  a value the preset would otherwise report as correct.
+- `optInOnly` / `optInPaths` is evaluated against the session directory (a
+  `mapPathToBank` hit counts as opted in), so a directory that will never inject
+  is reported as disabled instead of healthy.
 - The journal path honours `HINDSIGHT_DIAG_FILE`, the same override the
   integration uses; otherwise it reads `~/.hindsight/coding-agents-logs/diag.jsonl`.
 - The outermost registration is re-applied on the first non-subagent session

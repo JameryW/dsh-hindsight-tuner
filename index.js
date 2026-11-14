@@ -38,6 +38,7 @@ import {
   effectiveConfig,
   effectiveServer,
   installedBundles,
+  optedOut,
   probeServer,
   projectName,
   summarizeActivity,
@@ -191,50 +192,59 @@ function createGovernor(settings, stats) {
     if (candidates.length === 0) return decision
 
     const total = candidates.reduce((sum, candidate) => sum + candidate.tokens, 0)
+    const cap = settings.maxInjectTokens
+    let after = total
+    let removed = new Set()
+    let dropped = 0
+    let messages = decision.messages
+
+    if (cap && total > cap) {
+      const allocations = allocateBudget(candidates.map((candidate) => candidate.tokens), cap)
+      messages = decision.messages.slice()
+      after = 0
+      candidates.forEach((candidate, position) => {
+        const allotted = allocations[position]
+        if (candidate.tokens <= allotted) {
+          after += candidate.tokens
+          return
+        }
+        const marker = `\n\n…[dsh-hindsight-tuner: cut from ~${candidate.tokens} to ~${allotted} tokens. Ask Hindsight for the full recall explicitly, or raise maxInjectTokens.]`
+        const trimmed = allotted > 0 ? truncateToBudget(candidate.text, allotted, marker) : ''
+        if (!trimmed) {
+          removed.add(candidate.index)
+          dropped += 1
+          return
+        }
+        const otherBlocks = Array.isArray(candidate.message.content)
+          ? candidate.message.content.filter((block) => block?.type !== 'text')
+          : []
+        messages[candidate.index] = { ...candidate.message, content: [{ type: 'text', text: trimmed }, ...otherBlocks] }
+        after += estimateTokens(trimmed)
+      })
+      stats.capped += 1
+      stats.dropped += dropped
+      stats.last = { before: total, after, at: new Date().toISOString() }
+      record({ event: 'inject_capped', session: sessionId, before: total, after, dropped })
+    }
+
+    // Accounting records both what Hindsight wanted and what actually reached
+    // the model, so a capped turn never looks like an uncapped one.
     const session = sessionOf(sessionId)
     session.turns += 1
     session.last = total
+    session.lastInjected = after
     session.max = Math.max(session.max, total)
     session.tokens += total
+    session.injected = (session.injected ?? 0) + after
     stats.turns += 1
     stats.lastTurnTokens = total
     stats.maxTurnTokens = Math.max(stats.maxTurnTokens, total)
     stats.seen += candidates.length
 
-    const cap = settings.maxInjectTokens
-    if (!cap || total <= cap) return decision
-
-    const allocations = allocateBudget(candidates.map((candidate) => candidate.tokens), cap)
-    const messages = decision.messages.slice()
-    const removed = new Set()
-    let after = 0
-    let dropped = 0
-
-    candidates.forEach((candidate, position) => {
-      const allotted = allocations[position]
-      if (candidate.tokens <= allotted) {
-        after += candidate.tokens
-        return
-      }
-      const marker = `\n\n…[dsh-hindsight-tuner: cut from ~${candidate.tokens} to ~${allotted} tokens. Ask Hindsight for the full recall explicitly, or raise maxInjectTokens.]`
-      const trimmed = allotted > 0 ? truncateToBudget(candidate.text, allotted, marker) : ''
-      if (!trimmed) {
-        removed.add(candidate.index)
-        dropped += 1
-        return
-      }
-      const otherBlocks = Array.isArray(candidate.message.content)
-        ? candidate.message.content.filter((block) => block?.type !== 'text')
-        : []
-      messages[candidate.index] = { ...candidate.message, content: [{ type: 'text', text: trimmed }, ...otherBlocks] }
-      after += estimateTokens(trimmed)
-    })
-
-    stats.capped += 1
-    stats.dropped += dropped
-    stats.last = { before: total, after, at: new Date().toISOString() }
-    record({ event: 'inject_capped', session: sessionId, before: total, after, dropped })
-    return { ...decision, messages: messages.filter((_, index) => !removed.has(index)) }
+    if (cap && total > cap) {
+      return { ...decision, messages: messages.filter((_, index) => !removed.has(index)) }
+    }
+    return decision
   }
 
   return {
@@ -301,8 +311,10 @@ function formatLayers(layers, preset) {
     .filter(([key, value]) => value !== undefined && value !== preset[key === 'recallOptions.max_tokens' ? 'recallMaxTokens' : key])
     .map(([key, value]) => `${key}=${value}`)
   const parts = []
+  if (layers.sections?.length > 0) parts.push(`sections ${layers.sections.join(', ')}`)
+  if (layers.harnessKeys?.length > 0) parts.push('harnesses.dsh read')
+  if (layers.envKeys?.length > 0) parts.push(`env ${layers.envKeys.join(', ')}`)
   if (drift.length > 0) parts.push(`overrides ${drift.join(' · ')}`)
-  if (layers.harnessKeys.length > 0 && drift.length === 0) parts.push('harnesses.dsh read')
   return parts.length > 0 ? `  layers   ${parts.join(' · ')}` : null
 }
 
@@ -322,7 +334,9 @@ function hintFor(status) {
     return 'The Hindsight memory bundle is not installed in this profile: add @vectorize-io/hindsight-coding-agents, then run /hindsight probe.'
   }
   if (status.server.disabled) {
-    return 'Hindsight is disabled in the shared config (disabled: true); clear that key to turn memory back on.'
+    return status.server.disabledReason === 'optInOnly excludes this directory'
+      ? 'This directory is outside optInOnly/optInPaths, so Hindsight will not inject here; add the path or remove optInOnly.'
+      : 'Hindsight is disabled in the shared config (disabled: true); clear that key to turn memory back on.'
   }
   if (probe?.status === 401 || probe?.status === 403) {
     return 'The server rejected the token. Set "apiToken" in the shared config or HINDSIGHT_API_TOKEN, then run /hindsight probe to confirm — it is re-read on the next rejected request.'
@@ -353,12 +367,14 @@ function hintFor(status) {
 
 async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessionId = null) {
   const file = readConfigFile()
-  const layers = effectiveConfig(file.config)
-  const effective = layers.config
-  const server = effectiveServer(effective, {})
   const integration = findIntegration()
   const project = projectName(cwd)
-  const resolution = bankResolution(effective, project.name, cwd)
+  const baseLayers = effectiveConfig(file.config, { cwd })
+  const resolution = bankResolution(baseLayers.config, project.name, cwd)
+  const layers = effectiveConfig(file.config, { cwd, bank: resolution.base ?? resolution.bank })
+  const effective = layers.config
+  const disabled = effectiveServer(effective, {}).disabled || optedOut(effective, cwd)
+  const server = { ...effectiveServer(effective, {}), disabled }
   const probe = !integration.installed || server.disabled ? null : await probeServer({
     apiUrl: server.apiUrl,
     apiToken: server.token,
@@ -374,11 +390,15 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
       mode: server.mode,
       apiUrl: server.apiUrl,
       disabled: server.disabled,
+      disabledReason: server.disabled
+        ? (optedOut(effective, cwd) ? 'optInOnly excludes this directory' : 'disabled is set in the effective config')
+        : null,
       tokenSet: server.tokenSet,
       tokenSource: server.tokenSource,
     },
     bank: resolution.bank,
     bankSource: resolution.source,
+    bankBase: resolution.base ?? null,
     project,
     bundles: installedBundles().bundles,
     sources: { ...stats.sources },
@@ -396,7 +416,7 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
       recallMaxTokens: getPath(effective, 'recallOptions.max_tokens') ?? null,
       pageSearchLimit: effective.pageSearchLimit ?? null,
     },
-    layers: { env: layers.envKeys, harness: layers.harnessKeys },
+    layers: { env: layers.envKeys, harness: layers.harnessKeys, sections: layers.sections },
     desired: {
       autoInject: settings.autoInject,
       injectTimeoutMs: settings.injectTimeoutMs,
@@ -435,7 +455,7 @@ function formatStatus(status) {
     `Hindsight memory — ${state}`,
     `  server   ${status.server.apiUrl} (${status.server.mode}) · token ${status.server.tokenSet ? `set (${status.server.tokenSource})` : 'not set'}`,
     `  probe    ${formatProbe(status.probe)}`,
-    `  bank     ${status.bank} (${status.bankSource})${status.project.source === 'git' ? '' : '  (named from the directory; not shared with a git worktree bank)'}`,
+    `  bank     ${status.bank} (${status.bankSource})${status.bankBase ? ` renamed from ${status.bankBase}` : ''}${status.project.source === 'git' ? '' : '  (named from the directory; not shared with a git worktree bank)'}`,
     status.bundles.length > 0
       ? `  bundles  ${status.bundles.map((bundle) => `${bundle.name} ${bundle.version}${bundle.enabled ? '' : ' (disabled)'}`).join(' · ')}`
       : '  bundles  no memory bundles detected in this profile',
@@ -446,12 +466,12 @@ function formatStatus(status) {
       return drift.length > 0 ? [`  drift    ${drift.join(' · ')} — /hindsight tune applies the preset`] : []
     })(),
     ...(() => {
-      const layers = formatLayers({ config: status.effective, harnessKeys: status.layers.harness }, status.desired)
+      const layers = formatLayers({ config: status.effective, harnessKeys: status.layers.harness, envKeys: status.layers.env, sections: status.layers.sections }, status.desired)
       return layers ? [layers] : []
     })(),
     `  applied  ${status.applied.length ? `${status.applied.length} keys: ${status.applied.join(', ')}` : 'nothing by this plugin'}`,
     recall && recall.turns > 0
-      ? `  recall   ${recall.turns} turns · last ~${recall.last} tok · max ~${recall.max} tok · avg ~${Math.round(recall.tokens / recall.turns)} tok`
+      ? `  recall   ${recall.turns} turns · last ~${recall.last}${recall.lastInjected !== recall.last ? ` → ~${recall.lastInjected}` : ''} tok · wanted max ~${recall.max} tok · avg ~${Math.round(recall.tokens / recall.turns)} tok`
       : '  recall   no Hindsight recall observed in this session yet',
     `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · dropped ${status.budget.dropped}`,
   ]
