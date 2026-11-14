@@ -372,8 +372,16 @@ function formatActivity(activity) {
   const entries = Object.entries(activity.recent ?? {}).sort((left, right) => right[1] - left[1])
   const parts = entries.slice(0, 5).map(([event, count]) => `${event} ${count}`)
   if (activity.authFailures > 0) parts.push(`auth failures ${activity.authFailures}`)
+  if (activity.foreignFailures > 0) parts.push(`${activity.foreignFailures} failures to another server (old process)`)
   if (activity.lastInject) parts.push(`last inject ~${activity.lastInject.tokens} tok`)
   return parts.length > 0 ? `24h: ${parts.join(' · ')}` : '24h: nothing recorded'
+}
+
+function formatAge(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return 'unknown age'
+  if (ms < 60_000) return 'under a minute ago'
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m ago`
+  return `${Math.round(ms / 3_600_000)}h ago`
 }
 
 function hintFor(status) {
@@ -441,7 +449,8 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
 
   const session = governor.session(sessionId)
   const ratios = stats.ratios ?? []
-  const activity = summarizeActivity()
+  const expectedOrigin = originOf(server.apiUrl)
+  const activity = summarizeActivity({ expectedOrigin, harness: 'dsh' })
   const status = {
     file: { path: file.path, kind: file.kind, error: file.error ?? null },
     integration,
@@ -520,9 +529,11 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
  * The integration is loaded once per process. If its journal's newest failure
  * still targets a different origin than the effective config, the running
  * process predates the config change — memory will keep failing until DSH is
- * restarted, which no amount of correct file content fixes.
+ * restarted, which no amount of correct file content fixes. The window is short
+ * on purpose: after a restart the process either succeeds or fails against the
+ * configured server, so an old cloud failure must not keep crying wolf.
  */
-const STALE_FAILURE_MS = 3_600_000
+const STALE_FAILURE_MS = 15 * 60_000
 
 function originOf(url) {
   try {
@@ -536,7 +547,9 @@ function staleProcess(status) {
   const seen = status.activity.lastEndpoint
   if (!seen) return null
   const failedAt = Date.parse(status.activity.lastFailure?.ts ?? '')
-  if (!Number.isFinite(failedAt) || Date.now() - failedAt > STALE_FAILURE_MS) return null
+  if (!Number.isFinite(failedAt)) return null
+  const ageMs = Date.now() - failedAt
+  if (ageMs < 0 || ageMs > STALE_FAILURE_MS) return null
   const expected = originOf(status.server.apiUrl)
   if (!expected || originOf(seen) === expected) return null
   return {
@@ -544,6 +557,7 @@ function staleProcess(status) {
     expected,
     event: status.activity.lastFailure?.event ?? null,
     bank: status.activity.lastBank ?? null,
+    ageMs,
   }
 }
 
@@ -560,7 +574,7 @@ function formatStatus(status) {
     `Hindsight memory — ${state}`,
     `  server   ${status.server.apiUrl} (${status.server.mode}) · token ${status.server.tokenSet ? `set (${status.server.tokenSource})` : 'not set'}`,
     ...(status.stale
-      ? [`  process  newest journal failure still targets ${status.stale.seen} (${status.stale.event ?? 'failure'}${status.stale.bank ? `, bank ${status.stale.bank}` : ''}) — the running DSH loaded the old config; restart it`]
+      ? [`  process  newest journal failure still targets ${status.stale.seen} (${status.stale.event ?? 'failure'}${status.stale.bank ? `, bank ${status.stale.bank}` : ''}, ${formatAge(status.stale.ageMs)}) — the running DSH loaded the old config; restart it`]
       : []),
     `  probe    ${formatProbe(status.probe)}`,
     `  bank     ${status.bank} (${status.bankSource})${status.bankBase ? ` renamed from ${status.bankBase}` : ''}${status.project.source === 'git' ? '' : '  (named from the directory; not shared with a git worktree bank)'}`,
@@ -890,7 +904,9 @@ export function apply(ctx, rawConfig) {
     if (action === 'suggest') {
       return formatSuggestion(await buildStatus(settings, stats, governor, cwd, options.sessionId))
     }
-    return formatStatus(await buildStatus(settings, stats, governor, cwd, options.sessionId))
+    const status = await buildStatus(settings, stats, governor, cwd, options.sessionId)
+    if (options.json === true) return JSON.stringify(status, null, 2)
+    return formatStatus(status)
   }
 
   ctx.inject(['tools'], (toolCtx) => {
@@ -915,6 +931,10 @@ export function apply(ctx, rawConfig) {
             type: 'boolean',
             description: 'Agent-write mode only: report the tune diff without writing the config file.',
           },
+          json: {
+            type: 'boolean',
+            description: 'status only: return the machine-readable status object as JSON instead of the text report.',
+          },
         },
         required: ['action'],
       },
@@ -924,11 +944,15 @@ export function apply(ctx, rawConfig) {
       },
       async execute(args, exec) {
         const action = typeof args?.action === 'string' ? args.action : 'status'
+        if (args?.json === true && action !== 'status') {
+          return 'hindsight_tuner: json is only valid with status.'
+        }
         try {
           return await runAction(action, {
             cwd: exec?.agent?.session?.header?.cwd,
             sessionId: exec?.agent?.session?.header?.id,
             viaTool: true,
+            json: args?.json === true,
             overwrite: typeof args?.overwrite === 'boolean' ? args.overwrite : undefined,
             dryRun: args?.dryRun === true,
           })
@@ -943,7 +967,7 @@ export function apply(ctx, rawConfig) {
     try {
       commandCtx.commands.register({
         name: 'hindsight',
-        description: 'Hindsight memory: status | tune [--dry-run] [--overwrite] [--cap N] | revert [--dry-run] | probe | suggest | enable | disable',
+        description: 'Hindsight memory: status [--json] | tune [--dry-run] [--overwrite] [--cap N] | revert [--dry-run] | probe | suggest | enable | disable',
         async handler(invocation) {
           const parts = String(invocation?.rawInput ?? '').trim().split(/\s+/).filter(Boolean)
           const action = parts.shift() || 'status'
@@ -952,13 +976,16 @@ export function apply(ctx, rawConfig) {
           }
           const flags = parseCommandFlags(parts)
           if (flags.unknown) {
-            return { kind: 'error', text: `Unknown option "${flags.unknown}". Use --dry-run, --overwrite, or --cap N.` }
+            return { kind: 'error', text: `Unknown option "${flags.unknown}". Use --dry-run, --overwrite, --cap N, or --json.` }
           }
           if ((flags.overwrite || flags.cap !== undefined) && action !== 'tune') {
             return { kind: 'error', text: 'Options --overwrite and --cap are only valid for tune.' }
           }
           if (flags.dryRun && !['tune', 'revert'].includes(action)) {
             return { kind: 'error', text: 'Option --dry-run is only valid for tune or revert.' }
+          }
+          if (flags.json && action !== 'status') {
+            return { kind: 'error', text: 'Option --json is only valid for status.' }
           }
           try {
             const text = await runAction(action, {
@@ -967,6 +994,7 @@ export function apply(ctx, rawConfig) {
               dryRun: flags.dryRun === true,
               overwrite: flags.overwrite === true,
               cap: flags.cap,
+              json: flags.json === true,
             })
             return { kind: text.startsWith('Refused:') ? 'error' : 'success', text }
           } catch (error) {
@@ -986,6 +1014,7 @@ function parseCommandFlags(parts) {
     const part = parts[index]
     if (part === '--dry-run') flags.dryRun = true
     else if (part === '--overwrite') flags.overwrite = true
+    else if (part === '--json') flags.json = true
     else if (part === '--cap') flags.cap = Number(parts[++index])
     else if (part.startsWith('--cap=')) flags.cap = Number(part.slice('--cap='.length))
     else flags.unknown = part

@@ -469,6 +469,21 @@ assert.match(status, /budget\s+cap 600 tok\/turn · capped \d+ · dropped 0/)
 assert.match(status, /order\s+outermost hook/)
 assert.match(status, /pages\s+pageSearchLimit=/)
 
+// The same status is available as data, so a user or a script need not parse prose.
+const statusJson = await tool.execute({ action: 'status', json: true }, exec)
+const parsed = JSON.parse(statusJson)
+assert.equal(parsed.server.apiUrl, 'http://127.0.0.1:9', 'JSON status carries the resolved server')
+assert.equal('token' in parsed.server, false, 'JSON status never embeds the token itself')
+assert.ok(parsed.tokenSource === undefined || typeof parsed.tokenSource === 'string')
+assert.equal(typeof parsed.activity.foreignFailures, 'number', 'JSON status reports foreign failures')
+assert.equal(parsed.stale, null, 'no stale process without a recent failure')
+const integrationBundle = parsed.bundles.find((bundle) => bundle.name === '@vectorize-io/hindsight-coding-agents')
+assert.ok(integrationBundle, 'JSON status lists the integration bundle')
+assert.equal(integrationBundle.installed, true, 'JSON status resolves installed versions from node_modules')
+assert.equal(parsed.compat.compatible, true)
+assert.equal(parsed.budget.cap, 600)
+assert.equal((await tool.execute({ action: 'probe', json: true }, exec)).includes('json is only valid with status'), true)
+
 // A second memory plugin injecting on the same turn is visible and flagged.
 const mnemonMessage = {
   id: 'mnemon-1',
@@ -526,6 +541,10 @@ assert.match(commandResult.text, /Hindsight memory —/)
 assert.match(commandResult.text, /auto\s+(tune on|off)/, 'status shows the auto-tune state')
 
 // The command is the user's write path, and it takes explicit flags.
+const commandJson = await command.handler({ rawInput: ' status --json' })
+assert.equal(commandJson.kind, 'success')
+assert.equal(JSON.parse(commandJson.text).server.apiUrl, 'http://127.0.0.1:9')
+assert.equal((await command.handler({ rawInput: ' probe --json' })).kind, 'error', '--json is a status flag')
 const caps = await command.handler({ rawInput: ' tune --cap 400' })
 assert.equal(caps.kind, 'success')
 assert.match(caps.text, /Tuned/)
@@ -568,8 +587,30 @@ writeFileSync(process.env.HINDSIGHT_DIAG_FILE, JSON.stringify({
 const stale = await tool.execute({ action: 'status' }, exec)
 assert.match(stale, /process\s+newest journal failure still targets http:\/\/127\.0\.0\.1:9077/, 'stale process is named')
 assert.match(stale, /the running DSH loaded the old config; restart it/)
+assert.match(stale, /under a minute ago/, 'the stale line says how old the evidence is')
 assert.match(stale, /newest journal failure targets http:\/\/127\.0\.0\.1:9077/, 'hint explains the stale process')
 assert.match(stale, /Restart DSH/)
+assert.match(stale, /1 failures to another server \(old process\)/, 'failures against another origin are counted, not hidden')
+
+// Only recent evidence counts: a failure from twenty minutes ago is history,
+// not proof that this process is still misconfigured.
+writeFileSync(process.env.HINDSIGHT_DIAG_FILE, JSON.stringify({
+  ts: new Date(Date.now() - 20 * 60_000).toISOString(),
+  event: 'pages_failed',
+  error: 'GET http://127.0.0.1:9077/v1/default/banks/coding-agent%3A%3Afixture/pages/tree -> 404 (old process)',
+}))
+assert.doesNotMatch(await tool.execute({ action: 'status' }, exec), /process\s+newest journal failure/, 'an old failure is not called stale')
+
+// Another harness writing to the same journal is not this process's problem.
+writeFileSync(process.env.HINDSIGHT_DIAG_FILE, JSON.stringify({
+  ts: now,
+  harness: 'claude-code',
+  event: 'pages_failed',
+  error: 'GET http://127.0.0.1:9077/v1/default/banks/coding-agent%3A%3Aclaude/pages/tree -> 404',
+}))
+const foreignOnly = await tool.execute({ action: 'status' }, exec)
+assert.doesNotMatch(foreignOnly, /process\s+newest journal failure/, 'another harness failure is ignored')
+assert.doesNotMatch(foreignOnly, /failures to another server/, 'another harness failure is not counted as DSH foreign traffic')
 writeFileSync(process.env.HINDSIGHT_DIAG_FILE, injectionJournal)
 
 // A config with an invalid value is reported, not silently accepted.
@@ -623,7 +664,7 @@ try {
 
 // --- package contract -------------------------------------------------------
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
-assert.equal(pkg.version, '0.6.0', 'version matches this release')
+assert.equal(pkg.version, '0.7.0', 'version matches this release')
 assert.ok(pkg.engines?.node?.includes('>=22'), 'declares a Node floor the tests can rely on')
 assert.equal(pkg.license, 'MIT')
 assert.ok(pkg.files.includes('docs'), 'docs ship with the bundle')

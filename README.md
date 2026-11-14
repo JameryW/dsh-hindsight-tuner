@@ -56,8 +56,16 @@ cross-tool banks); this bundle owns three things it does not provide:
    when the journal's newest failure still targets a different origin than the
    effective config, the running DSH predates the config change and will keep
    failing until it is restarted — a state no amount of correct file content
-   fixes, so `/hindsight` names it on its own `process` line. `/hindsight suggest`
-   proposes a cap from the journal's own p95 recall size without writing anything.
+   fixes, so `/hindsight` names it on its own `process` line, with the age of the
+   evidence; the claim expires after 15 minutes so an old failure cannot cry wolf
+   forever. Journal entries are filtered by harness (a Claude Code failure is not
+   DSH's), and failures whose URL points at a different origin than the
+   configured server are counted separately instead of being folded into the
+   auth-failure total. `/hindsight suggest` proposes a cap from the journal's own
+   p95 recall size without writing anything. `status --json` (tool:
+   `json: true`) returns the same diagnosis as data — server without the token,
+   effective layers, preset diff, budget accounting, probe, activity, hint — so
+   a script or a user does not have to parse the text report.
 
 4. **Writes that survive a crash and a second process.** The shared config is
    written under a sidecar lock, through a `0600` temporary file that keeps a
@@ -94,6 +102,7 @@ the next DSH restart; the profile keeps its own copy of the row config.
 - `/hindsight` — health, tuning, per-turn recall size, budget and journal
   activity for this session. It flags `drift` when a value in the file differs
   from the requested preset.
+- `/hindsight status --json` — the same status as JSON, for scripts.
 - `/hindsight probe` — one reachability check, no journal read.
 - `/hindsight suggest` — read-only cap/recall recommendation from the recent
   injection sizes.
@@ -125,7 +134,9 @@ This bundle owns the Hindsight lane only. What it does and does not coordinate:
 - `billion-context` compresses at the proxy/ACP layer. The per-turn cap still
   applies before compression, but the two do not share a budget.
 - The `bundles` line lists the memory-related bundles the profile declares
-  (with version and enabled state), so a stacked setup is visible without
+  (with the version actually installed under `node_modules`, or the declared
+  range when it is absent, and enabled state), so a stacked setup is visible
+  without
   reading `package.json`.
 
 ## Configuration

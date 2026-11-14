@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.0
+
+- `status --json` (tool: `json: true`) returns the same diagnosis as data: the
+  resolved server without the token itself, the effective config layers, the
+  preset diff, per-session budget accounting, probe result, activity and the
+  hint. Scripts no longer have to parse prose, and the written report and the
+  machine-readable one cannot drift apart.
+- Journal entries are filtered by `harness`, so Claude Code (or any other
+  harness writing to the same journal) can no longer make DSH look broken or
+  healthy. Entries without a harness field are treated as DSH's.
+- Failures against an origin other than the configured server are counted
+  separately (`activity.foreignFailures` and a line in the activity summary)
+  instead of being mixed into auth-failure totals. That is what a pre-restart
+  Cloud 401 looks like after the config points at the daemon.
+- Stale-process evidence now expires after 15 minutes instead of an hour, and
+  the `process` line says how old the evidence is. After a restart the process
+  either succeeds or fails against the configured server; old failures should
+  stop crying wolf.
+- Bundle list resolves installed versions from `node_modules` and falls back to
+  the declared range only when the package is not installed, so the line says
+  what is actually loaded rather than what the manifest requests.
 ## 0.6.0
 
 - Stale-process detection: the journal records the endpoint of its newest
