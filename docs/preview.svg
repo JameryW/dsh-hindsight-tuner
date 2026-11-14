@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="300" viewBox="0 0 640 300">
+  <rect x="0" y="0" width="640" height="300" rx="18" fill="#0f172a"/>
+
+  <!-- git history -->
+  <g>
+    <path d="M56 86 V196" stroke="#2563eb" stroke-width="4" stroke-linecap="round"/>
+    <path d="M56 126 C78 126 78 106 96 106" fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="56" cy="86" r="8" fill="#60a5fa"/>
+    <circle cx="56" cy="126" r="8" fill="#3b82f6"/>
+    <circle cx="56" cy="166" r="8" fill="#2563eb"/>
+    <circle cx="56" cy="196" r="6" fill="#93c5fd"/>
+    <circle cx="96" cy="106" r="7" fill="#22d3ee"/>
+  </g>
+
+  <g stroke="#64748b" stroke-width="3" stroke-linecap="round">
+    <path d="M120 140 H146"/>
+  </g>
+  <polygon points="146,133 158,140 146,147" fill="#94a3b8"/>
+
+  <!-- shared bank -->
+  <g>
+    <path d="M160 104 V190 A40 12 0 0 0 240 190 V104" fill="#172554" stroke="#3b82f6" stroke-width="2"/>
+    <ellipse cx="200" cy="104" rx="40" ry="12" fill="#1e3a8a" stroke="#3b82f6" stroke-width="2"/>
+    <rect x="176" y="134" width="48" height="6" rx="3" fill="#1d4ed8" opacity="0.75"/>
+    <rect x="176" y="152" width="48" height="6" rx="3" fill="#1d4ed8" opacity="0.55"/>
+    <rect x="176" y="170" width="30" height="6" rx="3" fill="#1d4ed8" opacity="0.4"/>
+  </g>
+
+  <g stroke="#64748b" stroke-width="3" stroke-linecap="round">
+    <path d="M248 140 H274"/>
+  </g>
+  <polygon points="274,133 286,140 274,147" fill="#94a3b8"/>
+
+  <!-- structured pages -->
+  <g fill="#1e293b" stroke="#475569" stroke-width="2">
+    <rect x="306" y="92" width="84" height="104" rx="9" transform="rotate(-9 348 144)"/>
+    <rect x="306" y="92" width="84" height="104" rx="9" transform="rotate(-3 348 144)" fill="#243247"/>
+  </g>
+  <g transform="rotate(5 348 144)">
+    <rect x="306" y="92" width="84" height="104" rx="9" fill="#2b3a52" stroke="#64748b" stroke-width="2"/>
+    <rect x="322" y="116" width="52" height="6" rx="3" fill="#94a3b8"/>
+    <rect x="322" y="132" width="42" height="6" rx="3" fill="#64748b"/>
+    <rect x="322" y="148" width="48" height="6" rx="3" fill="#64748b"/>
+    <rect x="322" y="164" width="30" height="6" rx="3" fill="#94a3b8"/>
+  </g>
+
+  <g stroke="#64748b" stroke-width="3" stroke-linecap="round">
+    <path d="M406 140 H432"/>
+  </g>
+  <polygon points="432,133 444,140 432,147" fill="#94a3b8"/>
+
+  <!-- budgeted context -->
+  <g>
+    <rect x="456" y="64" width="150" height="152" rx="16" fill="#111827" stroke="#334155" stroke-width="2"/>
+    <circle cx="492" cy="102" r="15" fill="#1f6feb"/>
+    <circle cx="492" cy="102" r="5" fill="#dbeafe"/>
+
+    <rect x="476" y="138" width="110" height="12" rx="6" fill="#1e293b" stroke="#334155" stroke-width="2"/>
+    <rect x="476" y="138" width="56" height="12" rx="6" fill="#34d399"/>
+    <rect x="532" y="138" width="54" height="12" rx="6" fill="#7c2d12" opacity="0.6"/>
+    <path d="M532 126 V166" stroke="#f59e0b" stroke-width="3" stroke-linecap="round" stroke-dasharray="5 4"/>
+
+    <rect x="476" y="170" width="56" height="7" rx="3.5" fill="#34d399" opacity="0.7"/>
+    <circle cx="548" cy="100" r="4" fill="#f59e0b"/>
+  </g>
+</svg>

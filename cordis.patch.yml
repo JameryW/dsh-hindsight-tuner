@@ -1,0 +1,19 @@
+# DSH bundle layer for Hindsight memory tuning.
+#
+# The Hindsight integration itself is mounted by its own bundle row (`hindsight`).
+# This row adds the DSH-side control plane: a lean profile for the shared
+# ~/.hindsight/coding-agent.json, a per-turn injection budget, and /hindsight.
+#
+# Everything here is tunable from this row's config; `autoTune: false` leaves the
+# shared config untouched and keeps the plugin read-only apart from the budget cap.
+- insert:
+    - id: hindsight-tuner
+      name: '@local/dsh-hindsight-tuner'
+      config:
+        autoTune: true
+        overwrite: false
+        maxInjectTokens: 3000
+        autoInject: pages
+        injectTimeoutMs: 7000
+        observationScopes: per_source
+        recallMaxTokens: 2000
