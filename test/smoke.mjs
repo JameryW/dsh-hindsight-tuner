@@ -35,6 +35,14 @@ for (const name of ['HINDSIGHT_AUTO_INJECT', 'HINDSIGHT_API_URL', 'HINDSIGHT_API
 const { estimateTokens, truncateToBudget, trimToBudget, allocateBudget, countTokens, percentile, FALLBACK_MARGIN } = await import('../lib/tokens.js')
 const { applyTuning, revertTuning, readConfigFile, getPath, autoTuneEnabled, setAutoTune } = await import('../lib/config-file.js')
 const { bankResolution, diagPath, effectiveConfig, optedOut } = await import('../lib/diagnostics.js')
+const { record, flushJournal, journalPending } = await import('../lib/log.js')
+
+// --- journal buffering ------------------------------------------------------
+record({ event: 'buffered_probe' })
+assert.equal(journalPending(), 1, 'a turn event is not written on the critical path')
+flushJournal()
+assert.equal(journalPending(), 0, 'flush writes the buffer')
+assert.match(readFileSync(join(process.env.DSH_HOME, 'storages', 'dsh-hindsight-tuner', 'tuner.jsonl'), 'utf8'), /buffered_probe/, 'the buffered line reaches the journal')
 
 // --- token estimation and truncation ---------------------------------------
 assert.equal(estimateTokens(''), 0)
@@ -543,6 +551,7 @@ assert.equal(adaptiveStatus.budget.policy, 'adaptive')
 assert.equal(adaptiveStatus.budget.tier.name, 'deep')
 assert.match(adaptiveStatus.budget.tier.reason, /first recall/, 'the first turn says why it is deep')
 assert.equal(adaptiveStatus.budget.tierCounts.deep, 1)
+assert.ok(adaptiveStatus.budget.trimmedTokens > 0, 'trimming is accounted as saved tokens')
 assert.equal(adaptiveStatus.budget.session.tier, 'deep')
 assert.match(await adaptiveTool.execute({ action: 'status' }, adaptiveExec), /adaptive 100\/200\/400 .*last deep 400/)
 
@@ -593,7 +602,7 @@ assert.equal(skipStatus.budget.repeatPolicy, 'skip')
 assert.equal(skipStatus.budget.repeatSkips, 1)
 assert.ok(skipStatus.budget.savedTokens > 0, 'the skipped payload is accounted as saved')
 assert.equal(skipStatus.budget.session.lastInjected, 0, 'a skipped turn injected nothing')
-assert.match(await skipping.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status' }, skipExec), /repeat skip ≥90% · skipped 1 \(~\d+ tok saved\)/)
+assert.match(await skipping.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status' }, skipExec), /repeat skip ≥90% · skipped 1/)
 const changedSkip = await skipTurn('changed', long.toUpperCase().repeat(3))
 assert.equal(changedSkip.messages.length, 2, 'a different recall is still injected')
 for (const dispose of skipping.disposers) dispose()
@@ -689,6 +698,7 @@ writeFileSync(process.env.HINDSIGHT_DIAG_FILE, injectionJournal)
 const measured = await tool.execute({ action: 'suggest' }, exec)
 assert.match(measured, /observed recall ~\d+ tok p50 · ~\d+ tok p95 \(10 injections, char-based estimate\)/)
 assert.match(measured, /maxInjectTokens: 2475/, 'cap follows the p95, clamped')
+assert.match(measured, /tiers\s+light \d+ \/ normal \d+ \/ deep 2475/, 'tiers follow the same distribution')
 assert.match(measured, /recallOptions\.max_tokens: 2000/)
 
 // A journal that still fails against another origin means the running process
@@ -778,7 +788,7 @@ try {
 
 // --- package contract -------------------------------------------------------
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
-assert.equal(pkg.version, '0.9.0', 'version matches this release')
+assert.equal(pkg.version, '0.10.0', 'version matches this release')
 assert.ok(pkg.engines?.node?.includes('>=22'), 'declares a Node floor the tests can rely on')
 assert.equal(pkg.license, 'MIT')
 assert.ok(pkg.files.includes('docs'), 'docs ship with the bundle')

@@ -83,7 +83,9 @@ cross-tool banks); this bundle owns three things it does not provide:
    p95 recall size without writing anything. `status --json` (tool:
    `json: true`) returns the same diagnosis as data — server without the token,
    effective layers, preset diff, budget accounting, probe, activity, hint — so
-   a script or a user does not have to parse the text report.
+   a script or a user does not have to parse the text report. Token savings are
+   part of that report: `trimmedTokens` (what the ceiling removed) plus the
+   duplicate-skip savings appear as `saved ~N tok` on the budget line.
 
 4. **Writes that survive a crash and a second process.** The shared config is
    written under a sidecar lock, through a `0600` temporary file that keeps a
@@ -102,6 +104,11 @@ cross-tool banks); this bundle owns three things it does not provide:
    profile row sets `allowAgentWrites: true`; there is no `confirm` flag, because
    a flag the model fills in is not a permission boundary. The user-typed
    `/hindsight tune` / `/hindsight revert` command is the intended write path.
+
+The plugin's own journal (`<DSH_HOME>/storages/dsh-hindsight-tuner/tuner.jsonl`)
+is buffered rather than written on every event: entries are flushed in one
+append after 250 ms, immediately when 500 are pending, on dispose, and on a
+normal process exit — diagnostics never sit on the model's critical path.
 
 ## Install
 

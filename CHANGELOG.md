@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.10.0
+
+- The plugin's own journal is buffered: a turn can emit several events, and one
+  append per event put the journal on the model's critical path. Entries are
+  written in a single append after 250 ms, or immediately when 500 are pending,
+  and the buffer is flushed on dispose and on a normal process exit.
+  `flushJournal()` / `journalPending()` are exported for tests.
+- Savings are accounted rather than implied: `budget.trimmedTokens` records what
+  the ceiling removed across the process, alongside the duplicate-skip savings,
+  and the budget line ends with `saved ~N tok` when either is non-zero.
+- `suggest` also proposes an ordered adaptive tier table derived from the same
+  p50/p95 distribution (light near p50, normal between, deep at the cap), so the
+  read-only recommendation covers the 0.8 policy as well as the hard cap.
+
 ## 0.9.0
 
 - Duplicate governance (`repeatPolicy: skip`, `repeatThreshold`, default 0.9):

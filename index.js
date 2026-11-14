@@ -45,7 +45,7 @@ import {
   projectName,
   summarizeActivity,
 } from './lib/diagnostics.js'
-import { record } from './lib/log.js'
+import { flushJournal, record } from './lib/log.js'
 import {
   allocateBudget,
   countTokens,
@@ -347,6 +347,7 @@ function createGovernor(settings, stats, meter) {
         })
         stats.capped += 1
         stats.dropped += dropped
+        stats.trimmedTokens += Math.max(0, total - after)
         stats.last = { before: total, after, at: new Date().toISOString() }
         record({ event: 'inject_capped', session: sessionId, before: total, after, dropped, mode: meter.mode })
       }
@@ -595,6 +596,7 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
       repeatThreshold: settings.repeatThreshold,
       repeatSkips: stats.repeatSkips,
       savedTokens: stats.savedTokens,
+      trimmedTokens: stats.trimmedTokens,
       lastRepeat: stats.lastRepeat,
       turns: stats.turns,
       seen: stats.seen,
@@ -697,7 +699,7 @@ function formatStatus(status) {
     recall && recall.turns > 0
       ? `  recall   ${recall.turns} turns · last ~${recall.last}${recall.lastInjected !== recall.last ? ` → ~${recall.lastInjected}` : ''} tok · wanted max ~${recall.max} tok · avg ~${Math.round(recall.tokens / recall.turns)} tok`
       : '  recall   no Hindsight recall observed in this session yet',
-    `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · dropped ${status.budget.dropped} · ${formatTier(status.budget)} · ${formatRepeat(status.budget)}`,
+    `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · dropped ${status.budget.dropped} · ${formatTier(status.budget)} · ${formatRepeat(status.budget)}${formatSavings(status.budget)}`,
     `  tokens   ${formatTokens(status.tokens)}`,
   ]
 
@@ -770,7 +772,13 @@ function formatRepeat(budget) {
   const last = Number.isFinite(budget.lastRepeat) && budget.lastRepeat > 0
     ? ` · last ${Math.round(budget.lastRepeat * 100)}% repeat`
     : ''
-  return `repeat skip ≥${threshold}% · skipped ${budget.repeatSkips} (~${budget.savedTokens} tok saved)${last}`
+  return `repeat skip ≥${threshold}% · skipped ${budget.repeatSkips}${last}`
+}
+
+/** Tokens that never reached the model, from trimming plus skipped recalls. */
+function formatSavings(budget) {
+  const saved = (budget.trimmedTokens ?? 0) + (budget.savedTokens ?? 0)
+  return saved > 0 ? ` · saved ~${saved} tok` : ''
 }
 
 function formatTune(result) {
@@ -841,6 +849,7 @@ export function apply(ctx, rawConfig) {
     lastTier: null,
     repeatSkips: 0,
     savedTokens: 0,
+    trimmedTokens: 0,
     lastRepeat: 0,
     ratios: [],
     tokenizer: { mode: settings.tokenBudgetMode, name: null, ready: settings.tokenBudgetMode === 'fast' },
@@ -925,6 +934,7 @@ export function apply(ctx, rawConfig) {
   ctx.effect(() => () => {
     try { disposePreStep?.() } catch { /* already gone */ }
     governor.dispose()
+    flushJournal()
   })
   record({ event: 'activated', autoTune: settings.autoTune, cap: settings.maxInjectTokens, recall: settings.recallMaxTokens, tokenBudgetMode: settings.tokenBudgetMode })
 
@@ -963,6 +973,11 @@ export function apply(ctx, rawConfig) {
     }
     lines.push(`  cap      maxInjectTokens: ${cap}  (1.25× the p95, clamped 512..8000; current ${status.budget.cap})`)
     lines.push(`  recall   recallOptions.max_tokens: ${recall}  (Pages and Recall are separate ceilings; do not make recall larger than the cap by accident)`)
+    if (p50 && p95) {
+      const light = Math.min(p95, Math.max(128, Math.ceil(p50 * 0.9)))
+      const normal = Math.min(p95, Math.max(light, Math.ceil((p50 + p95) / 2)))
+      lines.push(`  tiers    light ${light} / normal ${normal} / deep ${cap}  (budgetPolicy: adaptive; from the same p50/p95, never above the cap)`)
+    }
     if (status.effective.autoInject !== 'pages') {
       lines.push('  pages    autoInject: pages injects stored pages without a synthesis pass; prefer it for coding sessions')
     }
