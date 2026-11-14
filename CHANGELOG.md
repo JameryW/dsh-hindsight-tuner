@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.0
+
+- Structure-aware trimming: a recall is cut at the last paragraph boundary or
+  after a closed markdown code fence that fits the budget, so the injected text
+  never ends inside an open fence (which would render the rest of the prompt as
+  code). The character/line cut stays as the fallback for a single oversized
+  paragraph. No hidden floor: an unfittable marker still drops the message.
+- Water-filling allocation: a short recall that fits an equal share of the turn
+  budget is kept whole, and only the larger messages absorb the remainder.
+  Proportional cutting damaged the short, high-signal recalls for no budget gain.
+- Upstream compatibility line: `status` names the installed
+  `@vectorize-io/hindsight-coding-agents` version and flags a version outside the
+  tested `0.8.x` line, since the pre-step hook contract is private to that
+  package. CI still runs the real hook integration test against `0.8.7`.
+
 ## 0.4.0
 
 - Real integration test (`test/integration.mjs`): imports the shipped

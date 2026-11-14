@@ -23,7 +23,7 @@
  * It degrades to a report when the integration or its config is absent.
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   appliedPaths,
@@ -53,7 +53,7 @@ import {
   FALLBACK_MARGIN,
   loadTokenizer,
   percentile,
-  truncateToBudget,
+  trimToBudget,
 } from './lib/tokens.js'
 import { validateConfig, validateSettings } from './lib/validate.js'
 
@@ -111,7 +111,25 @@ function textOf(message) {
  * file and a reachable server describe nothing this profile can use, and a
  * status that only probed the endpoint would claim a capability that is absent.
  */
+/**
+ * The upstream integration line this release is tested against (CI installs the
+ * pinned version and runs the real hook integration test). The pre-step
+ * contract is private to that package, so a version outside this line is
+ * reported instead of being silently trusted.
+ */
+const TESTED_INTEGRATION = { line: '0.8', version: '0.8.7' }
+
 let integrationMemo = null
+
+function integrationManifest(path) {
+  try {
+    const manifest = JSON.parse(readFileSync(path, 'utf8'))
+    const version = typeof manifest?.version === 'string' ? manifest.version : null
+    return { installed: true, path, version }
+  } catch {
+    return { installed: true, path, version: null }
+  }
+}
 
 function findIntegration() {
   const roots = new Set()
@@ -124,16 +142,30 @@ function findIntegration() {
   const key = [...roots].join('|')
   if (integrationMemo?.key === key) return integrationMemo.value
 
-  let value = { installed: false, path: null }
+  let value = { installed: false, path: null, version: null }
   for (const root of roots) {
     const manifest = join(root, 'node_modules', '@vectorize-io', 'hindsight-coding-agents', 'package.json')
     if (existsSync(manifest)) {
-      value = { installed: true, path: manifest }
+      value = integrationManifest(manifest)
       break
     }
   }
   integrationMemo = { key, value }
   return value
+}
+
+/** Compare the installed integration with the line this release tests. */
+function integrationCompatibility(integration) {
+  if (!integration.installed) return null
+  const version = integration.version
+  const match = version ? /^(\d+)\.(\d+)/.exec(version) : null
+  const line = match ? `${match[1]}.${match[2]}` : null
+  return {
+    version,
+    tested: TESTED_INTEGRATION.version,
+    line,
+    compatible: line === null ? null : line === TESTED_INTEGRATION.line,
+  }
 }
 
 /** Turn a JSON error body into one readable sentence. */
@@ -225,7 +257,7 @@ function createGovernor(settings, stats, meter) {
           return
         }
         const marker = `\n\n…[dsh-hindsight-tuner: cut from ~${candidate.tokens} to ~${allotted} tokens. Ask Hindsight for the full recall explicitly, or raise maxInjectTokens.]`
-        const trimmed = allotted > 0 ? truncateToBudget(candidate.text, allotted, marker, meter.count) : ''
+        const trimmed = allotted > 0 ? trimToBudget(candidate.text, allotted, marker, meter.count) : ''
         if (!trimmed) {
           removed.add(candidate.index)
           dropped += 1
@@ -409,6 +441,7 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
   const status = {
     file: { path: file.path, kind: file.kind, error: file.error ?? null },
     integration,
+    compat: integrationCompatibility(integration),
     server: {
       mode: server.mode,
       apiUrl: server.apiUrl,
@@ -495,6 +528,7 @@ function formatStatus(status) {
     status.bundles.length > 0
       ? `  bundles  ${status.bundles.map((bundle) => `${bundle.name} ${bundle.version}${bundle.enabled ? '' : ' (disabled)'}`).join(' · ')}`
       : '  bundles  no memory bundles detected in this profile',
+    ...(status.compat ? [`  compat   ${formatCompat(status.compat)}`] : []),
     `  config   ${status.file.path} (${describeKind(status.file.kind)}${status.file.error ? `: ${status.file.error}` : ''})`,
     `  auto     ${status.autoTune ? 'tune on the first session of a new process' : 'off (persisted; /hindsight enable turns it back on)'}`,
     `  tuning   ${formatPreset(status.preset)}`,
@@ -542,6 +576,13 @@ function formatStatus(status) {
   }
   lines.push(`  next     ${status.hint}`)
   return lines.join('\n')
+}
+
+function formatCompat(compat) {
+  if (!compat.version) return `version unreadable (this release is tested with ${compat.tested})`
+  if (compat.compatible === null) return `${compat.version} (this release is tested with ${compat.tested})`
+  if (compat.compatible) return `${compat.version} (tested line ${TESTED_INTEGRATION.line}.x)`
+  return `${compat.version} — outside the tested ${TESTED_INTEGRATION.line}.x line; the pre-step contract is private to that package, rerun npm test before trusting the budget`
 }
 
 function formatTokens(tokens) {

@@ -28,13 +28,17 @@ cross-tool banks); this bundle owns three things it does not provide:
    the first session start so it ends up outside the Hindsight hook regardless
    of bundle load order). It therefore sees the final message list and enforces
    one shared ceiling: the sum of every `plugin:hindsight` message in a turn is
-   at most `maxInjectTokens`. Trimming happens on a line boundary with an
-   explicit marker; a message that cannot fit even the marker is dropped. There
-   is no hidden 32-token floor — a tiny cap stays tiny (the minimum useful cap is
-   `0`, which disables trimming). Because the integration dedupes by comparing
-   the new recall against the last injected text, a trimmed message never
-   matches, so every turn is re-trimmed to the same ceiling instead of letting a
-   full-size payload through on the next turn.
+   at most `maxInjectTokens`. Trimming is structure-aware: it cuts at a paragraph
+   boundary or after a closed code fence (so markdown never ends inside an open
+   fence) and only falls back to a line/character cut when no boundary fits. A
+   message that cannot fit even the marker is dropped. Across messages the
+   budget is water-filled rather than proportionally cut: a short recall that
+   fits within an equal share is kept whole, and the larger messages take the
+   remainder. There is no hidden 32-token floor — a tiny cap stays tiny (the
+   minimum useful cap is `0`, which disables trimming). Because the integration
+   dedupes by comparing the new recall against the last injected text, a trimmed
+   message never matches, so every turn is re-trimmed to the same ceiling instead
+   of letting a full-size payload through on the next turn.
 
 3. **A diagnosis that does not lie.** With no token configured, the integration
    fails silently on every turn (`pages_failed`, `inject_unchanged`, `401` in
@@ -46,8 +50,10 @@ cross-tool banks); this bundle owns three things it does not provide:
    not seeded", and "another hook wraps the budget". It also reports per-session
    turn count, last/max/average recall tokens, the Pages and Recall ceilings
    separately, invalid config values, and whether more than one plugin injected
-   in the *same* turn. `/hindsight suggest` proposes a cap from the journal's own
-   p95 recall size without writing anything.
+   in the *same* turn. It names the installed integration version and flags a
+   version outside the `0.8.x` line the CI integration test covers, because the
+   hook contract is private to that package. `/hindsight suggest` proposes a cap
+   from the journal's own p95 recall size without writing anything.
 
 4. **Writes that survive a crash and a second process.** The shared config is
    written under a sidecar lock, through a `0600` temporary file that keeps a

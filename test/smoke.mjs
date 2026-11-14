@@ -16,7 +16,7 @@ process.env.HINDSIGHT_DIAG_FILE = join(scratch, 'diag.jsonl')
 const fakeProfile = join(scratch, 'profile')
 const fakeIntegration = join(fakeProfile, 'node_modules', '@vectorize-io', 'hindsight-coding-agents')
 mkdirSync(fakeIntegration, { recursive: true })
-writeFileSync(join(fakeIntegration, 'package.json'), '{"name":"@vectorize-io/hindsight-coding-agents","version":"0.0.0"}')
+writeFileSync(join(fakeIntegration, 'package.json'), '{"name":"@vectorize-io/hindsight-coding-agents","version":"0.8.7"}')
 writeFileSync(join(fakeProfile, 'package.json'), JSON.stringify({
   name: 'test-profile',
   private: true,
@@ -32,7 +32,7 @@ delete process.env.DSH_PROFILE
 delete process.env.DSH_INSTALL_DIR
 for (const name of ['HINDSIGHT_AUTO_INJECT', 'HINDSIGHT_API_URL', 'HINDSIGHT_API_PORT', 'HINDSIGHT_DISABLED']) delete process.env[name]
 
-const { estimateTokens, truncateToBudget, allocateBudget, countTokens, percentile, FALLBACK_MARGIN } = await import('../lib/tokens.js')
+const { estimateTokens, truncateToBudget, trimToBudget, allocateBudget, countTokens, percentile, FALLBACK_MARGIN } = await import('../lib/tokens.js')
 const { applyTuning, revertTuning, readConfigFile, getPath, autoTuneEnabled, setAutoTune } = await import('../lib/config-file.js')
 const { bankResolution, diagPath, effectiveConfig, optedOut } = await import('../lib/diagnostics.js')
 
@@ -79,6 +79,37 @@ for (const tokens of [[900, 900], [5000, 10, 10], [1, 1, 1, 1]]) {
   assert.ok(sum <= 600, `allocations sum ${sum} <= 600`)
   assert.ok(allocations.every((value, index) => value <= tokens[index]), 'never allocates more than a message has')
 }
+
+// Water-filling, not a proportional cut: a message that fits an equal share
+// keeps all of its content, and only the large message takes the remainder.
+assert.deepEqual(allocateBudget([10, 300], 200), [10, 190], 'small recall stays whole')
+assert.deepEqual(allocateBudget([50, 50, 300], 200), [50, 50, 100], 'the largest message absorbs the remainder')
+assert.deepEqual(allocateBudget([100, 100, 100], 600), [100, 100, 100], 'no cut needed under the cap')
+assert.equal(allocateBudget([], 600).length, 0)
+
+// Recall is markdown: a cut must not split a code fence, and should land on a
+// paragraph boundary rather than at an arbitrary character.
+const fencePrefix = `## Summary
+Short memory paragraph that must survive.
+
+\`\`\`js
+${Array.from({ length: 20 }, (_, index) => `const step${index} = run(${index})`).join('\n')}
+\`\`\`
+`
+const fenceTail = `\n${Array.from({ length: 300 }, (_, index) => `- detail ${index} 这是很长的后续内容用来抢占预算`).join('\n')}`
+const structured = fencePrefix + fenceTail
+const fenceCap = estimateTokens(fencePrefix) + 30
+const structuredTrim = trimToBudget(structured, fenceCap, '\n…[cut]')
+assert.ok(estimateTokens(structuredTrim) <= fenceCap, 'structured trim holds the cap')
+assert.ok(structuredTrim.startsWith('## Summary'), 'keeps the summary section')
+assert.ok(structuredTrim.endsWith('```\n…[cut]'), `cut after the closed fence, got: ${JSON.stringify(structuredTrim.slice(-40))}`)
+assert.equal(structuredTrim.split('```').length % 2, 1, 'every fence is closed')
+
+// No boundary at all (one huge paragraph) still falls back to the character cut.
+const noBoundary = 'x'.repeat(4000)
+const noBoundaryTrim = trimToBudget(noBoundary, 100, '\n…[cut]')
+assert.ok(estimateTokens(noBoundaryTrim) <= 100, 'fallback still holds the cap')
+assert.ok(noBoundaryTrim.endsWith('…[cut]'))
 
 // The fast path stays a documented estimate; accurate mode either uses the
 // installed tokenizer or says it fell back instead of pretending to be exact.
@@ -533,6 +564,7 @@ const diagnosed = await tool.execute({ action: 'status' }, exec)
 assert.match(diagnosed, /invalid\s+autoInject="sometime"/, 'invalid effective config is surfaced')
 assert.match(diagnosed, /invalid\s+apiPort=0/)
 assert.match(diagnosed, /integration falls back/)
+assert.match(diagnosed, /compat\s+0\.8\.7 \(tested line 0\.8\.x\)/, 'compat line names the tested integration line')
 writeFileSync(process.env.HINDSIGHT_CONFIG, savedConfig)
 
 const diagnosticPath = diagPath()
@@ -576,7 +608,7 @@ try {
 
 // --- package contract -------------------------------------------------------
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
-assert.equal(pkg.version, '0.4.0', 'version matches this release')
+assert.equal(pkg.version, '0.5.0', 'version matches this release')
 assert.ok(pkg.engines?.node?.includes('>=22'), 'declares a Node floor the tests can rely on')
 assert.equal(pkg.license, 'MIT')
 assert.ok(pkg.files.includes('docs'), 'docs ship with the bundle')
