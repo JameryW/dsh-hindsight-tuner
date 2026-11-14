@@ -10,11 +10,14 @@
  *  - it applies a lean profile to the shared `~/.hindsight/coding-agent.json`
  *    (pages-first injection, a short inject deadline, per-source observation
  *    scopes, and a recall token ceiling), fill-missing-only by default, with a
- *    backup and an exact undo;
+ *    backup, a lock, a crash-recoverable journal, and an exact undo;
  *  - it caps what a single turn can receive from Hindsight at `maxInjectTokens`,
- *    compensating for the integration's own dedupe check, which compares the
- *    last injected text and would re-inject after a trim;
- *  - it diagnoses the integration from its own journal, because a missing token
+ *    as the outermost `agent/pre-step` hook, so the cap sees the payload the
+ *    model will actually get. Trimming would defeat the integration's own
+ *    "unchanged recall" check, so every turn is trimmed to the same ceiling
+ *    instead of being re-injected untrimmed;
+ *  - it diagnoses the integration from its own journal and the effective config
+ *    (including environment and per-harness overrides), because a missing token
  *    currently fails silently on every turn.
  *
  * It degrades to a report when the integration or its config is absent.
@@ -30,7 +33,9 @@ import {
   revertTuning,
 } from './lib/config-file.js'
 import {
-  bankIdFor,
+  bankResolution,
+  diagPath,
+  effectiveConfig,
   effectiveServer,
   installedBundles,
   probeServer,
@@ -38,7 +43,7 @@ import {
   summarizeActivity,
 } from './lib/diagnostics.js'
 import { record } from './lib/log.js'
-import { estimateTokens, truncateToBudget } from './lib/tokens.js'
+import { allocateBudget, estimateTokens, truncateToBudget } from './lib/tokens.js'
 
 const PLUGIN = 'hindsight-tuner'
 const MAX_REMEMBERED_SESSIONS = 40
@@ -61,6 +66,9 @@ function normalizeConfig(input) {
     // explicit and survives a future release that raises its default.
     recallMaxTokens: number(raw.recallMaxTokens, 2000),
     sourceKind: text(raw.sourceKind, 'plugin:hindsight'),
+    // A tool call is an agent action; writing the user's global config from it
+    // needs either this opt-in or an explicit confirm argument.
+    allowAgentWrites: raw.allowAgentWrites === true,
   }
 }
 
@@ -131,31 +139,38 @@ function remember(map, key, value) {
 }
 
 /**
- * Cap one turn's Hindsight recall. The integration decides "unchanged" by
- * comparing the new recall with the last injected message, which our trim
- * breaks; so when the same raw payload arrives twice we drop the duplicate
- * instead of letting it through untrimmed.
+ * Cap one turn's Hindsight recall.
+ *
+ * This runs as the outermost `agent/pre-step` listener, so it sees the final
+ * message list after every other plugin (including Hindsight) has appended.
+ * The budget is shared by all matching messages in the turn: it is not a
+ * per-message limit, and there is no hidden minimum — when a message cannot fit
+ * even a marker it is dropped so the turn stays under the ceiling.
  */
 function createGovernor(settings, stats) {
-  const seen = new Map()
-  const countedSources = new Set()
+  const sessions = new Map()
 
-  /**
-   * Count every plugin-injected message once, whatever plugin it came from.
-   * This is the only honest way to see a stacked memory setup: two plugins
-   * injecting on the same turn is invisible from either plugin's own logs.
-   */
-  function noteSources(messages) {
+  function sessionOf(sessionId) {
+    let session = sessions.get(sessionId)
+    if (!session) {
+      session = { turns: 0, tokens: 0, last: 0, max: 0 }
+      remember(sessions, sessionId, session)
+    }
+    return session
+  }
+
+  /** Count plugin-injected messages per turn, and detect a stacked setup. */
+  function noteTurn(messages, sessionId) {
+    const kinds = new Set()
     for (const message of messages) {
       const kind = message?.source?.kind
-      if (typeof kind !== 'string' || !kind.startsWith('plugin:')) continue
-      const id = message?.id
-      if (typeof id === 'string') {
-        if (countedSources.has(id)) continue
-        countedSources.add(id)
-        if (countedSources.size > 5000) countedSources.clear()
-      }
-      stats.sources[kind] = (stats.sources[kind] ?? 0) + 1
+      if (typeof kind === 'string' && kind.startsWith('plugin:')) kinds.add(kind)
+    }
+    for (const kind of kinds) stats.sources[kind] = (stats.sources[kind] ?? 0) + 1
+    if (kinds.size > 1) {
+      stats.stackTurns += 1
+      stats.lastStack = [...kinds].sort()
+      record({ event: 'stack_turn', session: sessionId, kinds: [...kinds] })
     }
   }
 
@@ -163,51 +178,70 @@ function createGovernor(settings, stats) {
     const decision = await next()
     if (!decision || decision.kind !== 'enter' || !Array.isArray(decision.messages)) return decision
 
-    noteSources(decision.messages)
+    const sessionId = payload?.agent?.session?.header?.id ?? 'unknown'
+    noteTurn(decision.messages, sessionId)
 
-    const index = decision.messages.findIndex((message) => message?.source?.kind === settings.sourceKind)
-    if (index < 0) return decision
+    const candidates = []
+    decision.messages.forEach((message, index) => {
+      if (message?.source?.kind !== settings.sourceKind) return
+      const text = textOf(message)
+      if (!text) return
+      candidates.push({ index, message, text, tokens: estimateTokens(text) })
+    })
+    if (candidates.length === 0) return decision
 
-    const message = decision.messages[index]
-    const raw = textOf(message)
-    if (!raw) return decision
-    const tokens = estimateTokens(raw)
-
-    stats.seen += 1
-    stats.lastTokens = tokens
-    stats.maxTokens = Math.max(stats.maxTokens, tokens)
-    stats.totalTokens += tokens
+    const total = candidates.reduce((sum, candidate) => sum + candidate.tokens, 0)
+    const session = sessionOf(sessionId)
+    session.turns += 1
+    session.last = total
+    session.max = Math.max(session.max, total)
+    session.tokens += total
+    stats.turns += 1
+    stats.lastTurnTokens = total
+    stats.maxTurnTokens = Math.max(stats.maxTurnTokens, total)
+    stats.seen += candidates.length
 
     const cap = settings.maxInjectTokens
-    if (!cap || tokens <= cap) return decision
+    if (!cap || total <= cap) return decision
 
-    const sessionId = payload?.agent?.session?.header?.id ?? 'unknown'
-    const previous = seen.get(sessionId)
-
-    if (previous && previous.raw === raw) {
-      stats.deduped += 1
-      record({ event: 'inject_deduped', session: sessionId, tokens })
-      return { ...decision, messages: decision.messages.filter((_, position) => position !== index) }
-    }
-
-    const marker = `\n\n…[dsh-hindsight-tuner: cut from ~${tokens} to ~${cap} tokens. Ask Hindsight for the full recall explicitly, or raise maxInjectTokens.]`
-    const trimmed = truncateToBudget(raw, cap, marker)
-    const after = estimateTokens(trimmed)
-
-    remember(seen, sessionId, { raw })
-    stats.capped += 1
-    stats.last = { before: tokens, after, at: new Date().toISOString() }
-    record({ event: 'inject_capped', session: sessionId, before: tokens, after })
-
+    const allocations = allocateBudget(candidates.map((candidate) => candidate.tokens), cap)
     const messages = decision.messages.slice()
-    const otherBlocks = Array.isArray(message.content)
-      ? message.content.filter((block) => block?.type !== 'text')
-      : []
-    messages[index] = { ...message, content: [{ type: 'text', text: trimmed }, ...otherBlocks] }
-    return { ...decision, messages }
+    const removed = new Set()
+    let after = 0
+    let dropped = 0
+
+    candidates.forEach((candidate, position) => {
+      const allotted = allocations[position]
+      if (candidate.tokens <= allotted) {
+        after += candidate.tokens
+        return
+      }
+      const marker = `\n\n…[dsh-hindsight-tuner: cut from ~${candidate.tokens} to ~${allotted} tokens. Ask Hindsight for the full recall explicitly, or raise maxInjectTokens.]`
+      const trimmed = allotted > 0 ? truncateToBudget(candidate.text, allotted, marker) : ''
+      if (!trimmed) {
+        removed.add(candidate.index)
+        dropped += 1
+        return
+      }
+      const otherBlocks = Array.isArray(candidate.message.content)
+        ? candidate.message.content.filter((block) => block?.type !== 'text')
+        : []
+      messages[candidate.index] = { ...candidate.message, content: [{ type: 'text', text: trimmed }, ...otherBlocks] }
+      after += estimateTokens(trimmed)
+    })
+
+    stats.capped += 1
+    stats.dropped += dropped
+    stats.last = { before: total, after, at: new Date().toISOString() }
+    record({ event: 'inject_capped', session: sessionId, before: total, after, dropped })
+    return { ...decision, messages: messages.filter((_, index) => !removed.has(index)) }
   }
 
-  return { onPreStep, dispose: () => seen.clear() }
+  return {
+    onPreStep,
+    session: (sessionId) => sessions.get(sessionId) ?? null,
+    dispose: () => sessions.clear(),
+  }
 }
 
 function describeKind(kind) {
@@ -251,6 +285,27 @@ function presetDrift(actual, desired) {
     .map(([key, have, want]) => `${key} ${have ?? 'unset'} ≠ ${want}`)
 }
 
+/**
+ * Environment or harness overrides can change what the integration reads even
+ * when the file looks correct; surface them instead of reporting a stale value.
+ */
+function formatLayers(layers, preset) {
+  const effective = layers.config
+  const rows = [
+    ['autoInject', effective.autoInject],
+    ['injectTimeoutMs', effective.injectTimeoutMs],
+    ['observationScopes', effective.observationScopes],
+    ['recallOptions.max_tokens', getPath(effective, 'recallOptions.max_tokens')],
+  ]
+  const drift = rows
+    .filter(([key, value]) => value !== undefined && value !== preset[key === 'recallOptions.max_tokens' ? 'recallMaxTokens' : key])
+    .map(([key, value]) => `${key}=${value}`)
+  const parts = []
+  if (drift.length > 0) parts.push(`overrides ${drift.join(' · ')}`)
+  if (layers.harnessKeys.length > 0 && drift.length === 0) parts.push('harnesses.dsh read')
+  return parts.length > 0 ? `  layers   ${parts.join(' · ')}` : null
+}
+
 function formatActivity(activity) {
   if (!activity.exists) return 'no Hindsight journal yet'
   if (activity.error) return activity.error
@@ -287,25 +342,31 @@ function hintFor(status) {
   if (!status.server.tokenSet && status.server.mode === 'cloud') {
     return 'No API token is configured, so Cloud calls fail with 401. Add "apiToken" to the shared config or set HINDSIGHT_API_TOKEN, then run /hindsight probe.'
   }
+  if (status.budget.turns === 0 && (status.activity.recent?.inject_ok ?? 0) > 0) {
+    return 'The journal shows Hindsight injections but none reached this hook: another pre-step listener is wrapping it. Restart DSH so the tuner registers after its bundle, then check /hindsight again.'
+  }
   if (probe?.ok) {
     return 'Memory is reachable. A cold bank seeds git history on the first session; pages appear as they consolidate.'
   }
   return 'Run /hindsight tune to apply the lean profile, or inspect the config path above.'
 }
 
-async function buildStatus(settings, stats, cwd = process.cwd()) {
+async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessionId = null) {
   const file = readConfigFile()
-  const server = effectiveServer(file.config)
+  const layers = effectiveConfig(file.config)
+  const effective = layers.config
+  const server = effectiveServer(effective, {})
   const integration = findIntegration()
   const project = projectName(cwd)
-  const bank = bankIdFor(file.config, project.name)
+  const resolution = bankResolution(effective, project.name, cwd)
   const probe = !integration.installed || server.disabled ? null : await probeServer({
     apiUrl: server.apiUrl,
     apiToken: server.token,
-    bankId: bank,
+    bankId: resolution.bank,
     timeoutMs: 4000,
   })
 
+  const session = governor.session(sessionId)
   const status = {
     file: { path: file.path, kind: file.kind, error: file.error ?? null },
     integration,
@@ -316,16 +377,26 @@ async function buildStatus(settings, stats, cwd = process.cwd()) {
       tokenSet: server.tokenSet,
       tokenSource: server.tokenSource,
     },
-    bank,
+    bank: resolution.bank,
+    bankSource: resolution.source,
     project,
     bundles: installedBundles().bundles,
     sources: { ...stats.sources },
+    stackTurns: stats.stackTurns,
     preset: {
       autoInject: getPath(file.config, 'autoInject') ?? null,
       injectTimeoutMs: getPath(file.config, 'injectTimeoutMs') ?? null,
       observationScopes: getPath(file.config, 'observationScopes') ?? null,
       recallMaxTokens: getPath(file.config, 'recallOptions.max_tokens') ?? null,
     },
+    effective: {
+      autoInject: effective.autoInject ?? null,
+      injectTimeoutMs: effective.injectTimeoutMs ?? null,
+      observationScopes: effective.observationScopes ?? null,
+      recallMaxTokens: getPath(effective, 'recallOptions.max_tokens') ?? null,
+      pageSearchLimit: effective.pageSearchLimit ?? null,
+    },
+    layers: { env: layers.envKeys, harness: layers.harnessKeys },
     desired: {
       autoInject: settings.autoInject,
       injectTimeoutMs: settings.injectTimeoutMs,
@@ -335,13 +406,14 @@ async function buildStatus(settings, stats, cwd = process.cwd()) {
     applied: appliedPaths(),
     budget: {
       cap: settings.maxInjectTokens,
+      turns: stats.turns,
       seen: stats.seen,
-      lastTokens: stats.lastTokens,
-      maxTokens: stats.maxTokens,
-      avgTokens: stats.seen > 0 ? Math.round(stats.totalTokens / stats.seen) : 0,
+      lastTurnTokens: stats.lastTurnTokens,
+      maxTurnTokens: stats.maxTurnTokens,
       capped: stats.capped,
-      deduped: stats.deduped,
+      dropped: stats.dropped,
       last: stats.last,
+      session: session ? { turns: session.turns, last: session.last, max: session.max, tokens: session.tokens } : null,
     },
     probe,
     activity: summarizeActivity(),
@@ -358,11 +430,12 @@ function formatStatus(status) {
       : status.probe?.ok
         ? 'reachable'
         : 'memory unavailable'
+  const recall = status.budget.session
   const lines = [
     `Hindsight memory — ${state}`,
     `  server   ${status.server.apiUrl} (${status.server.mode}) · token ${status.server.tokenSet ? `set (${status.server.tokenSource})` : 'not set'}`,
     `  probe    ${formatProbe(status.probe)}`,
-    `  bank     ${status.bank}${status.project.source === 'git' ? '' : '  (named from the directory; not shared with a git worktree bank)'}`,
+    `  bank     ${status.bank} (${status.bankSource})${status.project.source === 'git' ? '' : '  (named from the directory; not shared with a git worktree bank)'}`,
     status.bundles.length > 0
       ? `  bundles  ${status.bundles.map((bundle) => `${bundle.name} ${bundle.version}${bundle.enabled ? '' : ' (disabled)'}`).join(' · ')}`
       : '  bundles  no memory bundles detected in this profile',
@@ -372,22 +445,37 @@ function formatStatus(status) {
       const drift = presetDrift(status.preset, status.desired)
       return drift.length > 0 ? [`  drift    ${drift.join(' · ')} — /hindsight tune applies the preset`] : []
     })(),
+    ...(() => {
+      const layers = formatLayers({ config: status.effective, harnessKeys: status.layers.harness }, status.desired)
+      return layers ? [layers] : []
+    })(),
     `  applied  ${status.applied.length ? `${status.applied.length} keys: ${status.applied.join(', ')}` : 'nothing by this plugin'}`,
-    status.budget.seen > 0
-      ? `  recall   this session: ${status.budget.seen} seen · last ~${status.budget.lastTokens} tok · max ~${status.budget.maxTokens} tok · avg ~${status.budget.avgTokens} tok`
+    recall && recall.turns > 0
+      ? `  recall   ${recall.turns} turns · last ~${recall.last} tok · max ~${recall.max} tok · avg ~${Math.round(recall.tokens / recall.turns)} tok`
       : '  recall   no Hindsight recall observed in this session yet',
-    `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · deduped ${status.budget.deduped}`,
+    `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · dropped ${status.budget.dropped}`,
   ]
+
+  if (status.budget.turns > 0) {
+    lines.push('  order    outermost hook: this turn\u2019s payload passed through the budget')
+  } else {
+    lines.push('  order    outermost hook installed (prepend); confirmed on the first recall')
+  }
+
+  const pages = status.effective.pageSearchLimit
+  lines.push(`  pages    pageSearchLimit=${pages ?? 'unset'}${status.effective.recallMaxTokens != null ? ` · recall max_tokens=${status.effective.recallMaxTokens}` : ''}  (two separate ceilings)`)
+
   const sources = Object.entries(status.sources ?? {})
   lines.push(sources.length > 0
-    ? `  sources  ${sources.map(([kind, count]) => `${kind} ${count}`).join(' · ')}`
+    ? `  sources  ${sources.map(([kind, count]) => `${kind} ${count} turns`).join(' · ')}`
     : '  sources  no plugin-injected messages in this session yet')
-  if (sources.length > 1) {
-    lines.push('  stack    more than one plugin injects per turn; their budgets add up — keep one memory lane')
+  if (status.stackTurns > 0) {
+    lines.push(`  stack    more than one plugin injects per turn (${status.stackTurns} turns: ${(status.sources && Object.keys(status.sources).join(', ')) || 'unknown'}); their budgets add up — keep one memory lane`)
   }
   if (status.budget.last) {
     lines.push(`  last     cut ~${status.budget.last.before} → ~${status.budget.last.after} tokens`)
   }
+  lines.push(`  journal  ${status.activity.path ?? diagPath()}`)
   lines.push(`  activity ${formatActivity(status.activity)}`)
   if (!status.probe?.ok && status.activity.lastInject) {
     lines.push('  note     inject_ok counts what Hindsight sent; while recall fails that is its static tool guide, not project memory')
@@ -434,10 +522,23 @@ function formatRevert(result) {
 
 export function apply(ctx, rawConfig) {
   const settings = normalizeConfig(rawConfig)
-  const stats = { seen: 0, lastTokens: 0, maxTokens: 0, totalTokens: 0, capped: 0, deduped: 0, last: null, sources: {} }
+  const stats = {
+    turns: 0,
+    seen: 0,
+    lastTurnTokens: 0,
+    maxTurnTokens: 0,
+    capped: 0,
+    dropped: 0,
+    stackTurns: 0,
+    lastStack: null,
+    last: null,
+    sources: {},
+  }
   const governor = createGovernor(settings, stats)
   const preset = buildPreset(settings)
   let tuning = null
+  let disposePreStep = null
+  let reordered = false
 
   function ensureTuned() {
     if (tuning) return tuning
@@ -456,16 +557,49 @@ export function apply(ctx, rawConfig) {
     return tuning
   }
 
+  /**
+   * Re-register the pre-step hook as the outermost waterfall listener. This is
+   * what makes the budget authoritative: Cordis prepends, so the last registration
+   * wins, and a session-start fires after every bundle has mounted — that is the
+   * first moment at which "after Hindsight" can be guaranteed regardless of the
+   * profile's bundle order.
+   */
+  function attachPreStep() {
+    try { disposePreStep?.() } catch { /* already gone */ }
+    disposePreStep = ctx.on('agent/pre-step', governor.onPreStep, { prepend: true })
+  }
+
+  attachPreStep()
+
   ctx.on('agent/session-start', ({ agent } = {}) => {
     if (agent?.session?.header?.origin === 'subagent') return
+    if (!reordered) {
+      reordered = true
+      attachPreStep()
+    }
     ensureTuned().catch(() => {})
   })
-  ctx.on('agent/pre-step', governor.onPreStep)
-  ctx.effect(() => () => governor.dispose())
+  ctx.effect(() => () => {
+    try { disposePreStep?.() } catch { /* already gone */ }
+    governor.dispose()
+  })
   record({ event: 'activated', autoTune: settings.autoTune, cap: settings.maxInjectTokens, recall: settings.recallMaxTokens })
+
+  /** A write from a tool call needs explicit authorization; a user command does not. */
+  function mayWrite(options) {
+    if (!options.viaTool) return true
+    if (options.dryRun) return true
+    if (settings.allowAgentWrites) return true
+    return options.confirm === true
+  }
+
+  const refusal = 'Refused: this writes the shared Hindsight config. Pass confirm: true, or set allowAgentWrites: true in the bundle config.'
 
   async function runAction(action, options = {}) {
     const cwd = options.cwd ?? process.cwd()
+    if (action === 'tune' || action === 'revert') {
+      if (!mayWrite(options)) return refusal
+    }
     if (action === 'tune') {
       const result = applyTuning({
         preset,
@@ -488,19 +622,20 @@ export function apply(ctx, rawConfig) {
         return 'Hindsight memory layer not installed: add @vectorize-io/hindsight-coding-agents to this profile first.'
       }
       const file = readConfigFile()
-      const server = effectiveServer(file.config)
-      const bank = bankIdFor(file.config, projectName(cwd).name)
-      const probe = await probeServer({ apiUrl: server.apiUrl, apiToken: server.token, bankId: bank, timeoutMs: 4000 })
-      return `Hindsight server — ${formatProbe(probe)}\n  ${server.apiUrl} · bank ${bank}${server.tokenSet ? '' : ' · no token configured'}`
+      const effective = effectiveConfig(file.config).config
+      const server = effectiveServer(effective, {})
+      const resolution = bankResolution(effective, projectName(cwd).name, cwd)
+      const probe = await probeServer({ apiUrl: server.apiUrl, apiToken: server.token, bankId: resolution.bank, timeoutMs: 4000 })
+      return `Hindsight server — ${formatProbe(probe)}\n  ${server.apiUrl} · bank ${resolution.bank} (${resolution.source})${server.tokenSet ? '' : ' · no token configured'}`
     }
-    return formatStatus(await buildStatus(settings, stats, cwd))
+    return formatStatus(await buildStatus(settings, stats, governor, cwd, options.sessionId))
   }
 
   ctx.inject(['tools'], (toolCtx) => {
     toolCtx.tools.register({
       name: 'hindsight_tuner',
       description:
-        'Inspect and tune the Hindsight project-memory integration in this profile. Reports whether memory is reachable and why, applies a lean pages-first / per-source / token-budgeted profile to the shared ~/.hindsight/coding-agent.json, and can undo exactly the edits it made. Returns a short text report.',
+        'Inspect and tune the Hindsight project-memory integration in this profile. Reports whether memory is reachable and why, applies a lean pages-first / per-source / token-budgeted profile to the shared ~/.hindsight/coding-agent.json, and can undo exactly the edits it made. Writes from this tool require confirm: true unless allowAgentWrites is enabled. Returns a short text report.',
       parameters: {
         type: 'object',
         properties: {
@@ -508,7 +643,7 @@ export function apply(ctx, rawConfig) {
             type: 'string',
             enum: ACTIONS,
             description:
-              'status: health, current tuning and this session\'s injection budget. tune: apply the lean profile to the shared config. revert: undo only the keys this plugin wrote. probe: reachability check without reading the journal.',
+              'status: health, effective config, and this session\'s injection budget. tune: apply the lean profile to the shared config. revert: undo only the keys this plugin wrote. probe: reachability check without reading the journal.',
           },
           overwrite: {
             type: 'boolean',
@@ -517,6 +652,10 @@ export function apply(ctx, rawConfig) {
           dryRun: {
             type: 'boolean',
             description: 'On tune, report the diff without writing the config file.',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Explicit authorization for tune/revert when allowAgentWrites is off.',
           },
         },
         required: ['action'],
@@ -530,6 +669,9 @@ export function apply(ctx, rawConfig) {
         try {
           return await runAction(action, {
             cwd: exec?.agent?.session?.header?.cwd,
+            sessionId: exec?.agent?.session?.header?.id,
+            viaTool: true,
+            confirm: args?.confirm === true,
             overwrite: typeof args?.overwrite === 'boolean' ? args.overwrite : undefined,
             dryRun: args?.dryRun === true,
           })
@@ -553,7 +695,10 @@ export function apply(ctx, rawConfig) {
           try {
             return {
               kind: 'success',
-              text: await runAction(action, { cwd: invocation?.agent?.session?.header?.cwd }),
+              text: await runAction(action, {
+                cwd: invocation?.agent?.session?.header?.cwd,
+                sessionId: invocation?.agent?.session?.header?.id,
+              }),
             }
           } catch (error) {
             return { kind: 'error', text: String(error?.message ?? error) }

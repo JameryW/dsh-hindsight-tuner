@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.1
+
+- Correctness: the budget now actually applies. The tuner registers as the
+  outermost `agent/pre-step` waterfall listener (`prepend: true`, re-registered
+  on the first session start) so it sees Hindsight's message and the final
+  payload, instead of running inside the integration's own `next()`.
+- Correctness: one hard ceiling per turn. The sum of all `plugin:hindsight`
+  messages is capped by proportionally allocating `maxInjectTokens`, every
+  message is trimmed with a marker, and a message that cannot fit the marker is
+  dropped. The hidden 32-token floor is gone.
+- Repeat recalls are no longer dropped: because trimming defeats the
+  integration's dedupe, the old shortcut alternated between capped and absent
+  memory. Every turn is now trimmed to the same ceiling.
+- Safety: config writes take a lock, re-read the file under it, write a `0600`
+  temp that keeps a stricter original mode, and journal the change before
+  touching the file. A crash between journal and config is recovered on the
+  next change or revert.
+- Diagnosis: `effective` shows the config the integration actually reads
+  (environment < file < `harnesses.dsh`), `layers` shows overrides, `bank`
+  names the routing rule (`mapPathToBank` / `bankId` / template), and
+  `pages`/`recall` are reported as two separate ceilings.
+- `stack` now only flags plugins that inject in the *same* turn; per-session
+  recall counts are tracked separately instead of one instance-wide total.
+- Journal path honours `HINDSIGHT_DIAG_FILE`.
+- Tool-initiated writes need `confirm: true` (or `allowAgentWrites: true`);
+  the `/hindsight` command does not.
+
 ## 0.3.0
 
 - Audit coexistence: `bundles` lists the memory-related bundles the profile

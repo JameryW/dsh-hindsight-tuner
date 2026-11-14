@@ -21,20 +21,35 @@ cross-tool banks); this bundle owns three things it does not provide:
    before the first write, and `/hindsight revert` removes only keys this plugin
    added.
 
-2. **A hard per-turn injection budget.** A recall that arrives larger than
-   `maxInjectTokens` is cut on a line boundary with an explicit truncation
-   marker. This matters because the integration dedupes by comparing the new
-   recall against the last injected text: a trimmed message never matches, so
-   the tuner also drops that duplicate instead of letting a full-size payload
-   through on the following turn.
+2. **A hard per-turn injection budget.** The tuner registers as the *outermost*
+   `agent/pre-step` waterfall listener (`prepend: true`, re-registered once on
+   the first session start so it ends up outside the Hindsight hook regardless
+   of bundle load order). It therefore sees the final message list and enforces
+   one shared ceiling: the sum of every `plugin:hindsight` message in a turn is
+   at most `maxInjectTokens`. Trimming happens on a line boundary with an
+   explicit marker; a message that cannot fit even the marker is dropped. There
+   is no hidden 32-token floor — a tiny cap stays tiny. Because the integration
+   dedupes by comparing the new recall against the last injected text, a trimmed
+   message never matches, so every turn is re-trimmed to the same ceiling
+   instead of letting a full-size payload through on the next turn.
 
 3. **A diagnosis that does not lie.** With no token configured, the integration
    fails silently on every turn (`pages_failed`, `inject_unchanged`, `401` in
-   its own journal). `/hindsight` reports the endpoint, token source, bank,
-   probe result and journal activity, so "no memory" is distinguishable from
-   "no token" and "server down". It also counts every recall the integration
-   sends this session — last, max and average tokens — so the per-turn cost is
-   visible even when it stays under the cap.
+   its own journal). `/hindsight` reports the endpoint, token source, bank and
+   routing source, probe result, journal activity, and the *effective* config —
+   including `HINDSIGHT_*` environment overrides and the `harnesses.dsh` layer
+   the integration applies on top of the file. That makes "no memory" distinct
+   from "no token", "server down", "bank not seeded", and "another hook wraps
+   the budget". It also reports per-session turn count, last/max/average recall
+   tokens, and whether more than one plugin injected in the *same* turn.
+
+4. **Writes that survive a crash and a second process.** The shared config is
+   written under a sidecar lock, through a `0600` temporary file that keeps a
+   stricter target mode, with a journal written before the config. If DSH dies
+   between the two commits, the next run folds the journal into the applied map
+   by comparing the live value, so `/hindsight revert` still works. A tool call
+   that would write needs `confirm: true` (or `allowAgentWrites: true`); the
+   `/hindsight` command is user-initiated and does not.
 
 ## Install
 
@@ -59,6 +74,8 @@ the next DSH restart; the profile keeps its own copy of the row config.
 
 The same operations are exposed to the agent as the `hindsight_tuner` tool
 (`status`, `tune`, `revert`, `probe`), and both call the same implementation.
+Tool-initiated `tune`/`revert` require `confirm: true` (or the row's
+`allowAgentWrites`); `dryRun` previews are always allowed.
 
 ## Coexistence
 
@@ -93,6 +110,7 @@ survives upgrades):
 | `observationScopes` | `per_source` | Wanted consolidation scopes |
 | `recallMaxTokens` | `2000` | Wanted `recallOptions.max_tokens` |
 | `sourceKind` | `plugin:hindsight` | Recall message source kind to cap |
+| `allowAgentWrites` | `false` | Let the agent tool write the shared config without `confirm: true` |
 
 ## Limits
 
@@ -101,9 +119,21 @@ survives upgrades):
   `status` says `memory layer not installed` and changes nothing on the model path.
 - The bank line uses the session's working directory, so it names the same
   `coding-agent::{gitProject}` bank the integration uses — including the
-  directory-name fallback when the directory is not a git work tree.
+  directory-name fallback when the directory is not a git work tree. An explicit
+  `mapPathToBank` mapping wins, then `bankId` when `dynamicBankId` is off; the
+  `status` line names which rule matched.
 - Behavioural keys are read by the integration per workspace, so a change
   applies to new sessions; `apiToken` is re-read after a rejected request.
+- The effective config is the one the integration reads: environment
+  (`HINDSIGHT_*`) first, then the file, then `harnesses.dsh`. `status` shows
+  `layers` whenever those layers change a value the preset would otherwise
+  report as correct.
+- The journal path honours `HINDSIGHT_DIAG_FILE`, the same override the
+  integration uses; otherwise it reads `~/.hindsight/coding-agents-logs/diag.jsonl`.
+- The outermost registration is re-applied on the first non-subagent session
+  start. Without a session (or if another plugin re-registers later), the cap
+  still runs but only sees messages appended inside its own `next()` — the
+  `order` line reports whether a turn has actually passed through it.
 - Token counts are an estimate (CJK ≈ 1 token/char, other text ≈ 3.6 chars/token),
   not a tokenizer.
 - The shared config is global: a value written here is used by Claude Code and
