@@ -50,7 +50,9 @@ the next DSH restart; the profile keeps its own copy of the row config.
 
 ## Use
 
-- `/hindsight` — health, tuning, budget and journal activity for this session.
+- `/hindsight` — health, tuning, per-turn recall size, budget and journal
+  activity for this session. It flags `drift` when a value in the file differs
+  from the requested preset.
 - `/hindsight probe` — one reachability check, no journal read.
 - `/hindsight tune` — apply the lean profile now.
 - `/hindsight revert` — undo this plugin's keys.

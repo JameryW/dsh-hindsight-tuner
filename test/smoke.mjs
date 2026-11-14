@@ -37,6 +37,24 @@ assert.ok(capped.startsWith('line 0 '), 'keeps the head of the payload')
 assert.equal(truncateToBudget('short', 900), 'short', 'no-op under budget')
 assert.equal(truncateToBudget(long, 0), long, 'cap <= 0 disables')
 
+// The cap holds for mixed CJK/latin text at every boundary, not just this sample.
+let seed = 7
+function randomText(words) {
+  const pool = ['中', '记忆', 'word', 'token', '的', 'amber', 'ok']
+  let out = ''
+  for (let index = 0; index < words; index += 1) {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    out += `${pool[seed % pool.length]}${seed % 3 === 0 ? '\n' : ' '}`
+  }
+  return out
+}
+for (const cap of [40, 120, 600, 1600]) {
+  for (let round = 0; round < 10; round += 1) {
+    const output = truncateToBudget(randomText(300), cap, '\n…')
+    assert.ok(estimateTokens(output) <= cap, `cap ${cap} held: ${estimateTokens(output)}`)
+  }
+}
+
 // --- shared config tuning ---------------------------------------------------
 const preset = [
   ['autoInject', 'pages'],
@@ -187,8 +205,22 @@ const status = await tool.execute({ action: 'status' })
 assert.match(status, /Hindsight memory —/)
 assert.match(status, /127\.0\.0\.1:9/)
 assert.match(status, /unreachable/)
+assert.match(status, /drift\s+observationScopes shared ≠ per_source/)
 assert.match(status, /recall\s+this session: 4 seen/)
 assert.match(status, /budget\s+cap 600 tok\/turn · capped 2 · deduped 1/)
+
+// A recall that carries images keeps them; only its text is trimmed.
+const withImage = {
+  ...recallMessage,
+  id: 'recall-image',
+  content: [
+    { type: 'text', text: big },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } },
+  ],
+}
+const imageResult = await preStep({ agent: { session: { header: { id: 'image-session' } } } }, async () => ({ kind: 'enter', messages: [withImage] }))
+assert.ok(imageResult.messages[0].content.some((block) => block.type === 'image'), 'keeps non-text blocks')
+assert.ok(imageResult.messages[0].content[0].text.length < big.length, 'trims only the text block')
 
 const preview = await tool.execute({ action: 'tune', dryRun: true })
 assert.match(preview, /Would tune/)

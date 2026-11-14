@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1
+
+- Cache the journal parse, the git probe and the integration lookup, so repeated
+  `/hindsight` calls no longer reread the diagnostic log or spawn git each time.
+- Retry a locked config rename on Windows and report a locked or read-only file
+  with a message that names the cause instead of a raw errno.
+- Keep non-text content blocks when trimming a recall.
+- Show `drift` when the file's tuning differs from the requested preset, so a
+  hand-edited value is visible without comparing numbers.
+- Property-test the token cap across mixed CJK/latin input.
+
 ## 0.2.0
 
 - Rename the package to `@jameryw/dsh-hindsight-tuner`.

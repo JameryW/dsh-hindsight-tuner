@@ -85,6 +85,8 @@ function textOf(message) {
  * file and a reachable server describe nothing this profile can use, and a
  * status that only probed the endpoint would claim a capability that is absent.
  */
+let integrationMemo = null
+
 function findIntegration() {
   const roots = new Set()
   if (process.env.DSH_PROFILE_DIR) roots.add(process.env.DSH_PROFILE_DIR)
@@ -92,11 +94,20 @@ function findIntegration() {
     roots.add(join(process.env.DSH_HOME, 'profiles', process.env.DSH_PROFILE))
   }
   if (process.env.DSH_INSTALL_DIR) roots.add(process.env.DSH_INSTALL_DIR)
+
+  const key = [...roots].join('|')
+  if (integrationMemo?.key === key) return integrationMemo.value
+
+  let value = { installed: false, path: null }
   for (const root of roots) {
     const manifest = join(root, 'node_modules', '@vectorize-io', 'hindsight-coding-agents', 'package.json')
-    if (existsSync(manifest)) return { installed: true, path: manifest }
+    if (existsSync(manifest)) {
+      value = { installed: true, path: manifest }
+      break
+    }
   }
-  return { installed: false, path: null }
+  integrationMemo = { key, value }
+  return value
 }
 
 /** Turn a JSON error body into one readable sentence. */
@@ -166,7 +177,10 @@ function createGovernor(settings, stats) {
     record({ event: 'inject_capped', session: sessionId, before: tokens, after })
 
     const messages = decision.messages.slice()
-    messages[index] = { ...message, content: [{ type: 'text', text: trimmed }] }
+    const otherBlocks = Array.isArray(message.content)
+      ? message.content.filter((block) => block?.type !== 'text')
+      : []
+    messages[index] = { ...message, content: [{ type: 'text', text: trimmed }, ...otherBlocks] }
     return { ...decision, messages }
   }
 
@@ -199,6 +213,19 @@ function formatPreset(preset) {
     `observationScopes=${preset.observationScopes ?? 'unset'}`,
     `recall.max_tokens=${preset.recallMaxTokens ?? 'unset'}`,
   ].join(' · ')
+}
+
+/** Keys whose file value differs from the requested preset. */
+function presetDrift(actual, desired) {
+  const pairs = [
+    ['autoInject', actual.autoInject, desired.autoInject],
+    ['injectTimeoutMs', actual.injectTimeoutMs, desired.injectTimeoutMs],
+    ['observationScopes', actual.observationScopes, desired.observationScopes],
+    ['recallOptions.max_tokens', actual.recallMaxTokens, desired.recallMaxTokens],
+  ]
+  return pairs
+    .filter(([, have, want]) => have !== want)
+    .map(([key, have, want]) => `${key} ${have ?? 'unset'} ≠ ${want}`)
 }
 
 function formatActivity(activity) {
@@ -274,6 +301,12 @@ async function buildStatus(settings, stats, cwd = process.cwd()) {
       observationScopes: getPath(file.config, 'observationScopes') ?? null,
       recallMaxTokens: getPath(file.config, 'recallOptions.max_tokens') ?? null,
     },
+    desired: {
+      autoInject: settings.autoInject,
+      injectTimeoutMs: settings.injectTimeoutMs,
+      observationScopes: settings.observationScopes,
+      recallMaxTokens: settings.recallMaxTokens,
+    },
     applied: appliedPaths(),
     budget: {
       cap: settings.maxInjectTokens,
@@ -307,6 +340,10 @@ function formatStatus(status) {
     `  bank     ${status.bank}${status.project.source === 'git' ? '' : '  (named from the directory; not shared with a git worktree bank)'}`,
     `  config   ${status.file.path} (${describeKind(status.file.kind)}${status.file.error ? `: ${status.file.error}` : ''})`,
     `  tuning   ${formatPreset(status.preset)}`,
+    ...(() => {
+      const drift = presetDrift(status.preset, status.desired)
+      return drift.length > 0 ? [`  drift    ${drift.join(' · ')} — /hindsight tune applies the preset`] : []
+    })(),
     `  applied  ${status.applied.length ? `${status.applied.length} keys: ${status.applied.join(', ')}` : 'nothing by this plugin'}`,
     status.budget.seen > 0
       ? `  recall   this session: ${status.budget.seen} seen · last ~${status.budget.lastTokens} tok · max ~${status.budget.maxTokens} tok · avg ~${status.budget.avgTokens} tok`
