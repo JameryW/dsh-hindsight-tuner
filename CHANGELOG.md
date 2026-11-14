@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.12.0
+
+- Operational memory metrics: `status` gains a `memory` line and `status --json`
+  a `memory` block with the last 24 hours of `inject_ok` vs `inject_unchanged`
+  (freshness percentage), consolidated pages and server errors. These are
+  observable proxies — the plugin can see whether memory is being delivered and
+  whether it changes, but not whether it helped the task.
+- README gains "Measuring memory", which states that boundary explicitly and
+  lists what an external A/B harness must score (task success rate, stale-memory
+  errors, tokens per successful task, p95 recall latency); the JSON status is
+  the interface for such a harness.
+
 ## 0.11.0
 
 - Trust governance (`verifyReminder`, on in the shipped row): a recall is

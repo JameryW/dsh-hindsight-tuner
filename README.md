@@ -119,6 +119,25 @@ is buffered rather than written on every event: entries are flushed in one
 append after 250 ms, immediately when 500 are pending, on dispose, and on a
 normal process exit — diagnostics never sit on the model's critical path.
 
+## Measuring memory
+
+What the plugin can observe from inside the loop is reported as `memory` in
+`status --json` and as one line in `/hindsight`: over the last 24 hours, how many
+recalls were fresh (`inject_ok`) versus unchanged (`inject_unchanged`), the
+resulting freshness percentage, how many pages were consolidated (`pages_ok`),
+and how many server calls failed (`pages_failed` + `retain_failed` +
+`reflect_failed`). Together with the budget accounting (`trimmedTokens`,
+`savedTokens`, per-tier counts) that is enough to see whether memory is being
+delivered and whether the budget is doing anything — not whether it *helped*.
+
+Task-success measurement cannot live here honestly: the plugin never sees whether
+a task passed, so a self-reported "Memory Precision@K" would be a guess. A real
+A/B of memory policies needs an external harness that runs the same task set
+under arms (no memory / pages / recall / tuned tiers) and scores the outcomes,
+then compares Task Success Rate, stale-memory errors, tokens per successful task
+and p95 recall latency. The plugin makes that harness possible by exposing the
+budget, freshness and savings as JSON; it does not pretend to be the harness.
+
 ## Install
 
 Clone the repository and install the directory as a local bundle:

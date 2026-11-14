@@ -485,6 +485,32 @@ function formatActivity(activity) {
   return parts.length > 0 ? `24h: ${parts.join(' · ')}` : '24h: nothing recorded'
 }
 
+/**
+ * Operational proxies for memory quality. The plugin can see whether a recall
+ * changed since the previous turn and whether the server produced pages, but it
+ * cannot see whether the recalled text helped the task — that needs an external
+ * evaluation harness (see README: Measuring memory).
+ */
+function memoryMetrics(activity) {
+  const recent = activity?.recent ?? {}
+  const injected = recent.inject_ok ?? 0
+  const unchanged = recent.inject_unchanged ?? 0
+  const attempts = injected + unchanged
+  return {
+    windowHours: 24,
+    injected,
+    unchanged,
+    refreshPct: attempts > 0 ? Math.round((injected / attempts) * 1000) / 10 : null,
+    pagesOk: recent.pages_ok ?? 0,
+    serverErrors: (recent.pages_failed ?? 0) + (recent.retain_failed ?? 0) + (recent.reflect_failed ?? 0),
+  }
+}
+
+function formatMemory(memory) {
+  if (!memory || memory.refreshPct === null) return null
+  return `24h: ${memory.refreshPct}% of recalls were fresh (${memory.injected} injected / ${memory.unchanged} unchanged) · ${memory.serverErrors} server errors`
+}
+
 function formatAge(ms) {
   if (!Number.isFinite(ms) || ms < 0) return 'unknown age'
   if (ms < 60_000) return 'under a minute ago'
@@ -648,6 +674,7 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
     },
     probe,
     activity,
+    memory: memoryMetrics(activity),
   }
   status.stale = staleProcess(status)
   status.hint = hintFor(status)
@@ -758,6 +785,8 @@ function formatStatus(status) {
   }
   lines.push(`  journal  ${status.activity.path ?? diagPath()}`)
   lines.push(`  activity ${formatActivity(status.activity)}`)
+  const memoryLine = formatMemory(status.memory)
+  if (memoryLine) lines.push(`  memory   ${memoryLine}`)
   if (!status.probe?.ok && status.activity.lastInject) {
     lines.push('  note     inject_ok counts what Hindsight sent; while recall fails that is its static tool guide, not project memory')
   }

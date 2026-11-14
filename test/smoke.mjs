@@ -725,6 +725,11 @@ assert.match(measured, /observed recall ~\d+ tok p50 · ~\d+ tok p95 \(10 inject
 assert.match(measured, /maxInjectTokens: 2475/, 'cap follows the p95, clamped')
 assert.match(measured, /tiers\s+light \d+ \/ normal \d+ \/ deep 2475/, 'tiers follow the same distribution')
 assert.match(measured, /recallOptions\.max_tokens: 2000/)
+const memoryStatus = await tool.execute({ action: 'status' }, exec)
+assert.match(memoryStatus, /memory\s+24h: 100% of recalls were fresh \(10 injected \/ 0 unchanged\) · 0 server errors/, 'the memory line reports observable freshness, not a task-success claim')
+const memoryJson = JSON.parse(await tool.execute({ action: 'status', json: true }, exec))
+assert.equal(memoryJson.memory.refreshPct, 100)
+assert.equal(memoryJson.memory.injected, 10)
 
 // A journal that still fails against another origin means the running process
 // predates the config: the effective config alone cannot explain it.
@@ -813,7 +818,7 @@ try {
 
 // --- package contract -------------------------------------------------------
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
-assert.equal(pkg.version, '0.11.0', 'version matches this release')
+assert.equal(pkg.version, '0.12.0', 'version matches this release')
 assert.ok(pkg.engines?.node?.includes('>=22'), 'declares a Node floor the tests can rely on')
 assert.equal(pkg.license, 'MIT')
 assert.ok(pkg.files.includes('docs'), 'docs ship with the bundle')
