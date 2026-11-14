@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Hindsight 记忆调优",
-    "description": "用 /hindsight 查看 Hindsight 项目记忆是否可用、每轮注入多少 Token、当前生效的调优是什么。插件为单轮注入设置上限（maxInjectTokens，默认 3000），并把精简配置写入 ~/.hindsight/coding-agent.json：pages 优先注入、观测范围按来源隔离、7 秒注入超时、2000 Token 召回上限。默认只补齐缺失的键（除非要求覆盖），写入前会先备份；/hindsight revert 只删除本插件写过的键，停用插件本身不会回滚它们。执行 status 或 probe 时会向配置的 Hindsight 端点发起一次 GET 请求；插件自身的状态与日志位于 ~/.dsh/storages/dsh-hindsight-tuner。记忆本身由 @vectorize-io/hindsight-coding-agents 提供，缺少该 bundle 时插件会报告记忆层未安装。",
+    "description": "用 /hindsight 查看 Hindsight 项目记忆是否可用、每轮注入多少 Token、当前生效的调优是什么。插件为单轮注入设置上限（maxInjectTokens，默认 3000），并把精简配置写入 ~/.hindsight/coding-agent.json：pages 优先注入、观测范围按来源隔离、7 秒注入超时、2000 Token 召回上限。默认只补齐缺失的键（除非要求覆盖），写入前会先备份；/hindsight revert 只删除本插件写过的键，并关闭自动调优（直到 /hindsight enable），因此重启后不会重新补齐。智能体工具默认只读，除非设置 allowAgentWrites；写入请使用用户执行的 /hindsight tune 或 /hindsight revert。执行 status 或 probe 时会向配置的 Hindsight 端点发起一次 GET 请求；插件自身的状态与日志位于 ~/.dsh/storages/dsh-hindsight-tuner。记忆本身由 @vectorize-io/hindsight-coding-agents 提供，缺少该 bundle 时插件会报告记忆层未安装。",
     "detail": "docs/DETAIL.zh.md"
   }
 }

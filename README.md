@@ -19,7 +19,9 @@ cross-tool banks); this bundle owns three things it does not provide:
 
    Existing values win by default (`overwrite: false`). The file is backed up
    before the first write, and `/hindsight revert` removes only keys this plugin
-   added.
+   added. A revert also persists `autoTune: false` in the plugin's state, so the
+   next process does not quietly refill the keys; `/hindsight enable` restores
+   automatic tuning.
 
 2. **A hard per-turn injection budget.** The tuner registers as the *outermost*
    `agent/pre-step` waterfall listener (`prepend: true`, re-registered once on
@@ -28,28 +30,42 @@ cross-tool banks); this bundle owns three things it does not provide:
    one shared ceiling: the sum of every `plugin:hindsight` message in a turn is
    at most `maxInjectTokens`. Trimming happens on a line boundary with an
    explicit marker; a message that cannot fit even the marker is dropped. There
-   is no hidden 32-token floor — a tiny cap stays tiny. Because the integration
-   dedupes by comparing the new recall against the last injected text, a trimmed
-   message never matches, so every turn is re-trimmed to the same ceiling
-   instead of letting a full-size payload through on the next turn.
+   is no hidden 32-token floor — a tiny cap stays tiny (the minimum useful cap is
+   `0`, which disables trimming). Because the integration dedupes by comparing
+   the new recall against the last injected text, a trimmed message never
+   matches, so every turn is re-trimmed to the same ceiling instead of letting a
+   full-size payload through on the next turn.
 
 3. **A diagnosis that does not lie.** With no token configured, the integration
    fails silently on every turn (`pages_failed`, `inject_unchanged`, `401` in
    its own journal). `/hindsight` reports the endpoint, token source, bank and
    routing source, probe result, journal activity, and the *effective* config —
-   including `HINDSIGHT_*` environment overrides and the `harnesses.dsh` layer
-   the integration applies on top of the file. That makes "no memory" distinct
-   from "no token", "server down", "bank not seeded", and "another hook wraps
-   the budget". It also reports per-session turn count, last/max/average recall
-   tokens, and whether more than one plugin injected in the *same* turn.
+   including `HINDSIGHT_*` environment overrides and the `harnesses.dsh`,
+   `paths.<dir>` and `banks.<id>` layers the integration applies on top of the
+   file. That makes "no memory" distinct from "no token", "server down", "bank
+   not seeded", and "another hook wraps the budget". It also reports per-session
+   turn count, last/max/average recall tokens, the Pages and Recall ceilings
+   separately, invalid config values, and whether more than one plugin injected
+   in the *same* turn. `/hindsight suggest` proposes a cap from the journal's own
+   p95 recall size without writing anything.
 
 4. **Writes that survive a crash and a second process.** The shared config is
    written under a sidecar lock, through a `0600` temporary file that keeps a
-   stricter target mode, with a journal written before the config. If DSH dies
-   between the two commits, the next run folds the journal into the applied map
-   by comparing the live value, so `/hindsight revert` still works. A tool call
-   that would write needs `confirm: true` (or `allowAgentWrites: true`); the
-   `/hindsight` command is user-initiated and does not.
+   stricter target mode, with a journal written before the config. The temporary
+   file is checked against the `mtime`/size read under the lock immediately
+   before the rename, so an editor that saved in between produces a clear
+   "changed concurrently" error instead of a lost update. If DSH dies between
+   the two commits, the next run folds the journal into the applied map by
+   comparing the live value, so `/hindsight revert` still works. The lock only
+   serialises processes that obey the same protocol — a text editor or another
+   tool saving the JSON is not blocked, which is why the rename guard exists.
+
+5. **Writes the model cannot authorize itself.** The `hindsight_tuner` tool is
+   read-only by default (`status`, `probe`, `suggest`, and `dryRun` previews).
+   `tune`, `revert`, `enable` and `disable` are exposed to the tool only when the
+   profile row sets `allowAgentWrites: true`; there is no `confirm` flag, because
+   a flag the model fills in is not a permission boundary. The user-typed
+   `/hindsight tune` / `/hindsight revert` command is the intended write path.
 
 ## Install
 
@@ -69,13 +85,20 @@ the next DSH restart; the profile keeps its own copy of the row config.
   activity for this session. It flags `drift` when a value in the file differs
   from the requested preset.
 - `/hindsight probe` — one reachability check, no journal read.
-- `/hindsight tune` — apply the lean profile now.
-- `/hindsight revert` — undo this plugin's keys.
+- `/hindsight suggest` — read-only cap/recall recommendation from the recent
+  injection sizes.
+- `/hindsight tune [--dry-run] [--overwrite] [--cap N]` — apply the lean profile
+  now; `--cap` changes the session ceiling only.
+- `/hindsight revert [--dry-run]` — undo this plugin's keys and persist an
+  auto-tune opt-out, so a restart does not refill them.
+- `/hindsight enable` / `/hindsight disable` — turn the persistent auto-tune
+  opt-out back on or off. `disable` leaves existing keys untouched.
 
 The same operations are exposed to the agent as the `hindsight_tuner` tool
-(`status`, `tune`, `revert`, `probe`), and both call the same implementation.
-Tool-initiated `tune`/`revert` require `confirm: true` (or the row's
-`allowAgentWrites`); `dryRun` previews are always allowed.
+(`status`, `probe`, `suggest`; plus `tune`, `revert`, `enable`, `disable` when the
+row sets `allowAgentWrites: true`), and both call the same implementation. A
+tool call cannot escalate itself: `dryRun` previews are always allowed, writes
+are not.
 
 ## Coexistence
 
@@ -109,8 +132,9 @@ survives upgrades):
 | `injectTimeoutMs` | `7000` | Wanted inject deadline |
 | `observationScopes` | `per_source` | Wanted consolidation scopes |
 | `recallMaxTokens` | `2000` | Wanted `recallOptions.max_tokens` |
-| `sourceKind` | `plugin:hindsight` | Recall message source kind to cap |
-| `allowAgentWrites` | `false` | Let the agent tool write the shared config without `confirm: true` |
+| `tokenBudgetMode` | `fast` | `fast` estimate or `accurate` tokenizer (optional `js-tiktoken`) |
+| `sourceKind` | `plugin:hindsight` | Recall message kind to cap |
+| `allowAgentWrites` | `false` | Expose tool writes; without it the tool is read-only |
 
 ## Limits
 
@@ -135,11 +159,16 @@ survives upgrades):
 - The journal path honours `HINDSIGHT_DIAG_FILE`, the same override the
   integration uses; otherwise it reads `~/.hindsight/coding-agents-logs/diag.jsonl`.
 - The outermost registration is re-applied on the first non-subagent session
-  start. Without a session (or if another plugin re-registers later), the cap
-  still runs but only sees messages appended inside its own `next()` — the
-  `order` line reports whether a turn has actually passed through it.
-- Token counts are an estimate (CJK ≈ 1 token/char, other text ≈ 3.6 chars/token),
-  not a tokenizer.
+  start. Without a session (or if another plugin registers later), the cap still
+  runs but only sees messages appended inside its own `next()` — the `order` line
+  reports whether a turn has actually passed through it.
+- Token counts are an estimate by default (CJK ≈ 1 token/char, other text ≈
+  3.6 chars/token). `tokenBudgetMode: accurate` uses `js-tiktoken` when it is
+  installed and otherwise falls back to the estimate with a ×1.1 margin; `status`
+  names which path is active and, after accurate turns, reports the measured
+  fast/accurate p50 and p95 ratio.
+- The budget applies to `plugin:hindsight` messages. A second provider that
+  injects its own source kind is counted and flagged, not capped.
 - The shared config is global: a value written here is used by Claude Code and
   Codex on the same machine too. That is the point of the shared bank, and also
   why `overwrite` defaults to off.
@@ -149,8 +178,13 @@ survives upgrades):
 ## Development
 
 ```sh
-node test/smoke.mjs
+node test/smoke.mjs        # hermetic unit/behaviour tests
+node test/integration.mjs  # real @vectorize-io/hindsight-coding-agents hooks
 ```
 
 The smoke test is hermetic: it points `HINDSIGHT_CONFIG` and `DSH_HOME` at a
-scratch directory, so it never reads or writes your real memory config.
+scratch directory, so it never reads or writes your real memory config. The
+integration test loads the shipped Hindsight `dist/dsh.js`, registers its real
+`agent/pre-step` hook after the tuner, and asserts the payload the model would
+receive is inside the ceiling; it skips (exit 0) when the package is not
+installed, and CI installs it so every job runs it for real.

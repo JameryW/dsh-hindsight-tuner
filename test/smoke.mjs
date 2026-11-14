@@ -32,8 +32,8 @@ delete process.env.DSH_PROFILE
 delete process.env.DSH_INSTALL_DIR
 for (const name of ['HINDSIGHT_AUTO_INJECT', 'HINDSIGHT_API_URL', 'HINDSIGHT_API_PORT', 'HINDSIGHT_DISABLED']) delete process.env[name]
 
-const { estimateTokens, truncateToBudget, allocateBudget } = await import('../lib/tokens.js')
-const { applyTuning, revertTuning, readConfigFile, getPath } = await import('../lib/config-file.js')
+const { estimateTokens, truncateToBudget, allocateBudget, countTokens, percentile, FALLBACK_MARGIN } = await import('../lib/tokens.js')
+const { applyTuning, revertTuning, readConfigFile, getPath, autoTuneEnabled, setAutoTune } = await import('../lib/config-file.js')
 const { bankResolution, diagPath, effectiveConfig, optedOut } = await import('../lib/diagnostics.js')
 
 // --- token estimation and truncation ---------------------------------------
@@ -79,6 +79,58 @@ for (const tokens of [[900, 900], [5000, 10, 10], [1, 1, 1, 1]]) {
   assert.ok(sum <= 600, `allocations sum ${sum} <= 600`)
   assert.ok(allocations.every((value, index) => value <= tokens[index]), 'never allocates more than a message has')
 }
+
+// The fast path stays a documented estimate; accurate mode either uses the
+// installed tokenizer or says it fell back instead of pretending to be exact.
+const sample = '中文 mixed with ascii text'
+assert.deepEqual(countTokens(sample, { mode: 'fast' }), { tokens: estimateTokens(sample), mode: 'fast', exact: true })
+const fallback = countTokens(sample, { mode: 'accurate' })
+assert.equal(fallback.exact, false, 'no tokenizer installed -> estimate, not exact')
+assert.equal(fallback.tokens, Math.ceil(estimateTokens(sample) * FALLBACK_MARGIN), 'fallback carries the safety margin')
+const exactCounter = countTokens('abcdef', { mode: 'accurate', encode: (text) => text.length })
+assert.deepEqual(exactCounter, { tokens: 6, mode: 'accurate', exact: true }, 'an encoder is used when present')
+assert.equal(countTokens('', { mode: 'accurate' }).tokens, 0)
+assert.equal(percentile([3, 1, 4, 2], 50), 2)
+assert.equal(percentile([3, 1, 4, 2], 95), 4)
+assert.equal(percentile([], 50), null, 'no samples -> no percentile')
+
+// Trimming honours whatever counter the caller supplies, so the accurate path
+// and the fast path enforce the same ceiling with their own measurement.
+const latinLong = 'word '.repeat(400)
+const latinCount = (text) => Math.ceil(text.length / 4)
+const latinTrimmed = truncateToBudget(latinLong, 100, '\n…', latinCount)
+assert.ok(latinCount(latinTrimmed) <= 100, 'custom counter governs the cut')
+
+// --- config validation ------------------------------------------------------
+const { validateConfig, validateSettings } = await import('../lib/validate.js')
+
+const badSettings = validateSettings({
+  autoInject: 'sometime',
+  injectTimeoutMs: 10,
+  observationScopes: 'shared',
+  recallMaxTokens: 3000,
+  maxInjectTokens: -1,
+  sourceKind: 'hindsight',
+  tokenBudgetMode: 'fuzzy',
+})
+assert.deepEqual(badSettings.preset, [['observationScopes', 'shared'], ['recallOptions.max_tokens', 3000]], 'invalid settings never reach the preset')
+assert.deepEqual(badSettings.issues.map((issue) => issue.field).sort(), ['autoInject', 'injectTimeoutMs', 'maxInjectTokens', 'sourceKind', 'tokenBudgetMode'])
+
+const fileIssues = validateConfig({
+  autoInject: 'sometime',
+  serverMode: 'remote-ish',
+  apiPort: 0,
+  pageSearchLimit: 0,
+  recallOptions: { max_tokens: 2 },
+  banks: { anything: { free: 'form' } },
+  paths: { 'C:/work': { autoInject: 'pages' } },
+})
+assert.deepEqual(fileIssues.map((issue) => issue.path).sort(), ['apiPort', 'autoInject', 'pageSearchLimit', 'recallOptions.max_tokens', 'serverMode'], 'free-form maps are not judged')
+assert.deepEqual(validateConfig({ autoInject: 'pages' }), [], 'valid config has no issues')
+// Upstream also accepts the explicit form, and has no hard cap on these numbers.
+assert.deepEqual(validateConfig({ observationScopes: [['per_source'], ['shared']], seedLimit: 10000, pageSearchLimit: 500 }), [], 'list-form scopes and large limits are valid')
+assert.deepEqual(validateConfig({ observationScopes: [] }).map((issue) => issue.path), ['observationScopes'], 'an empty scope list would silently fall back')
+assert.deepEqual(validateSettings({ autoInject: 'pages', injectTimeoutMs: 7000, observationScopes: [['per_source']], recallMaxTokens: 2000, maxInjectTokens: 0, sourceKind: 'plugin:x', tokenBudgetMode: 'fast' }).issues, [], 'settings accept the list form and cap 0')
 
 // --- shared config tuning ---------------------------------------------------
 const preset = [
@@ -256,6 +308,11 @@ function waterfall(harness, event, payload, inner) {
   return run(0)
 }
 
+// A reverted profile stays reverted across processes until enabled again.
+assert.equal(autoTuneEnabled(), false, 'revert persists an opt-out')
+setAutoTune(true)
+assert.equal(autoTuneEnabled(), true)
+
 const { apply } = await import('../index.js')
 const harness = makeHarness()
 apply(harness.ctx, { autoTune: true, maxInjectTokens: 600, recallMaxTokens: 2500 })
@@ -404,21 +461,79 @@ await waterfall(separate, 'agent/pre-step', { agent: { session: { header: { id: 
 const separateStatus = await separate.tools[0].execute({ action: 'status' }, exec)
 assert.doesNotMatch(separateStatus, /stack\s+more than one plugin/)
 
-// Writes from a tool call need confirm: true; previews and commands do not.
+// Agent writes are off by default and there is no `confirm` flag to self-approve
+// with: only the user-typed command or an explicit allowAgentWrites setting writes.
 assert.match(await tool.execute({ action: 'tune', dryRun: true }, exec), /Would tune/, 'previews are read-only')
-assert.match(await tool.execute({ action: 'tune' }, exec), /Refused/)
-assert.match(await tool.execute({ action: 'revert' }, exec), /Refused/)
+assert.match(await tool.execute({ action: 'tune' }, exec), /Refused/, 'tool cannot tune without allowAgentWrites')
+assert.match(await tool.execute({ action: 'revert' }, exec), /Refused/, 'tool cannot revert without allowAgentWrites')
+assert.match(await tool.execute({ action: 'enable' }, exec), /Refused/, 'tool cannot flip auto-tune')
 
-const commitOutput = await tool.execute({ action: 'tune', confirm: true }, exec)
-assert.match(commitOutput, /Tuned/)
+const writer = makeHarness()
+apply(writer.ctx, { autoTune: false, allowAgentWrites: true, maxInjectTokens: 600 })
+const writerTool = writer.tools.find((candidate) => candidate.name === 'hindsight_tuner')
+const writerTune = await writerTool.execute({ action: 'tune' }, exec)
+assert.match(writerTune, /Tuned/)
+assert.equal(autoTuneEnabled(), true, 'an explicit tune re-enables auto-tune')
+const writerRevert = await writerTool.execute({ action: 'revert' }, exec)
+assert.match(writerRevert, /Reverted/)
+assert.match(writerRevert, /auto-tune is now off/)
+assert.equal(autoTuneEnabled(), false, 'revert persists an opt-out for new processes')
+assert.match(await writerTool.execute({ action: 'disable' }, exec), /Auto-tune disabled/)
+assert.match(await writerTool.execute({ action: 'enable' }, exec), /Auto-tune enabled/)
+assert.equal(autoTuneEnabled(), true)
 
-const revertOutput = await tool.execute({ action: 'revert', confirm: true }, exec)
-assert.match(revertOutput, /Reverted/)
+const beforePreview = readFileSync(process.env.HINDSIGHT_CONFIG, 'utf8')
+const preview = await writerTool.execute({ action: 'tune', dryRun: true }, exec)
+assert.match(preview, /Would tune/)
+assert.match(preview, /dry run: no file was changed/)
+assert.equal(readFileSync(process.env.HINDSIGHT_CONFIG, 'utf8'), beforePreview, 'a dry run writes nothing')
 
 const command = harness.commands.find((candidate) => candidate.name === 'hindsight')
 const commandResult = await command.handler({ rawInput: ' status' })
 assert.equal(commandResult.kind, 'success')
 assert.match(commandResult.text, /Hindsight memory —/)
+assert.match(commandResult.text, /auto\s+(tune on|off)/, 'status shows the auto-tune state')
+
+// The command is the user's write path, and it takes explicit flags.
+const caps = await command.handler({ rawInput: ' tune --cap 400' })
+assert.equal(caps.kind, 'success')
+assert.match(caps.text, /Tuned/)
+const cappedStatus = await tool.execute({ action: 'status' }, exec)
+assert.match(cappedStatus, /budget\s+cap 400 tok\/turn/)
+assert.equal((await command.handler({ rawInput: ' tune --cap 64001' })).kind, 'error', 'a cap beyond the supported range is rejected')
+assert.equal((await command.handler({ rawInput: ' status --dry-run' })).kind, 'error', 'flags are rejected on status')
+assert.equal((await command.handler({ rawInput: ' revert --overwrite' })).kind, 'error', '--overwrite is a tune flag')
+// A preview must not change the session ceiling either.
+const previewCap = await command.handler({ rawInput: ' tune --dry-run --cap 777' })
+assert.equal(previewCap.kind, 'success')
+assert.match(previewCap.text, /no file was changed/)
+assert.match(await tool.execute({ action: 'status' }, exec), /budget\s+cap 400 tok\/turn/, 'dry run leaves the live cap alone')
+assert.equal((await command.handler({ rawInput: ' frobnicate' })).kind, 'error', 'unknown actions are rejected')
+
+const suggestion = await tool.execute({ action: 'suggest' }, exec)
+assert.match(suggestion, /budget suggestion/)
+assert.match(suggestion, /maxInjectTokens: \d+/)
+assert.match(suggestion, /recallOptions\.max_tokens: \d+/)
+assert.match(suggestion, /Pages and Recall are separate ceilings/)
+
+// The suggestion is fitted to the journal's own injections, not a fixed guess.
+const now = new Date().toISOString()
+writeFileSync(process.env.HINDSIGHT_DIAG_FILE, [1200, 1800, 2400, 3000, 3600, 4200, 4800, 5400, 6000, 6600]
+  .map((chars) => JSON.stringify({ ts: now, event: 'inject_ok', chars }))
+  .join('\n'))
+const measured = await tool.execute({ action: 'suggest' }, exec)
+assert.match(measured, /observed recall ~\d+ tok p50 · ~\d+ tok p95 \(10 injections, char-based estimate\)/)
+assert.match(measured, /maxInjectTokens: 2475/, 'cap follows the p95, clamped')
+assert.match(measured, /recallOptions\.max_tokens: 2000/)
+
+// A config with an invalid value is reported, not silently accepted.
+const savedConfig = readFileSync(process.env.HINDSIGHT_CONFIG, 'utf8')
+writeFileSync(process.env.HINDSIGHT_CONFIG, JSON.stringify({ autoInject: 'sometime', apiPort: 0, recallOptions: { max_tokens: 2 } }, null, 2))
+const diagnosed = await tool.execute({ action: 'status' }, exec)
+assert.match(diagnosed, /invalid\s+autoInject="sometime"/, 'invalid effective config is surfaced')
+assert.match(diagnosed, /invalid\s+apiPort=0/)
+assert.match(diagnosed, /integration falls back/)
+writeFileSync(process.env.HINDSIGHT_CONFIG, savedConfig)
 
 const diagnosticPath = diagPath()
 assert.equal(diagnosticPath, process.env.HINDSIGHT_DIAG_FILE, 'journal override is honoured')
@@ -458,6 +573,14 @@ try {
 } finally {
   process.env.DSH_PROFILE_DIR = savedProfileDir
 }
+
+// --- package contract -------------------------------------------------------
+const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+assert.equal(pkg.version, '0.4.0', 'version matches this release')
+assert.ok(pkg.engines?.node?.includes('>=22'), 'declares a Node floor the tests can rely on')
+assert.equal(pkg.license, 'MIT')
+assert.ok(pkg.files.includes('docs'), 'docs ship with the bundle')
+assert.ok(pkg.scripts?.test, 'package exposes the test command CI runs')
 
 for (const dispose of harness.disposers) dispose()
 for (const dispose of zero.disposers) dispose()

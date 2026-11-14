@@ -28,9 +28,11 @@ import { join } from 'node:path'
 import {
   appliedPaths,
   applyTuning,
+  autoTuneEnabled,
   getPath,
   readConfigFile,
   revertTuning,
+  setAutoTune,
 } from './lib/config-file.js'
 import {
   bankResolution,
@@ -44,11 +46,21 @@ import {
   summarizeActivity,
 } from './lib/diagnostics.js'
 import { record } from './lib/log.js'
-import { allocateBudget, estimateTokens, truncateToBudget } from './lib/tokens.js'
+import {
+  allocateBudget,
+  countTokens,
+  estimateTokens,
+  FALLBACK_MARGIN,
+  loadTokenizer,
+  percentile,
+  truncateToBudget,
+} from './lib/tokens.js'
+import { validateConfig, validateSettings } from './lib/validate.js'
 
 const PLUGIN = 'hindsight-tuner'
 const MAX_REMEMBERED_SESSIONS = 40
-const ACTIONS = ['status', 'tune', 'revert', 'probe']
+const ACTIONS = ['status', 'tune', 'revert', 'probe', 'suggest', 'enable', 'disable']
+const READ_ACTIONS = ['status', 'probe', 'suggest']
 
 export const name = PLUGIN
 
@@ -62,24 +74,28 @@ function normalizeConfig(input) {
     maxInjectTokens: number(raw.maxInjectTokens, 3000),
     autoInject: text(raw.autoInject, 'pages'),
     injectTimeoutMs: number(raw.injectTimeoutMs, 7000),
-    observationScopes: text(raw.observationScopes, 'per_source'),
+    // Accept the named mode or the integration's explicit list form; validation
+    // rejects anything else instead of silently writing a broken value.
+    observationScopes: raw.observationScopes ?? 'per_source',
     // The integration's own recall default is 2000; pinning it keeps the budget
     // explicit and survives a future release that raises its default.
     recallMaxTokens: number(raw.recallMaxTokens, 2000),
     sourceKind: text(raw.sourceKind, 'plugin:hindsight'),
+    // fast: dependency-free estimate. accurate: the model tokenizer when one is
+    // installed, with a labelled fallback when it is not.
+    tokenBudgetMode: text(raw.tokenBudgetMode, 'fast').toLowerCase(),
     // A tool call is an agent action; writing the user's global config from it
-    // needs either this opt-in or an explicit confirm argument.
+    // is only allowed when the user edited this flag into the bundle config.
+    // There is deliberately no per-call "confirm" argument: a model can set that
+    // itself, which would make the boundary meaningless.
     allowAgentWrites: raw.allowAgentWrites === true,
   }
 }
 
 function buildPreset(settings) {
-  return [
-    ['autoInject', settings.autoInject],
-    ['injectTimeoutMs', settings.injectTimeoutMs],
-    ['observationScopes', settings.observationScopes],
-    ['recallOptions.max_tokens', settings.recallMaxTokens],
-  ]
+  // Only values that passed validation are written; an invalid bundle setting
+  // is reported in status instead of being copied into the shared file.
+  return settings.preset ?? []
 }
 
 function textOf(message) {
@@ -148,7 +164,7 @@ function remember(map, key, value) {
  * per-message limit, and there is no hidden minimum — when a message cannot fit
  * even a marker it is dropped so the turn stays under the ceiling.
  */
-function createGovernor(settings, stats) {
+function createGovernor(settings, stats, meter) {
   const sessions = new Map()
 
   function sessionOf(sessionId) {
@@ -187,7 +203,7 @@ function createGovernor(settings, stats) {
       if (message?.source?.kind !== settings.sourceKind) return
       const text = textOf(message)
       if (!text) return
-      candidates.push({ index, message, text, tokens: estimateTokens(text) })
+      candidates.push({ index, message, text, tokens: meter.measure(text) })
     })
     if (candidates.length === 0) return decision
 
@@ -209,7 +225,7 @@ function createGovernor(settings, stats) {
           return
         }
         const marker = `\n\n…[dsh-hindsight-tuner: cut from ~${candidate.tokens} to ~${allotted} tokens. Ask Hindsight for the full recall explicitly, or raise maxInjectTokens.]`
-        const trimmed = allotted > 0 ? truncateToBudget(candidate.text, allotted, marker) : ''
+        const trimmed = allotted > 0 ? truncateToBudget(candidate.text, allotted, marker, meter.count) : ''
         if (!trimmed) {
           removed.add(candidate.index)
           dropped += 1
@@ -219,12 +235,12 @@ function createGovernor(settings, stats) {
           ? candidate.message.content.filter((block) => block?.type !== 'text')
           : []
         messages[candidate.index] = { ...candidate.message, content: [{ type: 'text', text: trimmed }, ...otherBlocks] }
-        after += estimateTokens(trimmed)
+        after += meter.count(trimmed)
       })
       stats.capped += 1
       stats.dropped += dropped
       stats.last = { before: total, after, at: new Date().toISOString() }
-      record({ event: 'inject_capped', session: sessionId, before: total, after, dropped })
+      record({ event: 'inject_capped', session: sessionId, before: total, after, dropped, mode: meter.mode })
     }
 
     // Accounting records both what Hindsight wanted and what actually reached
@@ -338,6 +354,12 @@ function hintFor(status) {
       ? 'This directory is outside optInOnly/optInPaths, so Hindsight will not inject here; add the path or remove optInOnly.'
       : 'Hindsight is disabled in the shared config (disabled: true); clear that key to turn memory back on.'
   }
+  if (status.configIssues.length > 0) {
+    return 'The shared config contains values the integration does not accept; it silently falls back for those keys. Fix the invalid lines above (or run /hindsight tune) before trusting this report.'
+  }
+  if (status.settingsIssues.length > 0) {
+    return 'This bundle has invalid settings, so they were not written. Fix the row in cordis.patch.yml, then run /hindsight tune.'
+  }
   if (probe?.status === 401 || probe?.status === 403) {
     return 'The server rejected the token. Set "apiToken" in the shared config or HINDSIGHT_API_TOKEN, then run /hindsight probe to confirm — it is re-read on the next rejected request.'
   }
@@ -383,6 +405,7 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
   })
 
   const session = governor.session(sessionId)
+  const ratios = stats.ratios ?? []
   const status = {
     file: { path: file.path, kind: file.kind, error: file.error ?? null },
     integration,
@@ -403,6 +426,19 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
     bundles: installedBundles().bundles,
     sources: { ...stats.sources },
     stackTurns: stats.stackTurns,
+    autoTune: autoTuneEnabled(),
+    // Invalid bundle settings are never written; invalid file values are shown
+    // because the integration would otherwise use them (or their fallback).
+    settingsIssues: settings.issues ?? [],
+    configIssues: validateConfig(effective),
+    tokens: {
+      mode: stats.tokenizer?.mode ?? settings.tokenBudgetMode,
+      name: stats.tokenizer?.name ?? null,
+      ready: stats.tokenizer?.ready ?? false,
+      p50: percentile(ratios, 50),
+      p95: percentile(ratios, 95),
+      samples: ratios.length,
+    },
     preset: {
       autoInject: getPath(file.config, 'autoInject') ?? null,
       injectTimeoutMs: getPath(file.config, 'injectTimeoutMs') ?? null,
@@ -460,6 +496,7 @@ function formatStatus(status) {
       ? `  bundles  ${status.bundles.map((bundle) => `${bundle.name} ${bundle.version}${bundle.enabled ? '' : ' (disabled)'}`).join(' · ')}`
       : '  bundles  no memory bundles detected in this profile',
     `  config   ${status.file.path} (${describeKind(status.file.kind)}${status.file.error ? `: ${status.file.error}` : ''})`,
+    `  auto     ${status.autoTune ? 'tune on the first session of a new process' : 'off (persisted; /hindsight enable turns it back on)'}`,
     `  tuning   ${formatPreset(status.preset)}`,
     ...(() => {
       const drift = presetDrift(status.preset, status.desired)
@@ -469,11 +506,14 @@ function formatStatus(status) {
       const layers = formatLayers({ config: status.effective, harnessKeys: status.layers.harness, envKeys: status.layers.env, sections: status.layers.sections }, status.desired)
       return layers ? [layers] : []
     })(),
+    ...status.settingsIssues.map((issue) => `  invalid  ${issue.field}=${JSON.stringify(issue.value)} (${issue.message}) — not written`),
+    ...status.configIssues.map((issue) => `  invalid  ${issue.path}=${JSON.stringify(issue.value)} (${issue.message}) — the integration falls back`),
     `  applied  ${status.applied.length ? `${status.applied.length} keys: ${status.applied.join(', ')}` : 'nothing by this plugin'}`,
     recall && recall.turns > 0
       ? `  recall   ${recall.turns} turns · last ~${recall.last}${recall.lastInjected !== recall.last ? ` → ~${recall.lastInjected}` : ''} tok · wanted max ~${recall.max} tok · avg ~${Math.round(recall.tokens / recall.turns)} tok`
       : '  recall   no Hindsight recall observed in this session yet',
     `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · dropped ${status.budget.dropped}`,
+    `  tokens   ${formatTokens(status.tokens)}`,
   ]
 
   if (status.budget.turns > 0) {
@@ -504,6 +544,17 @@ function formatStatus(status) {
   return lines.join('\n')
 }
 
+function formatTokens(tokens) {
+  if (tokens.mode !== 'accurate') return 'fast estimate (CJK 1/char, other 0.28/char)'
+  const head = tokens.ready
+    ? `accurate: ${tokens.name}`
+    : `accurate requested, no tokenizer installed — fast ×${FALLBACK_MARGIN} (npm i js-tiktoken)`
+  const calibration = tokens.samples > 0 && Number.isFinite(tokens.p50)
+    ? ` · fast/accurate p50 ${tokens.p50.toFixed(2)}× p95 ${tokens.p95.toFixed(2)}× (n=${tokens.samples})`
+    : ''
+  return `${head}${calibration}`
+}
+
 function formatTune(result) {
   const heading = result.dryRun ? 'Would tune' : 'Tuned'
   const lines = [`${heading} ${result.path} (${result.fileExisted ? 'existing' : 'new file'})`]
@@ -514,7 +565,9 @@ function formatTune(result) {
   for (const kept of result.kept) lines.push(`  = ${kept.path}: already ${JSON.stringify(kept.value)}`)
   if (result.changed.length === 0) lines.push('  nothing to change')
   if (result.backupPath) lines.push(`  backup ${result.backupPath}`)
-  if (!result.dryRun && result.changed.length > 0) {
+  if (result.dryRun) {
+    lines.push('  (dry run: no file was changed)')
+  } else if (result.changed.length > 0) {
     lines.push('  behavioural keys take effect for new sessions; apiToken is re-read on the next rejected request.')
     lines.push('  undo: /hindsight revert (removes only the keys above).')
   }
@@ -522,14 +575,18 @@ function formatTune(result) {
 }
 
 function formatRevert(result) {
+  const heading = result.dryRun ? 'Would revert' : 'Reverted'
   if (result.reverted.length === 0) {
-    const lines = [`Nothing reverted in ${result.path}`]
+    const lines = [`${heading} — nothing to undo in ${result.path}`]
     for (const skipped of result.skipped) {
       lines.push(`  ! ${skipped.path}: changed since the plugin wrote it (now ${JSON.stringify(skipped.current)}), left alone`)
     }
+    if (!result.dryRun) {
+      lines.push('  auto-tune is now off for new processes; /hindsight enable turns it back on.')
+    }
     return lines.join('\n')
   }
-  const lines = [`Reverted ${result.path}`]
+  const lines = [`${heading} ${result.path}`]
   for (const entry of result.reverted) {
     lines.push(`  - ${entry.path}${entry.restored === null ? ' (removed)' : ` → ${JSON.stringify(entry.restored)}`}`)
   }
@@ -537,11 +594,20 @@ function formatRevert(result) {
     lines.push(`  ! ${skipped.path}: changed since the plugin wrote it (now ${JSON.stringify(skipped.current)}), left alone`)
   }
   if (result.backupPath) lines.push(`  backup ${result.backupPath}`)
+  if (result.dryRun) lines.push('  (dry run: no file was changed)')
+  else lines.push('  auto-tune is now off for new processes; /hindsight enable turns it back on.')
   return lines.join('\n')
 }
 
 export function apply(ctx, rawConfig) {
   const settings = normalizeConfig(rawConfig)
+  const checked = validateSettings(settings)
+  settings.issues = checked.issues
+  settings.preset = checked.preset
+  if (settings.issues.some((issue) => issue.field === 'maxInjectTokens')) {
+    settings.maxInjectTokens = 3000
+  }
+
   const stats = {
     turns: 0,
     seen: 0,
@@ -553,8 +619,38 @@ export function apply(ctx, rawConfig) {
     lastStack: null,
     last: null,
     sources: {},
+    ratios: [],
+    tokenizer: { mode: settings.tokenBudgetMode, name: null, ready: settings.tokenBudgetMode === 'fast' },
   }
-  const governor = createGovernor(settings, stats)
+
+  let tokenizer = null
+  if (settings.tokenBudgetMode === 'accurate') {
+    loadTokenizer()
+      .then((loaded) => {
+        tokenizer = loaded
+        stats.tokenizer = { mode: 'accurate', name: loaded?.name ?? null, ready: Boolean(loaded) }
+        record({ event: 'tokenizer', mode: 'accurate', name: loaded?.name ?? null })
+      })
+      .catch(() => { /* the estimate still applies */ })
+  }
+
+  const meter = {
+    mode: settings.tokenBudgetMode,
+    measure(text) {
+      const counted = countTokens(text, { mode: settings.tokenBudgetMode, encode: tokenizer?.encode })
+      if (settings.tokenBudgetMode === 'accurate' && counted.exact) {
+        const fast = estimateTokens(text)
+        if (fast > 0) stats.ratios.push(counted.tokens / fast)
+        while (stats.ratios.length > 200) stats.ratios.shift()
+      }
+      return counted.tokens
+    },
+    count(text) {
+      return countTokens(text, { mode: settings.tokenBudgetMode, encode: tokenizer?.encode }).tokens
+    },
+  }
+
+  const governor = createGovernor(settings, stats, meter)
   const preset = buildPreset(settings)
   let tuning = null
   let disposePreStep = null
@@ -564,6 +660,10 @@ export function apply(ctx, rawConfig) {
     if (tuning) return tuning
     tuning = (async () => {
       if (!settings.autoTune) return { skipped: true, reason: 'autoTune is off' }
+      if (!autoTuneEnabled()) {
+        record({ event: 'tune_skipped', reason: 'persisted opt-out' })
+        return { skipped: true, reason: 'auto-tune is off (persisted; /hindsight enable)' }
+      }
       try {
         const result = applyTuning({ preset, overwrite: settings.overwrite })
         record({ event: 'tune_applied', changed: result.changed.map((change) => change.path) })
@@ -603,38 +703,96 @@ export function apply(ctx, rawConfig) {
     try { disposePreStep?.() } catch { /* already gone */ }
     governor.dispose()
   })
-  record({ event: 'activated', autoTune: settings.autoTune, cap: settings.maxInjectTokens, recall: settings.recallMaxTokens })
+  record({ event: 'activated', autoTune: settings.autoTune, cap: settings.maxInjectTokens, recall: settings.recallMaxTokens, tokenBudgetMode: settings.tokenBudgetMode })
 
-  /** A write from a tool call needs explicit authorization; a user command does not. */
+  /**
+   * Writes are a user action, not an agent action. There is deliberately no
+   * per-call "confirm" flag: a model can supply that itself, so it is not an
+   * authorization boundary. A user who wants agent writes edits
+   * `allowAgentWrites: true` into the bundle config; everyone else uses
+   * /hindsight tune or /hindsight revert.
+   */
   function mayWrite(options) {
     if (!options.viaTool) return true
-    if (options.dryRun) return true
-    if (settings.allowAgentWrites) return true
-    return options.confirm === true
+    if (options.dryRun === true) return true
+    return settings.allowAgentWrites
   }
 
-  const refusal = 'Refused: this writes the shared Hindsight config. Pass confirm: true, or set allowAgentWrites: true in the bundle config.'
+  const refusal = 'Refused: this writes the shared Hindsight config, and agent writes are disabled for this bundle. Ask the user to run /hindsight tune (or /hindsight revert), or set allowAgentWrites: true in the bundle config.'
+
+  function formatSuggestion(status) {
+    const chars = status.activity.injectSizes ?? []
+    // The upstream journal records characters, not tokens; use its own 0.3
+    // chars/token ratio and label the result as derived.
+    const seen = chars.map((size) => Math.ceil(size * 0.3))
+    const p50 = percentile(seen, 50)
+    const p95 = percentile(seen, 95)
+    const observed = p95 ?? status.budget.maxTurnTokens ?? 0
+    const cap = Math.max(512, Math.min(8000, Math.ceil((observed || 2000) * 1.25)))
+    const recall = Math.min(cap, 2000)
+    const lines = ['Hindsight budget suggestion (read-only)']
+    if (p95) {
+      lines.push(`  observed recall ~${p50} tok p50 · ~${p95} tok p95 (${seen.length} injections, char-based estimate)`)
+    } else if (status.budget.maxTurnTokens > 0) {
+      lines.push(`  observed recall: this session wanted up to ~${status.budget.maxTurnTokens} tok in one turn`)
+    } else {
+      lines.push('  no recall measured yet: the suggestion starts from the 2000-token default')
+    }
+    lines.push(`  cap      maxInjectTokens: ${cap}  (1.25× the p95, clamped 512..8000; current ${status.budget.cap})`)
+    lines.push(`  recall   recallOptions.max_tokens: ${recall}  (Pages and Recall are separate ceilings; do not make recall larger than the cap by accident)`)
+    if (status.effective.autoInject !== 'pages') {
+      lines.push('  pages    autoInject: pages injects stored pages without a synthesis pass; prefer it for coding sessions')
+    }
+    lines.push('  apply    set these in the bundle config (cordis.patch.yml), or use /hindsight tune --cap N for this session only')
+    lines.push('  why      a cap near the p95 keeps most turns intact while a rare huge recall is trimmed instead of dominating the window')
+    return lines.join('\n')
+  }
 
   async function runAction(action, options = {}) {
     const cwd = options.cwd ?? process.cwd()
-    if (action === 'tune' || action === 'revert') {
-      if (!mayWrite(options)) return refusal
-    }
+    const writes = ['tune', 'revert', 'enable', 'disable']
+    if (writes.includes(action) && !mayWrite(options)) return refusal
+
     if (action === 'tune') {
+      const dryRun = options.dryRun === true
+      if (options.cap !== undefined) {
+        if (!Number.isInteger(options.cap) || options.cap < 0 || options.cap > 64000) {
+          return 'Refused: --cap must be an integer 0..64000 (0 turns the cap off).'
+        }
+        // A preview must not change this session's behaviour either.
+        if (!dryRun) {
+          settings.maxInjectTokens = options.cap
+          record({ event: 'cap_changed', cap: options.cap, scope: 'session' })
+        }
+      }
       const result = applyTuning({
         preset,
         overwrite: options.overwrite ?? settings.overwrite,
-        dryRun: options.dryRun === true,
+        dryRun,
+        enableAutoTune: !dryRun,
       })
-      if (!result.dryRun) tuning = Promise.resolve(result)
-      record({ event: result.dryRun ? 'tune_previewed' : 'tune_requested', changed: result.changed.map((change) => change.path) })
+      if (!dryRun) tuning = Promise.resolve(result)
+      record({ event: dryRun ? 'tune_previewed' : 'tune_requested', changed: result.changed.map((change) => change.path) })
       return formatTune(result)
     }
     if (action === 'revert') {
-      const result = revertTuning()
-      tuning = Promise.resolve({ skipped: true, reason: 'reverted' })
-      record({ event: 'tune_reverted', reverted: result.reverted.map((entry) => entry.path) })
+      const dryRun = options.dryRun === true
+      const result = revertTuning({ dryRun })
+      if (!dryRun) tuning = Promise.resolve({ skipped: true, reason: 'reverted' })
+      record({ event: dryRun ? 'revert_previewed' : 'tune_reverted', reverted: result.reverted.map((entry) => entry.path) })
       return formatRevert(result)
+    }
+    if (action === 'disable') {
+      setAutoTune(false)
+      tuning = Promise.resolve({ skipped: true, reason: 'auto-tune disabled' })
+      record({ event: 'autotune_disabled' })
+      return 'Auto-tune disabled for this profile. Existing config keys are untouched; /hindsight enable restores automatic tuning.'
+    }
+    if (action === 'enable') {
+      setAutoTune(true)
+      tuning = null
+      record({ event: 'autotune_enabled' })
+      return 'Auto-tune enabled. The lean profile will be applied on the next session start; /hindsight tune applies it now.'
     }
     if (action === 'probe') {
       const integration = findIntegration()
@@ -642,11 +800,15 @@ export function apply(ctx, rawConfig) {
         return 'Hindsight memory layer not installed: add @vectorize-io/hindsight-coding-agents to this profile first.'
       }
       const file = readConfigFile()
-      const effective = effectiveConfig(file.config).config
+      const base = effectiveConfig(file.config, { cwd }).config
+      const resolution = bankResolution(base, projectName(cwd).name, cwd)
+      const effective = effectiveConfig(file.config, { cwd, bank: resolution.base ?? resolution.bank }).config
       const server = effectiveServer(effective, {})
-      const resolution = bankResolution(effective, projectName(cwd).name, cwd)
       const probe = await probeServer({ apiUrl: server.apiUrl, apiToken: server.token, bankId: resolution.bank, timeoutMs: 4000 })
       return `Hindsight server — ${formatProbe(probe)}\n  ${server.apiUrl} · bank ${resolution.bank} (${resolution.source})${server.tokenSet ? '' : ' · no token configured'}`
+    }
+    if (action === 'suggest') {
+      return formatSuggestion(await buildStatus(settings, stats, governor, cwd, options.sessionId))
     }
     return formatStatus(await buildStatus(settings, stats, governor, cwd, options.sessionId))
   }
@@ -655,27 +817,23 @@ export function apply(ctx, rawConfig) {
     toolCtx.tools.register({
       name: 'hindsight_tuner',
       description:
-        'Inspect and tune the Hindsight project-memory integration in this profile. Reports whether memory is reachable and why, applies a lean pages-first / per-source / token-budgeted profile to the shared ~/.hindsight/coding-agent.json, and can undo exactly the edits it made. Writes from this tool require confirm: true unless allowAgentWrites is enabled. Returns a short text report.',
+        'Inspect the Hindsight project-memory integration in this profile: reachability, the effective shared config (environment, harness, paths/banks sections), token budget and per-turn recall cost, invalid values, and a read-only budget suggestion. This tool does not modify the shared config unless the user explicitly enabled allowAgentWrites in the bundle config; ask them to run /hindsight tune or /hindsight revert instead. Returns a short text report.',
       parameters: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
-            enum: ACTIONS,
+            enum: settings.allowAgentWrites ? ACTIONS : READ_ACTIONS,
             description:
-              'status: health, effective config, and this session\'s injection budget. tune: apply the lean profile to the shared config. revert: undo only the keys this plugin wrote. probe: reachability check without reading the journal.',
+              'status: health, effective config, and this session\'s injection budget. probe: reachability check without reading the journal. suggest: read-only cap/recall recommendation. tune/revert/enable/disable only when allowAgentWrites is enabled.',
           },
           overwrite: {
             type: 'boolean',
-            description: 'On tune, replace values that already exist instead of respecting the user\'s choice. Defaults to the bundle config.',
+            description: 'Agent-write mode only: on tune, replace values that already exist instead of respecting the user\'s choice.',
           },
           dryRun: {
             type: 'boolean',
-            description: 'On tune, report the diff without writing the config file.',
-          },
-          confirm: {
-            type: 'boolean',
-            description: 'Explicit authorization for tune/revert when allowAgentWrites is off.',
+            description: 'Agent-write mode only: report the tune diff without writing the config file.',
           },
         },
         required: ['action'],
@@ -691,7 +849,6 @@ export function apply(ctx, rawConfig) {
             cwd: exec?.agent?.session?.header?.cwd,
             sessionId: exec?.agent?.session?.header?.id,
             viaTool: true,
-            confirm: args?.confirm === true,
             overwrite: typeof args?.overwrite === 'boolean' ? args.overwrite : undefined,
             dryRun: args?.dryRun === true,
           })
@@ -706,20 +863,32 @@ export function apply(ctx, rawConfig) {
     try {
       commandCtx.commands.register({
         name: 'hindsight',
-        description: 'Show Hindsight memory health and injection budget; append tune, revert, or probe',
+        description: 'Hindsight memory: status | tune [--dry-run] [--overwrite] [--cap N] | revert [--dry-run] | probe | suggest | enable | disable',
         async handler(invocation) {
-          const action = String(invocation?.rawInput ?? '').trim().split(/\s+/)[0] || 'status'
+          const parts = String(invocation?.rawInput ?? '').trim().split(/\s+/).filter(Boolean)
+          const action = parts.shift() || 'status'
           if (!ACTIONS.includes(action)) {
-            return { kind: 'error', text: `Unknown action "${action}". Use status, tune, revert, or probe.` }
+            return { kind: 'error', text: `Unknown action "${action}". Use ${ACTIONS.join(', ')}.` }
+          }
+          const flags = parseCommandFlags(parts)
+          if (flags.unknown) {
+            return { kind: 'error', text: `Unknown option "${flags.unknown}". Use --dry-run, --overwrite, or --cap N.` }
+          }
+          if ((flags.overwrite || flags.cap !== undefined) && action !== 'tune') {
+            return { kind: 'error', text: 'Options --overwrite and --cap are only valid for tune.' }
+          }
+          if (flags.dryRun && !['tune', 'revert'].includes(action)) {
+            return { kind: 'error', text: 'Option --dry-run is only valid for tune or revert.' }
           }
           try {
-            return {
-              kind: 'success',
-              text: await runAction(action, {
-                cwd: invocation?.agent?.session?.header?.cwd,
-                sessionId: invocation?.agent?.session?.header?.id,
-              }),
-            }
+            const text = await runAction(action, {
+              cwd: invocation?.agent?.session?.header?.cwd,
+              sessionId: invocation?.agent?.session?.header?.id,
+              dryRun: flags.dryRun === true,
+              overwrite: flags.overwrite === true,
+              cap: flags.cap,
+            })
+            return { kind: text.startsWith('Refused:') ? 'error' : 'success', text }
           } catch (error) {
             return { kind: 'error', text: String(error?.message ?? error) }
           }
@@ -729,4 +898,17 @@ export function apply(ctx, rawConfig) {
       record({ event: 'command_failed', error: String(error?.message ?? error) })
     }
   })
+}
+
+function parseCommandFlags(parts) {
+  const flags = {}
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index]
+    if (part === '--dry-run') flags.dryRun = true
+    else if (part === '--overwrite') flags.overwrite = true
+    else if (part === '--cap') flags.cap = Number(parts[++index])
+    else if (part.startsWith('--cap=')) flags.cap = Number(part.slice('--cap='.length))
+    else flags.unknown = part
+  }
+  return flags
 }

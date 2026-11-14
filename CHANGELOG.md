@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.0
+
+- Real integration test (`test/integration.mjs`): imports the shipped
+  `@vectorize-io/hindsight-coding-agents` `dist/dsh.js`, registers its actual
+  `agent/pre-step` hook *after* the tuner, fires `agent/session-start`, and
+  asserts the final model payload is within the cap. CI installs the package so
+  the test runs for real on Linux, Windows and macOS.
+- Authorization is no longer self-service: the `confirm: true` parameter is gone.
+  The tool is read-only (`status`, `probe`, `suggest`, `dryRun`) unless the row
+  sets `allowAgentWrites: true`; `/hindsight tune|revert` is the user's write
+  path. A boolean the model can fill in was never a permission boundary.
+- Revert persists: it writes `autoTune: false` to the plugin state, so the next
+  process does not refill the keys. New `/hindsight enable` / `disable` manage
+  that opt-out explicitly.
+- Token calibration: `tokenBudgetMode: fast|accurate`. Accurate uses
+  `js-tiktoken` when installed, falls back to the estimate ×1.1 with an explicit
+  "no tokenizer" notice, and `status` reports the measured fast/accurate p50/p95
+  ratio instead of claiming accuracy.
+- Strict validation (`lib/validate.js`): an invalid bundle setting is reported
+  and dropped from the preset instead of being written; an invalid value already
+  in the effective config is surfaced as `invalid ... the integration falls back`.
+  A cap below the marker size drops the message rather than forcing 32 tokens;
+  `0` still means off.
+- New read-only `/hindsight suggest`: derives a cap from the journal's p95
+  injection size (1.25×, clamped 512..8000) and keeps Pages and Recall reported
+  as separate budgets.
+- Concurrency: the write compares the `mtime`/size it read under the lock right
+  before the rename, so a concurrent editor causes a clear `ECONCURRENT` error
+  (with one retry) instead of a lost update.
+- Added MIT `LICENSE`, `engines.node >= 22`, `npm test`, and a macOS CI job.
+
 ## 0.3.2
 
 - Diagnosis: effective config now also applies the integration's per-directory
