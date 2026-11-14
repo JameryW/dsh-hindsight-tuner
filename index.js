@@ -52,6 +52,7 @@ import {
   estimateTokens,
   FALLBACK_MARGIN,
   loadTokenizer,
+  overlapRatio,
   percentile,
   trimToBudget,
 } from './lib/tokens.js'
@@ -81,6 +82,15 @@ function normalizeConfig(input) {
     // explicit and survives a future release that raises its default.
     recallMaxTokens: number(raw.recallMaxTokens, 2000),
     sourceKind: text(raw.sourceKind, 'plugin:hindsight'),
+    // off: one hard ceiling per turn (the 0.3–0.7 behaviour). adaptive: the
+    // ceiling for a turn is chosen from a small tier table (light/normal/deep)
+    // and can only lower the configured maxInjectTokens, never raise it.
+    budgetPolicy: raw.budgetPolicy === 'adaptive' ? 'adaptive' : 'off',
+    budgetTiers: {
+      light: number(raw.budgetTiers?.light, 800),
+      normal: number(raw.budgetTiers?.normal, 1600),
+      deep: number(raw.budgetTiers?.deep, 3000),
+    },
     // fast: dependency-free estimate. accurate: the model tokenizer when one is
     // installed, with a labelled fallback when it is not.
     tokenBudgetMode: text(raw.tokenBudgetMode, 'fast').toLowerCase(),
@@ -188,6 +198,36 @@ function remember(map, key, value) {
 }
 
 /**
+ * Pick this turn's ceiling from the tier table.
+ *
+ * The policy is intentionally explainable rather than clever: every branch has
+ * a one-line reason that `status` prints, so a user can decide whether the rule
+ * matches their workflow. Signals available without host-internal access are
+ * the session's turn index, whether the last recall had to be cut, and how much
+ * of the current recall repeats the previous one. Tiers can only lower the
+ * configured ceiling — they never bypass `maxInjectTokens`.
+ */
+function chooseTier(tiers, session, text, total) {
+  const size = (value) => (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0)
+  const light = size(tiers?.light)
+  const normal = size(tiers?.normal)
+  const deep = size(tiers?.deep)
+  const overlap = session.turns > 0 && session.lastRaw ? overlapRatio(session.lastRaw, text) : 0
+  if (session.turns > 0 && overlap >= 0.6) {
+    return { name: 'light', ceiling: light, reason: `${Math.round(overlap * 100)}% of this recall repeats the previous one` }
+  }
+  if (session.turns > 0 && session.lastCapped) {
+    return { name: 'light', ceiling: light, reason: 'the previous recall had to be cut' }
+  }
+  if (session.turns === 0) {
+    return { name: 'deep', ceiling: deep, reason: 'first recall of the session, nothing is in context yet' }
+  }
+  if (total <= light) return { name: 'light', ceiling: light, reason: 'fits the light ceiling' }
+  if (total <= normal) return { name: 'normal', ceiling: normal, reason: 'fits the normal ceiling' }
+  return { name: 'deep', ceiling: deep, reason: 'larger than the normal ceiling' }
+}
+
+/**
  * Cap one turn's Hindsight recall.
  *
  * This runs as the outermost `agent/pre-step` listener, so it sees the final
@@ -202,7 +242,7 @@ function createGovernor(settings, stats, meter) {
   function sessionOf(sessionId) {
     let session = sessions.get(sessionId)
     if (!session) {
-      session = { turns: 0, tokens: 0, last: 0, max: 0 }
+      session = { turns: 0, tokens: 0, last: 0, max: 0, lastRaw: '', lastCapped: false, tier: null }
       remember(sessions, sessionId, session)
     }
     return session
@@ -240,14 +280,28 @@ function createGovernor(settings, stats, meter) {
     if (candidates.length === 0) return decision
 
     const total = candidates.reduce((sum, candidate) => sum + candidate.tokens, 0)
+    const combined = candidates.map((candidate) => candidate.text).join('\n')
     const cap = settings.maxInjectTokens
+    const session = sessionOf(sessionId)
+    let budget = cap
+    let tier = null
+
+    if (cap && settings.budgetPolicy === 'adaptive') {
+      tier = chooseTier(settings.budgetTiers, session, combined, total)
+      budget = Math.min(cap, tier.ceiling)
+      session.tier = tier.name
+      stats.tiers[tier.name] = (stats.tiers[tier.name] ?? 0) + 1
+      stats.lastTier = { ...tier, budget, requested: total }
+      record({ event: 'tier_selected', session: sessionId, tier: tier.name, ceiling: tier.ceiling, budget, requested: total, reason: tier.reason })
+    }
+
     let after = total
     let removed = new Set()
     let dropped = 0
     let messages = decision.messages
 
-    if (cap && total > cap) {
-      const allocations = allocateBudget(candidates.map((candidate) => candidate.tokens), cap)
+    if (budget && total > budget) {
+      const allocations = allocateBudget(candidates.map((candidate) => candidate.tokens), budget)
       messages = decision.messages.slice()
       after = 0
       candidates.forEach((candidate, position) => {
@@ -277,19 +331,21 @@ function createGovernor(settings, stats, meter) {
 
     // Accounting records both what Hindsight wanted and what actually reached
     // the model, so a capped turn never looks like an uncapped one.
-    const session = sessionOf(sessionId)
+    const cappedThisTurn = Boolean(budget && total > budget)
     session.turns += 1
     session.last = total
     session.lastInjected = after
     session.max = Math.max(session.max, total)
     session.tokens += total
     session.injected = (session.injected ?? 0) + after
+    session.lastCapped = cappedThisTurn
+    if (settings.budgetPolicy === 'adaptive') session.lastRaw = combined.slice(0, 20_000)
     stats.turns += 1
     stats.lastTurnTokens = total
     stats.maxTurnTokens = Math.max(stats.maxTurnTokens, total)
     stats.seen += candidates.length
 
-    if (cap && total > cap) {
+    if (cappedThisTurn) {
       return { ...decision, messages: messages.filter((_, index) => !removed.has(index)) }
     }
     return decision
@@ -508,6 +564,10 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
     applied: appliedPaths(),
     budget: {
       cap: settings.maxInjectTokens,
+      policy: settings.budgetPolicy,
+      tiers: settings.budgetTiers,
+      tier: stats.lastTier,
+      tierCounts: { ...stats.tiers },
       turns: stats.turns,
       seen: stats.seen,
       lastTurnTokens: stats.lastTurnTokens,
@@ -515,7 +575,17 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
       capped: stats.capped,
       dropped: stats.dropped,
       last: stats.last,
-      session: session ? { turns: session.turns, last: session.last, max: session.max, tokens: session.tokens } : null,
+      session: session
+        ? {
+            turns: session.turns,
+            last: session.last,
+            max: session.max,
+            tokens: session.tokens,
+            injected: session.injected ?? 0,
+            lastInjected: session.lastInjected ?? session.last,
+            tier: session.tier ?? null,
+          }
+        : null,
     },
     probe,
     activity,
@@ -599,12 +669,16 @@ function formatStatus(status) {
     recall && recall.turns > 0
       ? `  recall   ${recall.turns} turns · last ~${recall.last}${recall.lastInjected !== recall.last ? ` → ~${recall.lastInjected}` : ''} tok · wanted max ~${recall.max} tok · avg ~${Math.round(recall.tokens / recall.turns)} tok`
       : '  recall   no Hindsight recall observed in this session yet',
-    `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · dropped ${status.budget.dropped}`,
+    `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · dropped ${status.budget.dropped} · ${formatTier(status.budget)}`,
     `  tokens   ${formatTokens(status.tokens)}`,
   ]
 
   if (status.budget.turns > 0) {
-    lines.push('  order    outermost hook: this turn\u2019s payload passed through the budget')
+    lines.push(
+      status.budget.capped > 0
+        ? '  order    outermost hook: a recall in this process passed through the budget'
+        : '  order    outermost hook: saw the recall and it was within the ceiling',
+    )
   } else {
     lines.push('  order    outermost hook installed (prepend); confirmed on the first recall')
   }
@@ -647,6 +721,18 @@ function formatTokens(tokens) {
     ? ` · fast/accurate p50 ${tokens.p50.toFixed(2)}× p95 ${tokens.p95.toFixed(2)}× (n=${tokens.samples})`
     : ''
   return `${head}${calibration}`
+}
+
+/** The tier table and, once a recall has happened, the choice made for it. */
+function formatTier(budget) {
+  if (budget.policy !== 'adaptive') return 'tier off'
+  const tiers = budget.tiers ?? {}
+  const table = `${tiers.light ?? '?'}/${tiers.normal ?? '?'}/${tiers.deep ?? '?'} (light/normal/deep)`
+  const last = budget.tier
+  if (!last) return `adaptive ${table} · no recall yet`
+  const used = Number.isFinite(last.budget) ? last.budget : last.ceiling
+  const wanted = Number.isFinite(last.requested) ? `; ~${last.requested} wanted` : ''
+  return `adaptive ${table} · last ${last.name} ${used} (${last.reason}${wanted})`
 }
 
 function formatTune(result) {
@@ -713,6 +799,8 @@ export function apply(ctx, rawConfig) {
     lastStack: null,
     last: null,
     sources: {},
+    tiers: { light: 0, normal: 0, deep: 0 },
+    lastTier: null,
     ratios: [],
     tokenizer: { mode: settings.tokenBudgetMode, name: null, ready: settings.tokenBudgetMode === 'fast' },
   }

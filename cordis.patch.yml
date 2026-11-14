@@ -20,4 +20,11 @@
         observationScopes: per_source
         recallMaxTokens: 2000
         tokenBudgetMode: fast
+        # adaptive: pick a per-turn ceiling from this table (never above
+        # maxInjectTokens). off: every recall gets the full cap.
+        budgetPolicy: adaptive
+        budgetTiers:
+          light: 800
+          normal: 1600
+          deep: 3000
         allowAgentWrites: false

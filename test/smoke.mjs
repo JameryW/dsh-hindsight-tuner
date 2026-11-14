@@ -162,6 +162,25 @@ assert.deepEqual(validateConfig({ autoInject: 'pages' }), [], 'valid config has 
 assert.deepEqual(validateConfig({ observationScopes: [['per_source'], ['shared']], seedLimit: 10000, pageSearchLimit: 500 }), [], 'list-form scopes and large limits are valid')
 assert.deepEqual(validateConfig({ observationScopes: [] }).map((issue) => issue.path), ['observationScopes'], 'an empty scope list would silently fall back')
 assert.deepEqual(validateSettings({ autoInject: 'pages', injectTimeoutMs: 7000, observationScopes: [['per_source']], recallMaxTokens: 2000, maxInjectTokens: 0, sourceKind: 'plugin:x', tokenBudgetMode: 'fast' }).issues, [], 'settings accept the list form and cap 0')
+assert.deepEqual(
+  validateSettings({ autoInject: 'pages', injectTimeoutMs: 7000, observationScopes: 'shared', recallMaxTokens: 2000, maxInjectTokens: 3000, sourceKind: 'plugin:x', tokenBudgetMode: 'fast', budgetPolicy: 'adaptive', budgetTiers: { light: 600, normal: 900, deep: 1200 } }).issues,
+  [],
+  'an ordered adaptive tier table is valid',
+)
+assert.deepEqual(
+  validateSettings({ autoInject: 'pages', injectTimeoutMs: 7000, observationScopes: 'shared', recallMaxTokens: 2000, maxInjectTokens: 3000, sourceKind: 'plugin:x', tokenBudgetMode: 'fast', budgetPolicy: 'adaptive', budgetTiers: { light: 900, normal: 800, deep: 1200 } }).issues.map((issue) => issue.field),
+  ['budgetTiers'],
+  'out-of-order tiers would make the ceiling jump',
+)
+assert.deepEqual(
+  validateSettings({ autoInject: 'pages', injectTimeoutMs: 7000, observationScopes: 'shared', recallMaxTokens: 2000, maxInjectTokens: 3000, sourceKind: 'plugin:x', tokenBudgetMode: 'fast', budgetPolicy: 'adaptive', budgetTiers: { light: 0, normal: 800, deep: 1200 } }).issues.map((issue) => issue.field),
+  ['budgetTiers'],
+  'a zero tier would silently disable the ceiling',
+)
+assert.deepEqual(
+  validateSettings({ autoInject: 'pages', injectTimeoutMs: 7000, observationScopes: 'shared', recallMaxTokens: 2000, maxInjectTokens: 3000, sourceKind: 'plugin:x', tokenBudgetMode: 'fast', budgetPolicy: 'sometimes' }).issues.map((issue) => issue.field),
+  ['budgetPolicy'],
+)
 
 // --- shared config tuning ---------------------------------------------------
 const preset = [
@@ -483,6 +502,68 @@ assert.equal(integrationBundle.installed, true, 'JSON status resolves installed 
 assert.equal(parsed.compat.compatible, true)
 assert.equal(parsed.budget.cap, 600)
 assert.equal((await tool.execute({ action: 'probe', json: true }, exec)).includes('json is only valid with status'), true)
+assert.match(status, /tier off/, 'the default policy is the single hard ceiling')
+
+// --- adaptive tiers --------------------------------------------------------
+// The tier table can only lower the hard cap, and each choice carries a reason
+// that status prints, so the policy is auditable rather than magic.
+const adaptive = makeHarness()
+apply(adaptive.ctx, {
+  autoTune: false,
+  maxInjectTokens: 500,
+  budgetPolicy: 'adaptive',
+  budgetTiers: { light: 100, normal: 200, deep: 400 },
+})
+const adaptiveTool = adaptive.tools.find((candidate) => candidate.name === 'hindsight_tuner')
+const adaptiveExec = { agent: { session: { header: { id: 'adaptive', cwd: process.cwd() } } } }
+const adaptiveRecall = (id, text) => ({
+  id,
+  role: 'user',
+  source: { kind: 'plugin:hindsight', form: 'recall' },
+  content: [{ type: 'text', text }],
+})
+const adaptiveTurn = (id, text) => waterfall(adaptive, 'agent/pre-step', { agent: { session: { header: { id: 'adaptive' } } } }, async () => ({
+  kind: 'enter',
+  messages: [human, adaptiveRecall(id, text)],
+}))
+const injectedText = (result) => result.messages.find((message) => message.source?.kind === 'plugin:hindsight').content[0].text
+
+const deepTurn = await adaptiveTurn('deep', big)
+assert.ok(estimateTokens(injectedText(deepTurn)) <= 400, 'first recall uses the deep ceiling, not the cap')
+let adaptiveStatus = JSON.parse(await adaptiveTool.execute({ action: 'status', json: true }, adaptiveExec))
+assert.equal(adaptiveStatus.budget.policy, 'adaptive')
+assert.equal(adaptiveStatus.budget.tier.name, 'deep')
+assert.match(adaptiveStatus.budget.tier.reason, /first recall/, 'the first turn says why it is deep')
+assert.equal(adaptiveStatus.budget.tierCounts.deep, 1)
+assert.equal(adaptiveStatus.budget.session.tier, 'deep')
+assert.match(await adaptiveTool.execute({ action: 'status' }, adaptiveExec), /adaptive 100\/200\/400 .*last deep 400/)
+
+const repeatTurn = await adaptiveTurn('repeat', big)
+assert.ok(estimateTokens(injectedText(repeatTurn)) <= 100, 'a repeated recall drops to the light ceiling')
+adaptiveStatus = JSON.parse(await adaptiveTool.execute({ action: 'status', json: true }, adaptiveExec))
+assert.equal(adaptiveStatus.budget.tier.name, 'light')
+assert.match(adaptiveStatus.budget.tier.reason, /repeats the previous one/)
+
+const afterCutTurn = await adaptiveTurn('fresh', long.toUpperCase().repeat(3))
+assert.ok(estimateTokens(injectedText(afterCutTurn)) <= 100, 'a turn after a cut stays on the light ceiling')
+adaptiveStatus = JSON.parse(await adaptiveTool.execute({ action: 'status', json: true }, adaptiveExec))
+assert.match(adaptiveStatus.budget.tier.reason, /previous recall had to be cut/)
+
+// A tier can never raise the hard cap.
+const tight = makeHarness()
+apply(tight.ctx, {
+  autoTune: false,
+  maxInjectTokens: 150,
+  budgetPolicy: 'adaptive',
+  budgetTiers: { light: 100, normal: 200, deep: 400 },
+})
+const tightTurn = await waterfall(tight, 'agent/pre-step', { agent: { session: { header: { id: 'tight' } } } }, async () => ({
+  kind: 'enter',
+  messages: [human, adaptiveRecall('tight', big)],
+}))
+assert.ok(estimateTokens(injectedText(tightTurn)) <= 150, 'the configured cap still bounds a higher tier')
+for (const dispose of adaptive.disposers) dispose()
+for (const dispose of tight.disposers) dispose()
 
 // A second memory plugin injecting on the same turn is visible and flagged.
 const mnemonMessage = {
@@ -664,7 +745,7 @@ try {
 
 // --- package contract -------------------------------------------------------
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
-assert.equal(pkg.version, '0.7.0', 'version matches this release')
+assert.equal(pkg.version, '0.8.0', 'version matches this release')
 assert.ok(pkg.engines?.node?.includes('>=22'), 'declares a Node floor the tests can rely on')
 assert.equal(pkg.license, 'MIT')
 assert.ok(pkg.files.includes('docs'), 'docs ship with the bundle')

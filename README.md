@@ -40,6 +40,17 @@ cross-tool banks); this bundle owns three things it does not provide:
    message never matches, so every turn is re-trimmed to the same ceiling instead
    of letting a full-size payload through on the next turn.
 
+   By default a turn may spend the whole cap. `budgetPolicy: adaptive` instead
+   picks a ceiling per turn from `budgetTiers` (light/normal/deep, defaults
+   800/1600/3000, never above `maxInjectTokens`), with a reason the status
+   prints: the first recall of a session takes `deep` because nothing is in
+   context yet; a recall that mostly repeats the previous one (line overlap
+   ≥60%) or follows a turn that had to be cut takes `light`, because the model
+   already has that text; otherwise the smallest tier the recall fits is used.
+   The tier is a ceiling, not a target, and `status` shows the table, the last
+   choice with its reason and the per-tier counts (`status --json` carries the
+   same as data). `budgetPolicy: off` keeps the single hard ceiling.
+
 3. **A diagnosis that does not lie.** With no token configured, the integration
    fails silently on every turn (`pages_failed`, `inject_unchanged`, `401` in
    its own journal). `/hindsight` reports the endpoint, token source, bank and
@@ -154,6 +165,8 @@ survives upgrades):
 | `observationScopes` | `per_source` | Wanted consolidation scopes |
 | `recallMaxTokens` | `2000` | Wanted `recallOptions.max_tokens` |
 | `tokenBudgetMode` | `fast` | `fast` estimate or `accurate` tokenizer (optional `js-tiktoken`) |
+| `budgetPolicy` | `adaptive` in the shipped row (`off` default) | `adaptive` picks a per-turn ceiling from `budgetTiers`; `off` uses the cap |
+| `budgetTiers` | `{ light: 800, normal: 1600, deep: 3000 }` | Tier ceilings, each ≤ `maxInjectTokens`; must be ordered light ≤ normal ≤ deep |
 | `sourceKind` | `plugin:hindsight` | Recall message kind to cap |
 | `allowAgentWrites` | `false` | Expose tool writes; without it the tool is read-only |
 

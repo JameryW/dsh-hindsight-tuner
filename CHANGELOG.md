@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.0
+
+- Adaptive budget tiers (`budgetPolicy: adaptive`, `budgetTiers`): a turn's
+  ceiling is picked from light/normal/deep instead of always spending the cap.
+  The pick has a stated reason — first recall of the session (`deep`, nothing is
+  in context yet), a recall that mostly repeats the last one or follows a cut
+  (`light`, the model already has it), otherwise the smallest tier the recall
+  fits. Every tier is a ceiling: the configured `maxInjectTokens` still bounds
+  them, and `status` shows the table, the last choice and its reason, and how
+  often each tier was used. `budgetPolicy: off` keeps the old one-ceiling mode.
+- `overlapRatio` (lib/tokens.js) compares line sets of the previous and current
+  recall so the duplicate test is about content, not length.
+- `validateSettings` rejects an unordered tier table (`light <= normal <= deep`,
+  integers 0..64000) and an unknown policy before they reach the shared config.
+
 ## 0.7.0
 
 - `status --json` (tool: `json: true`) returns the same diagnosis as data: the
