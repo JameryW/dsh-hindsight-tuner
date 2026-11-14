@@ -16,6 +16,16 @@ const fakeProfile = join(scratch, 'profile')
 const fakeIntegration = join(fakeProfile, 'node_modules', '@vectorize-io', 'hindsight-coding-agents')
 mkdirSync(fakeIntegration, { recursive: true })
 writeFileSync(join(fakeIntegration, 'package.json'), '{"name":"@vectorize-io/hindsight-coding-agents","version":"0.0.0"}')
+writeFileSync(join(fakeProfile, 'package.json'), JSON.stringify({
+  name: 'test-profile',
+  private: true,
+  dependencies: {
+    '@vectorize-io/hindsight-coding-agents': '0.8.7',
+    'dsh-mnemon': '0.5.45',
+    'dsh-context': '0.84.1',
+  },
+  dsh: { profile: { bundles: ['@vectorize-io/hindsight-coding-agents', 'dsh-mnemon'] } },
+}, null, 2))
 process.env.DSH_PROFILE_DIR = fakeProfile
 delete process.env.DSH_PROFILE
 delete process.env.DSH_INSTALL_DIR
@@ -176,7 +186,14 @@ const recallMessage = {
   content: [{ type: 'text', text: big }],
 }
 const human = { id: 'human', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'do the thing' }] }
-const next = async () => ({ kind: 'enter', messages: [human, recallMessage] })
+let recallSequence = 0
+const next = async () => {
+  recallSequence += 1
+  return {
+    kind: 'enter',
+    messages: [human, { ...recallMessage, id: `recall-${recallSequence}` }],
+  }
+}
 
 const first = await preStep({ agent: { session: { header: { id: 'session-1' } } } }, next)
 const firstRecall = first.messages.find((message) => message.source?.kind === 'plugin:hindsight')
@@ -196,7 +213,7 @@ const otherSession = await preStep({ agent: { session: { header: { id: 'session-
 assert.equal(otherSession.messages.length, 2)
 
 // Under the cap: untouched.
-const small = { ...recallMessage, content: [{ type: 'text', text: 'short recall' }] }
+const small = { ...recallMessage, id: 'recall-small', content: [{ type: 'text', text: 'short recall' }] }
 const under = await preStep({}, async () => ({ kind: 'enter', messages: [small] }))
 assert.equal(under.messages[0].content[0].text, 'short recall')
 
@@ -206,8 +223,12 @@ assert.match(status, /Hindsight memory —/)
 assert.match(status, /127\.0\.0\.1:9/)
 assert.match(status, /unreachable/)
 assert.match(status, /drift\s+observationScopes shared ≠ per_source/)
+assert.ok(status.includes('dsh-mnemon 0.5.45'), 'lists a stacked memory bundle')
+assert.ok(status.includes('dsh-context 0.84.1 (disabled)'), 'marks a declared but inactive bundle')
+assert.ok(status.includes('plugin:hindsight 4'), 'counts Hindsight injections')
 assert.match(status, /recall\s+this session: 4 seen/)
 assert.match(status, /budget\s+cap 600 tok\/turn · capped 2 · deduped 1/)
+assert.doesNotMatch(status, /stack\s+more than one plugin/, 'one source is not a stack')
 
 // A recall that carries images keeps them; only its text is trimmed.
 const withImage = {
@@ -221,6 +242,18 @@ const withImage = {
 const imageResult = await preStep({ agent: { session: { header: { id: 'image-session' } } } }, async () => ({ kind: 'enter', messages: [withImage] }))
 assert.ok(imageResult.messages[0].content.some((block) => block.type === 'image'), 'keeps non-text blocks')
 assert.ok(imageResult.messages[0].content[0].text.length < big.length, 'trims only the text block')
+
+// A second memory plugin injecting on the same turn is visible and flagged.
+const mnemonMessage = {
+  id: 'mnemon-1',
+  role: 'user',
+  source: { kind: 'plugin:dsh-mnemon', form: 'recall' },
+  content: [{ type: 'text', text: 'mnemon recall' }],
+}
+await preStep({ agent: { session: { header: { id: 'stacked' } } } }, async () => ({ kind: 'enter', messages: [human, mnemonMessage] }))
+const stacked = await tool.execute({ action: 'status' })
+assert.ok(stacked.includes('plugin:dsh-mnemon 1'), 'counts another plugin source')
+assert.match(stacked, /stack\s+more than one plugin injects/)
 
 const preview = await tool.execute({ action: 'tune', dryRun: true })
 assert.match(preview, /Would tune/)

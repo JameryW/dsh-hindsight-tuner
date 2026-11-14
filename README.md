@@ -60,6 +60,24 @@ the next DSH restart; the profile keeps its own copy of the row config.
 The same operations are exposed to the agent as the `hindsight_tuner` tool
 (`status`, `tune`, `revert`, `probe`), and both call the same implementation.
 
+## Coexistence
+
+This bundle owns the Hindsight lane only. What it does and does not coordinate:
+
+- It caps and diagnoses `@vectorize-io/hindsight-coding-agents` injections
+  (`plugin:hindsight`). It does not configure or cap another memory provider.
+- `dsh-mnemon` can reach the same Hindsight server through its own
+  `dsh-mnemon-provider-hindsight` adapter, but that adapter carries its own
+  endpoint and bank settings: the shared file this plugin edits does not
+  configure it. Running both lanes means two recalls per turn; `/hindsight`
+  counts `sources` per injection kind and flags `stack` when more than one
+  plugin injects.
+- `billion-context` compresses at the proxy/ACP layer. The per-turn cap still
+  applies before compression, but the two do not share a budget.
+- The `bundles` line lists the memory-related bundles the profile declares
+  (with version and enabled state), so a stacked setup is visible without
+  reading `package.json`.
+
 ## Configuration
 
 Tune the row in the profile's `cordis.patch.yml` (the user's patch layer

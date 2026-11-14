@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+
+- Audit coexistence: `bundles` lists the memory-related bundles the profile
+  declares with version and enabled state, and `sources` counts injected
+  messages per plugin source kind.
+- Flag a stacked setup with `stack` when more than one plugin injects per turn,
+  so two memory lanes are visible instead of silently doubling the context.
+- Document exactly which lanes this bundle does and does not coordinate
+  (Hindsight direct, Mnemon's Hindsight provider, billion-context compression).
+
 ## 0.2.1
 
 - Cache the journal parse, the git probe and the integration lookup, so repeated

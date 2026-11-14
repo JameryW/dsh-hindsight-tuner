@@ -32,6 +32,7 @@ import {
 import {
   bankIdFor,
   effectiveServer,
+  installedBundles,
   probeServer,
   projectName,
   summarizeActivity,
@@ -137,10 +138,32 @@ function remember(map, key, value) {
  */
 function createGovernor(settings, stats) {
   const seen = new Map()
+  const countedSources = new Set()
+
+  /**
+   * Count every plugin-injected message once, whatever plugin it came from.
+   * This is the only honest way to see a stacked memory setup: two plugins
+   * injecting on the same turn is invisible from either plugin's own logs.
+   */
+  function noteSources(messages) {
+    for (const message of messages) {
+      const kind = message?.source?.kind
+      if (typeof kind !== 'string' || !kind.startsWith('plugin:')) continue
+      const id = message?.id
+      if (typeof id === 'string') {
+        if (countedSources.has(id)) continue
+        countedSources.add(id)
+        if (countedSources.size > 5000) countedSources.clear()
+      }
+      stats.sources[kind] = (stats.sources[kind] ?? 0) + 1
+    }
+  }
 
   async function onPreStep(payload, next) {
     const decision = await next()
     if (!decision || decision.kind !== 'enter' || !Array.isArray(decision.messages)) return decision
+
+    noteSources(decision.messages)
 
     const index = decision.messages.findIndex((message) => message?.source?.kind === settings.sourceKind)
     if (index < 0) return decision
@@ -295,6 +318,8 @@ async function buildStatus(settings, stats, cwd = process.cwd()) {
     },
     bank,
     project,
+    bundles: installedBundles().bundles,
+    sources: { ...stats.sources },
     preset: {
       autoInject: getPath(file.config, 'autoInject') ?? null,
       injectTimeoutMs: getPath(file.config, 'injectTimeoutMs') ?? null,
@@ -338,6 +363,9 @@ function formatStatus(status) {
     `  server   ${status.server.apiUrl} (${status.server.mode}) · token ${status.server.tokenSet ? `set (${status.server.tokenSource})` : 'not set'}`,
     `  probe    ${formatProbe(status.probe)}`,
     `  bank     ${status.bank}${status.project.source === 'git' ? '' : '  (named from the directory; not shared with a git worktree bank)'}`,
+    status.bundles.length > 0
+      ? `  bundles  ${status.bundles.map((bundle) => `${bundle.name} ${bundle.version}${bundle.enabled ? '' : ' (disabled)'}`).join(' · ')}`
+      : '  bundles  no memory bundles detected in this profile',
     `  config   ${status.file.path} (${describeKind(status.file.kind)}${status.file.error ? `: ${status.file.error}` : ''})`,
     `  tuning   ${formatPreset(status.preset)}`,
     ...(() => {
@@ -350,6 +378,13 @@ function formatStatus(status) {
       : '  recall   no Hindsight recall observed in this session yet',
     `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · deduped ${status.budget.deduped}`,
   ]
+  const sources = Object.entries(status.sources ?? {})
+  lines.push(sources.length > 0
+    ? `  sources  ${sources.map(([kind, count]) => `${kind} ${count}`).join(' · ')}`
+    : '  sources  no plugin-injected messages in this session yet')
+  if (sources.length > 1) {
+    lines.push('  stack    more than one plugin injects per turn; their budgets add up — keep one memory lane')
+  }
   if (status.budget.last) {
     lines.push(`  last     cut ~${status.budget.last.before} → ~${status.budget.last.after} tokens`)
   }
@@ -399,7 +434,7 @@ function formatRevert(result) {
 
 export function apply(ctx, rawConfig) {
   const settings = normalizeConfig(rawConfig)
-  const stats = { seen: 0, lastTokens: 0, maxTokens: 0, totalTokens: 0, capped: 0, deduped: 0, last: null }
+  const stats = { seen: 0, lastTokens: 0, maxTokens: 0, totalTokens: 0, capped: 0, deduped: 0, last: null, sources: {} }
   const governor = createGovernor(settings, stats)
   const preset = buildPreset(settings)
   let tuning = null
