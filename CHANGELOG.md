@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0
+
+- Stale-process detection: the journal records the endpoint of its newest
+  failure, so `status` can compare it with the effective `apiUrl`. When they
+  differ and the failure is less than an hour old, the running DSH process
+  predates the config change and memory keeps failing until a restart — reported
+  on a dedicated `process` line and as the leading hint (above the generic
+  auth/404 advice it used to be buried under). This is the state the live
+  profile was in: config pointed at the daemon, the process still called Cloud
+  and logged 401s.
+
 ## 0.5.0
 
 - Structure-aware trimming: a recall is cut at the last paragraph boundary or

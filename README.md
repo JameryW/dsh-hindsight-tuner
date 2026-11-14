@@ -52,8 +52,12 @@ cross-tool banks); this bundle owns three things it does not provide:
    separately, invalid config values, and whether more than one plugin injected
    in the *same* turn. It names the installed integration version and flags a
    version outside the `0.8.x` line the CI integration test covers, because the
-   hook contract is private to that package. `/hindsight suggest` proposes a cap
-   from the journal's own p95 recall size without writing anything.
+   hook contract is private to that package. It also detects a **stale process**:
+   when the journal's newest failure still targets a different origin than the
+   effective config, the running DSH predates the config change and will keep
+   failing until it is restarted — a state no amount of correct file content
+   fixes, so `/hindsight` names it on its own `process` line. `/hindsight suggest`
+   proposes a cap from the journal's own p95 recall size without writing anything.
 
 4. **Writes that survive a crash and a second process.** The shared config is
    written under a sidecar lock, through a `0600` temporary file that keeps a

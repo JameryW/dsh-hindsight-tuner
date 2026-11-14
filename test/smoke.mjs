@@ -549,13 +549,28 @@ assert.match(suggestion, /Pages and Recall are separate ceilings/)
 
 // The suggestion is fitted to the journal's own injections, not a fixed guess.
 const now = new Date().toISOString()
-writeFileSync(process.env.HINDSIGHT_DIAG_FILE, [1200, 1800, 2400, 3000, 3600, 4200, 4800, 5400, 6000, 6600]
+const injectionJournal = [1200, 1800, 2400, 3000, 3600, 4200, 4800, 5400, 6000, 6600]
   .map((chars) => JSON.stringify({ ts: now, event: 'inject_ok', chars }))
-  .join('\n'))
+  .join('\n')
+writeFileSync(process.env.HINDSIGHT_DIAG_FILE, injectionJournal)
 const measured = await tool.execute({ action: 'suggest' }, exec)
 assert.match(measured, /observed recall ~\d+ tok p50 · ~\d+ tok p95 \(10 injections, char-based estimate\)/)
 assert.match(measured, /maxInjectTokens: 2475/, 'cap follows the p95, clamped')
 assert.match(measured, /recallOptions\.max_tokens: 2000/)
+
+// A journal that still fails against another origin means the running process
+// predates the config: the effective config alone cannot explain it.
+writeFileSync(process.env.HINDSIGHT_DIAG_FILE, JSON.stringify({
+  ts: now,
+  event: 'pages_failed',
+  error: 'GET http://127.0.0.1:9077/v1/default/banks/coding-agent%3A%3Afixture/pages/tree -> 404 (old process)',
+}))
+const stale = await tool.execute({ action: 'status' }, exec)
+assert.match(stale, /process\s+newest journal failure still targets http:\/\/127\.0\.0\.1:9077/, 'stale process is named')
+assert.match(stale, /the running DSH loaded the old config; restart it/)
+assert.match(stale, /newest journal failure targets http:\/\/127\.0\.0\.1:9077/, 'hint explains the stale process')
+assert.match(stale, /Restart DSH/)
+writeFileSync(process.env.HINDSIGHT_DIAG_FILE, injectionJournal)
 
 // A config with an invalid value is reported, not silently accepted.
 const savedConfig = readFileSync(process.env.HINDSIGHT_CONFIG, 'utf8')
@@ -608,7 +623,7 @@ try {
 
 // --- package contract -------------------------------------------------------
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
-assert.equal(pkg.version, '0.5.0', 'version matches this release')
+assert.equal(pkg.version, '0.6.0', 'version matches this release')
 assert.ok(pkg.engines?.node?.includes('>=22'), 'declares a Node floor the tests can rely on')
 assert.equal(pkg.license, 'MIT')
 assert.ok(pkg.files.includes('docs'), 'docs ship with the bundle')

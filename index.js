@@ -392,6 +392,9 @@ function hintFor(status) {
   if (status.settingsIssues.length > 0) {
     return 'This bundle has invalid settings, so they were not written. Fix the row in cordis.patch.yml, then run /hindsight tune.'
   }
+  if (status.stale) {
+    return `The newest journal failure targets ${status.stale.seen}, but the effective config points at ${status.stale.expected}: the running DSH process loaded the old config. Restart DSH so the integration re-reads it.`
+  }
   if (probe?.status === 401 || probe?.status === 403) {
     return 'The server rejected the token. Set "apiToken" in the shared config or HINDSIGHT_API_TOKEN, then run /hindsight probe to confirm — it is re-read on the next rejected request.'
   }
@@ -438,6 +441,7 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
 
   const session = governor.session(sessionId)
   const ratios = stats.ratios ?? []
+  const activity = summarizeActivity()
   const status = {
     file: { path: file.path, kind: file.kind, error: file.error ?? null },
     integration,
@@ -505,10 +509,42 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
       session: session ? { turns: session.turns, last: session.last, max: session.max, tokens: session.tokens } : null,
     },
     probe,
-    activity: summarizeActivity(),
+    activity,
   }
+  status.stale = staleProcess(status)
   status.hint = hintFor(status)
   return status
+}
+
+/**
+ * The integration is loaded once per process. If its journal's newest failure
+ * still targets a different origin than the effective config, the running
+ * process predates the config change — memory will keep failing until DSH is
+ * restarted, which no amount of correct file content fixes.
+ */
+const STALE_FAILURE_MS = 3_600_000
+
+function originOf(url) {
+  try {
+    return new URL(String(url)).origin.toLowerCase()
+  } catch {
+    return String(url ?? '').replace(/\/+$/, '').toLowerCase()
+  }
+}
+
+function staleProcess(status) {
+  const seen = status.activity.lastEndpoint
+  if (!seen) return null
+  const failedAt = Date.parse(status.activity.lastFailure?.ts ?? '')
+  if (!Number.isFinite(failedAt) || Date.now() - failedAt > STALE_FAILURE_MS) return null
+  const expected = originOf(status.server.apiUrl)
+  if (!expected || originOf(seen) === expected) return null
+  return {
+    seen: originOf(seen),
+    expected,
+    event: status.activity.lastFailure?.event ?? null,
+    bank: status.activity.lastBank ?? null,
+  }
 }
 
 function formatStatus(status) {
@@ -523,6 +559,9 @@ function formatStatus(status) {
   const lines = [
     `Hindsight memory — ${state}`,
     `  server   ${status.server.apiUrl} (${status.server.mode}) · token ${status.server.tokenSet ? `set (${status.server.tokenSource})` : 'not set'}`,
+    ...(status.stale
+      ? [`  process  newest journal failure still targets ${status.stale.seen} (${status.stale.event ?? 'failure'}${status.stale.bank ? `, bank ${status.stale.bank}` : ''}) — the running DSH loaded the old config; restart it`]
+      : []),
     `  probe    ${formatProbe(status.probe)}`,
     `  bank     ${status.bank} (${status.bankSource})${status.bankBase ? ` renamed from ${status.bankBase}` : ''}${status.project.source === 'git' ? '' : '  (named from the directory; not shared with a git worktree bank)'}`,
     status.bundles.length > 0
