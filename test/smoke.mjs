@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -9,6 +9,16 @@ process.on('exit', () => rmSync(scratch, { recursive: true, force: true }))
 
 process.env.DSH_HOME = join(scratch, 'dsh-home')
 process.env.HINDSIGHT_CONFIG = join(scratch, 'coding-agent.json')
+
+// Pin the environment: the plugin looks for the integration in the profile, so
+// give it a fake profile instead of relying on the machine running the test.
+const fakeProfile = join(scratch, 'profile')
+const fakeIntegration = join(fakeProfile, 'node_modules', '@vectorize-io', 'hindsight-coding-agents')
+mkdirSync(fakeIntegration, { recursive: true })
+writeFileSync(join(fakeIntegration, 'package.json'), '{"name":"@vectorize-io/hindsight-coding-agents","version":"0.0.0"}')
+process.env.DSH_PROFILE_DIR = fakeProfile
+delete process.env.DSH_PROFILE
+delete process.env.DSH_INSTALL_DIR
 
 const { estimateTokens, truncateToBudget } = await import('../lib/tokens.js')
 const { applyTuning, revertTuning, readConfigFile, getPath } = await import('../lib/config-file.js')
@@ -218,20 +228,14 @@ assert.match(zeroStatus, /cap off/)
 
 // --- memory layer absent ----------------------------------------------------
 const savedProfileDir = process.env.DSH_PROFILE_DIR
-const savedProfile = process.env.DSH_PROFILE
-const savedInstallDir = process.env.DSH_INSTALL_DIR
-delete process.env.DSH_PROFILE_DIR
-delete process.env.DSH_PROFILE
-delete process.env.DSH_INSTALL_DIR
+process.env.DSH_PROFILE_DIR = join(scratch, 'profile-without-integration')
 try {
   const missing = await tool.execute({ action: 'status' })
   assert.match(missing, /memory layer not installed/)
   assert.match(missing, /probe\s+not checked/)
   assert.match(await tool.execute({ action: 'probe' }), /not installed/)
 } finally {
-  if (savedProfileDir !== undefined) process.env.DSH_PROFILE_DIR = savedProfileDir
-  if (savedProfile !== undefined) process.env.DSH_PROFILE = savedProfile
-  if (savedInstallDir !== undefined) process.env.DSH_INSTALL_DIR = savedInstallDir
+  process.env.DSH_PROFILE_DIR = savedProfileDir
 }
 
 for (const dispose of harness.disposers) dispose()
