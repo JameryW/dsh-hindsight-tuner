@@ -129,8 +129,7 @@ function createGovernor(settings, stats) {
 
   async function onPreStep(payload, next) {
     const decision = await next()
-    const cap = settings.maxInjectTokens
-    if (!cap || !decision || decision.kind !== 'enter' || !Array.isArray(decision.messages)) return decision
+    if (!decision || decision.kind !== 'enter' || !Array.isArray(decision.messages)) return decision
 
     const index = decision.messages.findIndex((message) => message?.source?.kind === settings.sourceKind)
     if (index < 0) return decision
@@ -139,7 +138,14 @@ function createGovernor(settings, stats) {
     const raw = textOf(message)
     if (!raw) return decision
     const tokens = estimateTokens(raw)
-    if (tokens <= cap) return decision
+
+    stats.seen += 1
+    stats.lastTokens = tokens
+    stats.maxTokens = Math.max(stats.maxTokens, tokens)
+    stats.totalTokens += tokens
+
+    const cap = settings.maxInjectTokens
+    if (!cap || tokens <= cap) return decision
 
     const sessionId = payload?.agent?.session?.header?.id ?? 'unknown'
     const previous = seen.get(sessionId)
@@ -216,9 +222,6 @@ function hintFor(status) {
   if (probe?.status === 401 || probe?.status === 403) {
     return 'The server rejected the token. Set "apiToken" in the shared config or HINDSIGHT_API_TOKEN, then run /hindsight probe to confirm — it is re-read on the next rejected request.'
   }
-  if (!status.server.tokenSet && status.server.mode === 'cloud') {
-    return 'No API token is configured, so Cloud calls fail with 401. Add "apiToken" to the shared config or set HINDSIGHT_API_TOKEN, then run /hindsight probe.'
-  }
   if (probe && probe.status === 0) {
     return `The server is unreachable. For daemon mode, start hindsight-embed on ${status.server.apiUrl}.`
   }
@@ -230,6 +233,9 @@ function hintFor(status) {
   }
   if (probe && probe.status >= 500) {
     return `The server reported ${probe.status}. Check the hosted status page or your self-hosted instance, then retry /hindsight probe.`
+  }
+  if (!status.server.tokenSet && status.server.mode === 'cloud') {
+    return 'No API token is configured, so Cloud calls fail with 401. Add "apiToken" to the shared config or set HINDSIGHT_API_TOKEN, then run /hindsight probe.'
   }
   if (probe?.ok) {
     return 'Memory is reachable. A cold bank seeds git history on the first session; pages appear as they consolidate.'
@@ -269,7 +275,16 @@ async function buildStatus(settings, stats, cwd = process.cwd()) {
       recallMaxTokens: getPath(file.config, 'recallOptions.max_tokens') ?? null,
     },
     applied: appliedPaths(),
-    budget: { cap: settings.maxInjectTokens, capped: stats.capped, deduped: stats.deduped, last: stats.last },
+    budget: {
+      cap: settings.maxInjectTokens,
+      seen: stats.seen,
+      lastTokens: stats.lastTokens,
+      maxTokens: stats.maxTokens,
+      avgTokens: stats.seen > 0 ? Math.round(stats.totalTokens / stats.seen) : 0,
+      capped: stats.capped,
+      deduped: stats.deduped,
+      last: stats.last,
+    },
     probe,
     activity: summarizeActivity(),
   }
@@ -293,7 +308,10 @@ function formatStatus(status) {
     `  config   ${status.file.path} (${describeKind(status.file.kind)}${status.file.error ? `: ${status.file.error}` : ''})`,
     `  tuning   ${formatPreset(status.preset)}`,
     `  applied  ${status.applied.length ? `${status.applied.length} keys: ${status.applied.join(', ')}` : 'nothing by this plugin'}`,
-    `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · this session: capped ${status.budget.capped} · deduped ${status.budget.deduped}`,
+    status.budget.seen > 0
+      ? `  recall   this session: ${status.budget.seen} seen · last ~${status.budget.lastTokens} tok · max ~${status.budget.maxTokens} tok · avg ~${status.budget.avgTokens} tok`
+      : '  recall   no Hindsight recall observed in this session yet',
+    `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · deduped ${status.budget.deduped}`,
   ]
   if (status.budget.last) {
     lines.push(`  last     cut ~${status.budget.last.before} → ~${status.budget.last.after} tokens`)
@@ -344,7 +362,7 @@ function formatRevert(result) {
 
 export function apply(ctx, rawConfig) {
   const settings = normalizeConfig(rawConfig)
-  const stats = { capped: 0, deduped: 0, last: null }
+  const stats = { seen: 0, lastTokens: 0, maxTokens: 0, totalTokens: 0, capped: 0, deduped: 0, last: null }
   const governor = createGovernor(settings, stats)
   const preset = buildPreset(settings)
   let tuning = null

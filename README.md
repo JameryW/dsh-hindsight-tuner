@@ -32,7 +32,9 @@ cross-tool banks); this bundle owns three things it does not provide:
    fails silently on every turn (`pages_failed`, `inject_unchanged`, `401` in
    its own journal). `/hindsight` reports the endpoint, token source, bank,
    probe result and journal activity, so "no memory" is distinguishable from
-   "no token" and "server down".
+   "no token" and "server down". It also counts every recall the integration
+   sends this session — last, max and average tokens — so the per-turn cost is
+   visible even when it stays under the cap.
 
 ## Install
 

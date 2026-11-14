@@ -8,7 +8,7 @@
 # shared config untouched and keeps the plugin read-only apart from the budget cap.
 - insert:
     - id: hindsight-tuner
-      name: '@local/dsh-hindsight-tuner'
+      name: '@jameryw/dsh-hindsight-tuner'
       config:
         autoTune: true
         overwrite: false

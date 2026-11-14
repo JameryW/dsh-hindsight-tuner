@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 const root = resolve(import.meta.dirname, '..')
-const scratch = resolve(root, '..', '..', '.tmp-hindsight-tuner')
-rmSync(scratch, { recursive: true, force: true })
-mkdirSync(scratch, { recursive: true })
+const scratch = mkdtempSync(join(tmpdir(), 'dsh-hindsight-tuner-'))
+process.on('exit', () => rmSync(scratch, { recursive: true, force: true }))
 
 process.env.DSH_HOME = join(scratch, 'dsh-home')
 process.env.HINDSIGHT_CONFIG = join(scratch, 'coding-agent.json')
@@ -94,51 +94,52 @@ writeFileSync(process.env.HINDSIGHT_CONFIG, JSON.stringify({
   observationScopes: 'shared',
 }, null, 2))
 
-const handlers = new Map()
-const tools = []
-const commands = []
-const disposers = []
-
-const ctx = {
-  on(event, handler) {
-    if (!handlers.has(event)) handlers.set(event, [])
-    handlers.get(event).push(handler)
-    return () => {}
-  },
-  effect(factory) {
-    const dispose = factory()
-    if (typeof dispose === 'function') disposers.push(dispose)
-    return () => {}
-  },
-  inject(services, callback) {
-    if (services.includes('tools')) {
-      callback({ tools: { register(definition) { tools.push(definition) } } })
-    }
-    if (services.includes('commands')) {
-      callback({ commands: { register(definition) { commands.push(definition); return () => {} } } })
-    }
-    return () => {}
-  },
+function makeHarness() {
+  const handlers = new Map()
+  const harness = { handlers, tools: [], commands: [], disposers: [] }
+  harness.ctx = {
+    on(event, handler) {
+      if (!handlers.has(event)) handlers.set(event, [])
+      handlers.get(event).push(handler)
+      return () => {}
+    },
+    effect(factory) {
+      const dispose = factory()
+      if (typeof dispose === 'function') harness.disposers.push(dispose)
+      return () => {}
+    },
+    inject(services, callback) {
+      if (services.includes('tools')) {
+        callback({ tools: { register(definition) { harness.tools.push(definition) } } })
+      }
+      if (services.includes('commands')) {
+        callback({ commands: { register(definition) { harness.commands.push(definition); return () => {} } } })
+      }
+      return () => {}
+    },
+  }
+  return harness
 }
 
 const { apply } = await import('../index.js')
-apply(ctx, { autoTune: true, maxInjectTokens: 600, recallMaxTokens: 2500 })
+const harness = makeHarness()
+apply(harness.ctx, { autoTune: true, maxInjectTokens: 600, recallMaxTokens: 2500 })
 
-assert.ok(tools.some((tool) => tool.name === 'hindsight_tuner'), 'registers the tool')
-assert.ok(commands.some((command) => command.name === 'hindsight'), 'registers the command')
+const tool = harness.tools.find((candidate) => candidate.name === 'hindsight_tuner')
+assert.ok(tool, 'registers the tool')
+assert.ok(harness.commands.some((command) => command.name === 'hindsight'), 'registers the command')
 
-const sessionStart = handlers.get('agent/session-start')
+const sessionStart = harness.handlers.get('agent/session-start')
 assert.ok(sessionStart?.length === 1)
 sessionStart[0]({ agent: { session: { header: { origin: 'main' } } } })
 await new Promise((done) => setTimeout(done, 100))
 
 const tuned = readConfigFile()
 assert.equal(tuned.config.autoInject, 'pages', 'session start fills missing keys')
-assert.equal(tuned.config.autoInject, 'pages')
 assert.equal(tuned.config.observationScopes, 'shared', 'does not overwrite the user value')
 assert.equal(tuned.config.recallOptions.max_tokens, 2500)
 
-const preStep = handlers.get('agent/pre-step')[0]
+const preStep = harness.handlers.get('agent/pre-step')[0]
 const big = long.repeat(3)
 const recallMessage = {
   id: 'recall',
@@ -172,12 +173,12 @@ const under = await preStep({}, async () => ({ kind: 'enter', messages: [small] 
 assert.equal(under.messages[0].content[0].text, 'short recall')
 
 // The tool and the command share one implementation.
-const tool = tools.find((candidate) => candidate.name === 'hindsight_tuner')
 const status = await tool.execute({ action: 'status' })
 assert.match(status, /Hindsight memory —/)
 assert.match(status, /127\.0\.0\.1:9/)
 assert.match(status, /unreachable/)
-assert.match(status, /budget\s+cap 600 tok\/turn/)
+assert.match(status, /recall\s+this session: 4 seen/)
+assert.match(status, /budget\s+cap 600 tok\/turn · capped 2 · deduped 1/)
 
 const preview = await tool.execute({ action: 'tune', dryRun: true })
 assert.match(preview, /Would tune/)
@@ -185,11 +186,54 @@ assert.match(preview, /Would tune/)
 const revertOutput = await tool.execute({ action: 'revert' })
 assert.match(revertOutput, /Reverted/)
 
-const command = commands.find((candidate) => candidate.name === 'hindsight')
+const command = harness.commands.find((candidate) => candidate.name === 'hindsight')
 const commandResult = await command.handler({ rawInput: ' status' })
 assert.equal(commandResult.kind, 'success')
 assert.match(commandResult.text, /Hindsight memory —/)
 
-for (const dispose of disposers) dispose()
-rmSync(scratch, { recursive: true, force: true })
+// --- hint branches behind a stubbed endpoint --------------------------------
+const realFetch = globalThis.fetch
+try {
+  globalThis.fetch = async () => new Response('{"detail":"nope"}', { status: 404 })
+  assert.match(await tool.execute({ action: 'status' }), /bank does not exist yet/)
+
+  globalThis.fetch = async () => new Response('', { status: 429 })
+  assert.match(await tool.execute({ action: 'status' }), /rate-limited/)
+
+  globalThis.fetch = async () => new Response('', { status: 503 })
+  assert.match(await tool.execute({ action: 'status' }), /server reported 503/)
+} finally {
+  globalThis.fetch = realFetch
+}
+
+// --- cap off: still counts, never rewrites ---------------------------------
+const zero = makeHarness()
+apply(zero.ctx, { autoTune: false, maxInjectTokens: 0 })
+const zeroPreStep = zero.handlers.get('agent/pre-step')[0]
+const untouched = await zeroPreStep({ agent: { session: { header: { id: 'zero' } } } }, next)
+assert.equal(untouched.messages[1].content[0].text, big, 'cap 0 leaves the recall alone')
+const zeroStatus = await zero.tools[0].execute({ action: 'status' })
+assert.match(zeroStatus, /recall\s+this session: 1 seen/)
+assert.match(zeroStatus, /cap off/)
+
+// --- memory layer absent ----------------------------------------------------
+const savedProfileDir = process.env.DSH_PROFILE_DIR
+const savedProfile = process.env.DSH_PROFILE
+const savedInstallDir = process.env.DSH_INSTALL_DIR
+delete process.env.DSH_PROFILE_DIR
+delete process.env.DSH_PROFILE
+delete process.env.DSH_INSTALL_DIR
+try {
+  const missing = await tool.execute({ action: 'status' })
+  assert.match(missing, /memory layer not installed/)
+  assert.match(missing, /probe\s+not checked/)
+  assert.match(await tool.execute({ action: 'probe' }), /not installed/)
+} finally {
+  if (savedProfileDir !== undefined) process.env.DSH_PROFILE_DIR = savedProfileDir
+  if (savedProfile !== undefined) process.env.DSH_PROFILE = savedProfile
+  if (savedInstallDir !== undefined) process.env.DSH_INSTALL_DIR = savedInstallDir
+}
+
+for (const dispose of harness.disposers) dispose()
+for (const dispose of zero.disposers) dispose()
 console.log('smoke: all checks passed')
