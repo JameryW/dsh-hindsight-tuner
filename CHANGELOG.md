@@ -1,5 +1,93 @@
 # Changelog
 
+## 0.18.0
+
+- New opt-in `budgetPolicy: scenario` (defaults stay `off`/`adaptive`). It keeps
+  the `budgetTiers` table but chooses a scenario before the ceiling: memory
+  re-injected after a compaction and the first recall of a session take `deep`;
+  tool-continuation steps, repeats of what is already in context and turns after
+  a cut take `light`; a prompt that reads like debug/edit/review work takes
+  `normal`, questions take `light`, and anything else uses `default`. Precedence
+  is compaction recovery > first turn > continuation > repeat > after-cut > task
+  kind > default, so a repeat can never outrank a lost-memory recovery.
+- `scenarioTiers` overrides any scenario's tier per workspace, and an invalid
+  policy or override is reported as a settings issue (with the raw value) instead
+  of being silently normalized. `status` shows the scenario table, the last
+  choice with its reason and budget, and per-scenario counts; `status --json`,
+  the journal's `tier_selected` record and `/hindsight suggest` carry the same
+  data. The policy stays evidence-gated until the P2 selection comparison.
+- New `lib/scenario.js` (pure, no host imports) and `test/scenario.mjs` cover the
+  table, English/CJK prompt classification, every precedence step, overrides and
+  invalid-input handling; `test/smoke.mjs` gains an end-to-end scenario section
+  (first turn, debug prompt, continuation step, repeat, compaction recovery,
+  override, invalid policy). Adds `node test/scenario.mjs` to `npm test` and CI.
+
+## 0.17.0
+
+- Budgeted View (`viewPolicy: budgeted`, default `truncate`): an over-budget
+  recall is no longer cut to its prefix. The payload is split into
+  paragraph/fence-aware fact blocks, each block is scored against the current
+  turn's own non-memory text (file paths and backticked identifiers weighted
+  above prose, CJK runs supported), and the highest-value blocks are kept until
+  the allotment is spent. Kept blocks retain their headings and carry short
+  evidence pointers (commit SHA, page id, file path) when present; the payload
+  ends with a `budgeted view kept N of M blocks` footer and is re-measured so the
+  rendered result can never exceed the cap. With no lexical signal it falls back
+  to the prefix; a single-block or tiny-budget payload falls back to
+  `trimToBudget`. `viewContextMessages` (default 8) bounds the task context.
+- Budgeted-view accounting is visible rather than implied: `status` reports
+  `viewPolicy`, `viewTurns`, `viewKept` and `viewOmitted`, sessions carry their
+  own counters, and the journal records `inject_view` with block counts, kept
+  tokens and evidence pointers. A misspelled `viewPolicy` is reported as a
+  settings issue instead of being silently normalized.
+- New unit suite `test/view.mjs` covers segmentation (including blank lines
+  inside fences), term weighting, ranking, provenance hints, budget safety,
+  determinism, fallbacks and the repetition helpers; it runs in `npm test` and
+  CI. `docs/ARCHITECTURE.md` records the governance boundary, the P0–P3 evidence
+  gates, the metrics and the version roadmap.
+
+## 0.16.0
+
+- The A/B harness is now experiment-grade instead of a per-arm aggregate:
+  every run is isolated in a git worktree pinned to a recorded base SHA, every
+  task gets up to `maxAttempts` attempts and every attempt is a row, the
+  Hindsight bank (Pages tree + stats) is fingerprinted and can be frozen with
+  `--fingerprint-out`/`--verify-fingerprint`, and arm comparisons are paired at
+  the task level with a preregistered primary, a task-cluster bootstrap and
+  reported confidence intervals (new `eval/worktree.mjs`, `eval/bank.mjs`,
+  `eval/stats.mjs`).
+- Failed, errored and timed-out runs are never dropped: the completeness check
+  reports missing rows/attempts as an inclusion warning, and cache-adjusted
+  prices (`--prices`) turn raw usage into a real cost per solved node.
+  `eval/arms.example.json` documents the P0 (`R0`/`R1`/`R2`), P1 (`A0`/`A1`/`A2`/
+  `A3`), P2 (`A3-T`/`A3-V`) and P3 (`A4`/`A5`) arms with their gates;
+  `eval/README.md` specifies the task/arm schema, the asserts a qualifying run
+  must satisfy and the metric definitions. The offline self-test now exercises
+  50 checks and stays required in `npm test` and CI.
+
+## 0.15.0
+
+- Repeat safety: repetition is measured against the text the model actually
+  received last turn, not the raw recall. A mostly-repeated recall that adds
+  facts is now narrowed to those new blocks (a labelled `new-facts delta`)
+  instead of being dropped whole, so the old overlap rule can no longer discard
+  new memory. Recalls whose message ids were seen in an earlier turn are history
+  and are never removed as duplicates.
+- Safe re-injection after compaction: the integration's unchanged-recall check
+  scans the raw session log, which still contains events a compaction shadowed,
+  so it can believe memory is in context when it is not. The tuner reads the log
+  itself (`compaction/summary`'s `shadowedSeqs` and `surfaceOp: replace` ranges);
+  when the last delivery was removed it disables repetition and re-appends the
+  text the model used to have, labelled as a re-injection and counted in the same
+  budget. `status` reports `re-entered` and `deltas` separately from `skipped`.
+- Budget and status accounting distinguish what Hindsight wanted from what
+  actually reached the model: a capped, skipped or delta turn never looks like
+  an uncapped one, and `session.lastInjected`/`lastInjectedText` track the
+  delivered text.
+- New regression tests cover the superset recall (new facts survive), history
+  retention when a duplicate arrives, the delta path, and both sides of the
+  compaction re-injection decision.
+
 ## 0.14.0
 
 - Pages and Recall are reported as the two separate budgets they are: `status`

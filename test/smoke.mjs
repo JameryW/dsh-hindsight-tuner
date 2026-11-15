@@ -567,7 +567,7 @@ const repeatTurn = await adaptiveTurn('repeat', big)
 assert.ok(estimateTokens(injectedText(repeatTurn)) <= 100, 'a repeated recall drops to the light ceiling')
 adaptiveStatus = JSON.parse(await adaptiveTool.execute({ action: 'status', json: true }, adaptiveExec))
 assert.equal(adaptiveStatus.budget.tier.name, 'light')
-assert.match(adaptiveStatus.budget.tier.reason, /repeats the previous one/)
+assert.match(adaptiveStatus.budget.tier.reason, /repeats what is in context/)
 
 const afterCutTurn = await adaptiveTurn('fresh', long.toUpperCase().repeat(3))
 assert.ok(estimateTokens(injectedText(afterCutTurn)) <= 100, 'a turn after a cut stays on the light ceiling')
@@ -615,6 +615,234 @@ assert.match(await skipping.tools.find((candidate) => candidate.name === 'hindsi
 const changedSkip = await skipTurn('changed', long.toUpperCase().repeat(3))
 assert.equal(changedSkip.messages.length, 2, 'a different recall is still injected')
 for (const dispose of skipping.disposers) dispose()
+
+// --- repeat safety ----------------------------------------------------------
+// Three failure modes of the old line-overlap rule: new facts lost when a recall
+// repeats, history removed because a duplicate arrived, and memory lost after
+// the context was compacted. Each case gets its own harness for clean state.
+const conventions = Array.from({ length: 12 }, (_, i) => `- convention ${i}: keep diffs small and update the changelog`).join('\n')
+const newFact = '- new fact: freeze the bank fingerprint before a benchmark run'
+const statusOf = async (harness, sessionId) => JSON.parse(await harness.tools
+  .find((candidate) => candidate.name === 'hindsight_tuner')
+  .execute({ action: 'status', json: true }, { agent: { session: { header: { id: sessionId, cwd: process.cwd() } } } }))
+
+// (1) A repeated recall that adds facts ships only the delta: neither the new
+// facts nor the repeated blocks are misjudged.
+const deltaHarness = makeHarness()
+apply(deltaHarness.ctx, { autoTune: false, maxInjectTokens: 600, repeatPolicy: 'skip', repeatThreshold: 0.9 })
+const deltaTurn = (messages) => waterfall(deltaHarness, 'agent/pre-step', { agent: { session: { header: { id: 'delta' } } } }, async () => ({ kind: 'enter', messages }))
+await deltaTurn([human, adaptiveRecall('d1', conventions)])
+const delta = await deltaTurn([human, adaptiveRecall('d2', `${conventions}\n\n${newFact}`)])
+const deltaText = injectedText(delta)
+assert.ok(deltaText.includes('freeze the bank fingerprint'), 'a repeated recall keeps the facts it adds')
+assert.ok(deltaText.includes('new-facts delta'), 'the injected copy says it is a delta')
+assert.ok(!deltaText.includes('convention 0'), 'blocks the model already has are not paid for twice')
+assert.ok(estimateTokens(deltaText) <= 600, 'the delta still fits the cap')
+const deltaStatus = await statusOf(deltaHarness, 'delta')
+assert.equal(deltaStatus.budget.deltas, 1, 'a delta is not reported as a skipped turn')
+assert.equal(deltaStatus.budget.repeatSkips, 0)
+for (const dispose of deltaHarness.disposers) dispose()
+
+// (2) History is kept when a duplicate arrives in the same turn; only the copy
+// that has never reached the model is removed.
+const historyHarness = makeHarness()
+apply(historyHarness.ctx, { autoTune: false, maxInjectTokens: 600, repeatPolicy: 'skip', repeatThreshold: 0.9 })
+const historyTurn = (messages) => waterfall(historyHarness, 'agent/pre-step', { agent: { session: { header: { id: 'history' } } } }, async () => ({ kind: 'enter', messages }))
+await historyTurn([human, adaptiveRecall('h1', conventions)])
+const keptHistory = await historyTurn([human, adaptiveRecall('h1', conventions), adaptiveRecall('h2', conventions)])
+assert.equal(keptHistory.messages.length, 2, 'only the new duplicate is removed')
+assert.ok(keptHistory.messages.some((message) => message.id === 'h1'), 'the recall the model already has is not dropped')
+assert.ok(!keptHistory.messages.some((message) => message.id === 'h2'), 'the unseen duplicate is suppressed')
+for (const dispose of historyHarness.disposers) dispose()
+
+// (3) Compaction shadowed the recall: re-send it, even when the integration
+// suppressed a new injection because its own dedupe scans shadowed events.
+const compactionHarness = makeHarness()
+apply(compactionHarness.ctx, { autoTune: false, maxInjectTokens: 600, repeatPolicy: 'skip' })
+const logged = []
+const compactTurn = (messages) => waterfall(
+  compactionHarness,
+  'agent/pre-step',
+  { agent: { session: { header: { id: 'compact' }, snapshotEvents: () => logged } } },
+  async () => ({ kind: 'enter', messages }),
+)
+await compactTurn([human, adaptiveRecall('c1', conventions)])
+logged.push({ type: 'user/message', seq: 2, data: { source: { kind: 'plugin:hindsight' }, content: [{ type: 'text', text: conventions }] } })
+const quietTurn = await compactTurn([human])
+assert.equal(quietTurn.messages.length, 1, 'without a shadowing event nothing is re-sent')
+logged.push({ type: 'compaction/summary', seq: 3, data: { shadowedSeqs: [2] } })
+const reentry = await compactTurn([human])
+assert.equal(reentry.messages.length, 2, 'memory removed by compaction is re-injected')
+const reentryText = injectedText(reentry)
+assert.ok(reentryText.startsWith('[dsh-hindsight-tuner: memory re-injected after context compaction]'), 'the re-injection is labelled')
+const reentryStatus = await statusOf(compactionHarness, 'compact')
+assert.equal(reentryStatus.budget.reentered, 1, 'the re-entry is counted separately from ordinary injections')
+assert.match(await compactionHarness.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status' }, { agent: { session: { header: { id: 'compact' } } } }), /re-entered 1/)
+for (const dispose of compactionHarness.disposers) dispose()
+
+// --- budgeted view ----------------------------------------------------------
+// Truncation keeps the prefix; the budgeted view spends the same budget on the
+// blocks whose evidence matches the task, and labels what it left out.
+const viewHarness = makeHarness()
+apply(viewHarness.ctx, { autoTune: false, maxInjectTokens: 300, viewPolicy: 'budgeted' })
+const viewExec = { agent: { session: { header: { id: 'view', cwd: process.cwd() } } } }
+const viewTask = {
+  id: 'task',
+  role: 'user',
+  source: { kind: 'user' },
+  content: [{ type: 'text', text: 'Fix the budget accounting in lib/tokens.js so trimToBudget never exceeds the cap; update the recallBudget test.' }],
+}
+const irrelevant = Array.from({ length: 18 }, (_, i) => `### Unrelated note ${i}\nOld deployment trivia number ${i} about a service that no longer exists in this repository and is not part of this task.`)
+const relevant = '### Budget accounting\n- `lib/tokens.js` trimToBudget must never exceed the cap; a `recallBudget` test asserts the boundary (commit 3f8a1c9, path lib/tokens.js).'
+const viewTurn = await waterfall(viewHarness, 'agent/pre-step', { agent: { session: { header: { id: 'view' } } } }, async () => ({
+  kind: 'enter',
+  messages: [viewTask, adaptiveRecall('v1', [...irrelevant.slice(0, 18), relevant].join('\n\n'))],
+}))
+const viewText = injectedText(viewTurn)
+assert.ok(estimateTokens(viewText) <= 300, 'the selected view still fits the hard cap')
+assert.ok(viewText.includes('lib/tokens.js'), 'the block matching the task is kept although it was last in the recall')
+assert.ok(viewText.includes('budgeted view'), 'the payload says it is a selection, not a truncation')
+assert.ok(!viewText.includes('Unrelated note 0'), 'topically unrelated leading blocks are not paid for')
+const viewStatus = JSON.parse(await viewHarness.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status', json: true }, viewExec))
+assert.equal(viewStatus.budget.viewPolicy, 'budgeted')
+assert.equal(viewStatus.budget.viewTurns, 1)
+assert.ok(viewStatus.budget.viewKept >= 1 && viewStatus.budget.viewOmitted > 0)
+
+// Without any lexical signal the view falls back to the prefix, still measured.
+const plainHarness = makeHarness()
+apply(plainHarness.ctx, { autoTune: false, maxInjectTokens: 200, viewPolicy: 'budgeted' })
+const plainTurn = await waterfall(plainHarness, 'agent/pre-step', { agent: { session: { header: { id: 'plain' } } } }, async () => ({
+  kind: 'enter',
+  messages: [human, adaptiveRecall('p1', irrelevant.join('\n\n'))],
+}))
+const plainText = injectedText(plainTurn)
+assert.ok(plainText.startsWith('### Unrelated note 0'), 'with no signal the view keeps the prefix')
+// token estimation is already imported at the top of this file
+assert.ok(estimateTokens(plainText) <= 200, 'the fallback selection is still measured')
+for (const dispose of viewHarness.disposers) dispose()
+for (const dispose of plainHarness.disposers) dispose()
+
+// A misspelled policy is reported and falls back, never silently half-applied.
+const invalidView = makeHarness()
+apply(invalidView.ctx, { autoTune: false, viewPolicy: 'magic' })
+const invalidStatus = JSON.parse(await invalidView.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status', json: true }, viewExec))
+assert.ok(invalidStatus.settingsIssues.some((issue) => issue.field === 'viewPolicy'), 'an invalid view policy is surfaced')
+assert.equal(invalidStatus.budget.viewPolicy, 'truncate', 'an invalid view policy falls back to truncate')
+for (const dispose of invalidView.disposers) dispose()
+
+// --- scenario budget (v0.18, opt-in) ---------------------------------------
+// The adaptive policy only knows repeat/cut; the scenario policy also reads the
+// turn's state and a lexical task signal. Defaults stay off, so every harness
+// here opts in explicitly and the assertions cover both the chosen tier and the
+// reason status prints for it.
+const scenarioHarness = makeHarness()
+apply(scenarioHarness.ctx, {
+  autoTune: false,
+  maxInjectTokens: 500,
+  budgetPolicy: 'scenario',
+  budgetTiers: { light: 100, normal: 200, deep: 400 },
+})
+const scenarioExec = { agent: { session: { header: { id: 'scenario', cwd: process.cwd() } } } }
+const scenarioStatus = async (harness = scenarioHarness, id = 'scenario') => JSON.parse(await harness.tools
+  .find((candidate) => candidate.name === 'hindsight_tuner')
+  .execute({ action: 'status', json: true }, { agent: { session: { header: { id, cwd: process.cwd() } } } }))
+const scenarioTurn = (harness, messages, extra = {}) => waterfall(
+  harness,
+  'agent/pre-step',
+  { agent: { session: { header: { id: 'scenario' } } }, ...extra },
+  async () => ({ kind: 'enter', messages }),
+)
+const freshRecall = (id) => adaptiveRecall(id, Array.from({ length: 12 }, (_, i) => `- fact ${i}: the scenario policy reads the journal before choosing a tier`).join('\n'))
+const debugPrompt = {
+  id: 'u-debug',
+  role: 'user',
+  source: { kind: 'user' },
+  content: [{ type: 'text', text: 'Fix the failing view test — error: expected 3, got 2' }],
+}
+
+// First recall: nothing is in context, so the deep tier is used even though the
+// prompt looks like a debugging turn.
+await scenarioTurn(scenarioHarness, [human, adaptiveRecall('s1', conventions)])
+const firstStatus = await scenarioStatus()
+assert.equal(firstStatus.budget.policy, 'scenario')
+assert.equal(firstStatus.budget.lastScenario.scenario, 'first-turn')
+assert.equal(firstStatus.budget.tier.name, 'deep', 'a first turn gets the deep ceiling')
+assert.equal(firstStatus.budget.tier.budget, 400)
+
+// Second turn: a debugging prompt with a fresh recall lands on the normal tier.
+const debugTurn = await scenarioTurn(scenarioHarness, [debugPrompt, freshRecall('s2')])
+const debugText = injectedText(debugTurn)
+assert.ok(estimateTokens(debugText) <= 200, 'the debug scenario honours the normal ceiling')
+const debugStatus = await scenarioStatus()
+assert.equal(debugStatus.budget.lastScenario.scenario, 'debug', 'the prompt signal picks the scenario')
+assert.equal(debugStatus.budget.tier.name, 'normal')
+assert.equal(debugStatus.budget.tier.scenario, 'debug')
+assert.equal(debugStatus.budget.scenarios.debug, 1)
+assert.match(await scenarioHarness.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status' }, scenarioExec), /scenario .*last debug → normal/)
+
+// A tool-continuation step inside the turn already carries the recall: light.
+const continuationTurn = await scenarioTurn(scenarioHarness, [human, freshRecall('s3')], { step: 1 })
+assert.ok(estimateTokens(injectedText(continuationTurn)) <= 100, 'a continuation step gets the light ceiling')
+assert.equal((await scenarioStatus()).budget.lastScenario.scenario, 'continuation')
+
+// The same recall requested again is a repeat, not a fresh debug turn.
+await scenarioTurn(scenarioHarness, [human, freshRecall('s3-copy')])
+const repeatStatus = await scenarioStatus()
+assert.equal(repeatStatus.budget.lastScenario.scenario, 'repeat')
+assert.equal(repeatStatus.budget.tier.name, 'light')
+
+// Overrides are reported and applied to exactly one scenario.
+const overrideHarness = makeHarness()
+apply(overrideHarness.ctx, {
+  autoTune: false,
+  maxInjectTokens: 500,
+  budgetPolicy: 'scenario',
+  budgetTiers: { light: 100, normal: 200, deep: 400 },
+  scenarioTiers: { debug: 'light' },
+})
+await scenarioTurn(overrideHarness, [human, adaptiveRecall('o1', conventions)])
+await scenarioTurn(overrideHarness, [debugPrompt, freshRecall('o2')])
+const overrideStatus = await scenarioStatus(overrideHarness)
+assert.equal(overrideStatus.budget.scenarioTiers.debug, 'light')
+assert.equal(overrideStatus.budget.tier.name, 'light', 'the override replaces the default tier')
+assert.match(await overrideHarness.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status' }, scenarioExec), /overrides debug=light/)
+for (const dispose of overrideHarness.disposers) dispose()
+
+// Compaction recovery outranks the task kind: the memory the new recall repeats
+// is no longer in context, so it is worth the deep ceiling again.
+const scenarioCompact = makeHarness()
+apply(scenarioCompact.ctx, {
+  autoTune: false,
+  maxInjectTokens: 500,
+  budgetPolicy: 'scenario',
+  budgetTiers: { light: 100, normal: 200, deep: 400 },
+})
+const scenarioLogged = []
+const compactScenarioTurn = (messages) => waterfall(
+  scenarioCompact,
+  'agent/pre-step',
+  { agent: { session: { header: { id: 'scenario-compact' }, snapshotEvents: () => scenarioLogged } } },
+  async () => ({ kind: 'enter', messages }),
+)
+await compactScenarioTurn([human, adaptiveRecall('c1', conventions)])
+scenarioLogged.push({ type: 'user/message', seq: 2, data: { source: { kind: 'plugin:hindsight' }, content: [{ type: 'text', text: conventions }] } })
+scenarioLogged.push({ type: 'compaction/summary', seq: 3, data: { shadowedSeqs: [2] } })
+await compactScenarioTurn([human, freshRecall('c2')])
+const compactStatus = await scenarioStatus(scenarioCompact, 'scenario-compact')
+assert.equal(compactStatus.budget.lastScenario.scenario, 'compaction-recovery')
+assert.equal(compactStatus.budget.tier.name, 'deep')
+for (const dispose of scenarioCompact.disposers) dispose()
+
+// A misspelled policy or scenario is reported and falls back, never half-applied.
+const badScenario = makeHarness()
+apply(badScenario.ctx, { autoTune: false, budgetPolicy: 'magic', scenarioTiers: { debug: 'huge', 'no-such-scenario': 'light' } })
+const badStatus = await scenarioStatus(badScenario, 'bad')
+assert.ok(badStatus.settingsIssues.some((issue) => issue.field === 'budgetPolicy'), 'an invalid budget policy is surfaced')
+assert.ok(badStatus.settingsIssues.some((issue) => issue.field === 'scenarioTiers'), 'invalid scenario tiers are surfaced')
+assert.equal(badStatus.budget.policy, 'off', 'an invalid policy falls back to off')
+assert.equal(badStatus.budget.scenarioTiers.debug, 'normal', 'an invalid override keeps the default tier')
+for (const dispose of badScenario.disposers) dispose()
+for (const dispose of scenarioHarness.disposers) dispose()
 
 // --- trust reminder ---------------------------------------------------------
 // The recall is evidence, not authority: with the reminder on, the injected text
@@ -828,7 +1056,7 @@ try {
 
 // --- package contract -------------------------------------------------------
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
-assert.equal(pkg.version, '0.14.0', 'version matches this release')
+assert.equal(pkg.version, '0.18.0', 'version matches this release')
 assert.ok(pkg.engines?.node?.includes('>=22'), 'declares a Node floor the tests can rely on')
 assert.equal(pkg.license, 'MIT')
 assert.ok(pkg.files.includes('docs'), 'docs ship with the bundle')
@@ -840,3 +1068,4 @@ for (const dispose of lateHarness.disposers) dispose()
 for (const dispose of tinyHarness.disposers) dispose()
 for (const dispose of separate.disposers) dispose()
 console.log('smoke: all checks passed')
+

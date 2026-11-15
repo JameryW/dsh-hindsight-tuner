@@ -23,6 +23,7 @@
  * It degrades to a report when the integration or its config is absent.
  */
 
+import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
@@ -52,18 +53,48 @@ import {
   estimateTokens,
   FALLBACK_MARGIN,
   loadTokenizer,
-  overlapRatio,
   percentile,
+  repetitionRatio,
+  subtractRepeated,
   trimToBudget,
 } from './lib/tokens.js'
 import { validateConfig, validateSettings } from './lib/validate.js'
+import {
+  budgetedView,
+  DEFAULT_VIEW_CONTEXT_MESSAGES,
+  taskContextText,
+  VIEW_POLICIES,
+} from './lib/view.js'
+import {
+  chooseScenario,
+  DEFAULT_SCENARIO_TIERS,
+  SCENARIO_NAMES,
+  SCENARIO_TIER_NAMES,
+} from './lib/scenario.js'
 
 const PLUGIN = 'hindsight-tuner'
 const MAX_REMEMBERED_SESSIONS = 40
+// Remembered message ids per session; enough to tell "this recall existed in an
+// earlier turn" from "this recall is new", without holding arbitrary history.
+const MAX_SEEN_IDS = 400
+const REENTRY_PREFIX = '[dsh-hindsight-tuner: memory re-injected after context compaction]\n\n'
+const REENTRY_MARKER = '\n\n…[dsh-hindsight-tuner: re-injected after the context was compacted; the earlier copy is no longer in context.]'
+const DELTA_MARKER = '…[dsh-hindsight-tuner: new-facts delta — repeated blocks omitted; the earlier recall is still in the conversation.]'
 const ACTIONS = ['status', 'tune', 'revert', 'probe', 'suggest', 'enable', 'disable']
 const READ_ACTIONS = ['status', 'probe', 'suggest']
 
 export const name = PLUGIN
+
+function normalizeScenarioTiers(raw) {
+  const tiers = { ...DEFAULT_SCENARIO_TIERS }
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const scenario of SCENARIO_NAMES) {
+      const value = typeof raw[scenario] === 'string' ? raw[scenario].toLowerCase() : null
+      if (SCENARIO_TIER_NAMES.includes(value)) tiers[scenario] = value
+    }
+  }
+  return tiers
+}
 
 function normalizeConfig(input) {
   const raw = input && typeof input === 'object' ? input : {}
@@ -85,12 +116,19 @@ function normalizeConfig(input) {
     // off: one hard ceiling per turn (the 0.3–0.7 behaviour). adaptive: the
     // ceiling for a turn is chosen from a small tier table (light/normal/deep)
     // and can only lower the configured maxInjectTokens, never raise it.
-    budgetPolicy: raw.budgetPolicy === 'adaptive' ? 'adaptive' : 'off',
+    // scenario: the same tier table, chosen from the turn's state and lexical
+    // task signal (debug/edit/review/question/continuation). Opt-in experiment.
+    budgetPolicy: raw.budgetPolicy === 'adaptive' || raw.budgetPolicy === 'scenario'
+      ? raw.budgetPolicy
+      : 'off',
     budgetTiers: {
       light: number(raw.budgetTiers?.light, 800),
       normal: number(raw.budgetTiers?.normal, 1600),
       deep: number(raw.budgetTiers?.deep, 3000),
     },
+    // Per-scenario tier overrides. Defaults are a starting table, not a measured
+    // optimum; an invalid key or tier is reported and falls back per entry.
+    scenarioTiers: normalizeScenarioTiers(raw.scenarioTiers),
     // inject: every turn gets the recall again (the integration's behaviour).
     // skip: a recall that mostly repeats what the model already received last
     // turn is dropped instead of re-sent; the earlier message is still in the
@@ -101,6 +139,14 @@ function normalizeConfig(input) {
     // session and may describe code that has since changed. With this on, the
     // injected text opens with a short reminder to verify before acting.
     verifyReminder: raw.verifyReminder === true,
+
+    // truncate: keep the leading blocks of a recall within the budget (the 0.x
+    // behaviour). budgeted: score fact-sized blocks against the current turn and
+    // spend the budget on the blocks whose evidence matches the task.
+    viewPolicy: VIEW_POLICIES.includes(text(raw.viewPolicy, 'truncate').toLowerCase())
+      ? text(raw.viewPolicy, 'truncate').toLowerCase()
+      : 'truncate',
+    viewContextMessages: Math.min(40, Math.max(1, Math.round(number(raw.viewContextMessages, DEFAULT_VIEW_CONTEXT_MESSAGES)))),
 
     // fast: dependency-free estimate. accurate: the model tokenizer when one is
     // installed, with a labelled fallback when it is not.
@@ -125,6 +171,28 @@ function textOf(message) {
     .filter((block) => block?.type === 'text' && typeof block.text === 'string')
     .map((block) => block.text)
     .join('\n')
+}
+
+/**
+ * The user's prompt for this step, taken from the claimed batch only.
+ *
+ * The pre-step payload carries the exclusive batch claimed for the step, not the
+ * whole conversation, so this is a small, current sample of what the model is
+ * being asked to do. It is used for scenario classification only; a step whose
+ * batch has no user message (a tool continuation) reads as an empty prompt and
+ * falls through to the continuation scenario instead of guessing from the tool
+ * output.
+ */
+function claimPrompt(messages, sourceKind, limit = 4000) {
+  const parts = []
+  for (let index = messages.length - 1; index >= 0 && parts.length < 2; index -= 1) {
+    const message = messages[index]
+    if (message?.source?.kind !== 'user') continue
+    if (message?.source?.kind === sourceKind) continue
+    const text = textOf(message)
+    if (text) parts.unshift(text)
+  }
+  return parts.join('\n').slice(0, limit)
 }
 
 /**
@@ -231,9 +299,19 @@ function chooseTier(tiers, session, text, total) {
   const light = size(tiers?.light)
   const normal = size(tiers?.normal)
   const deep = size(tiers?.deep)
-  const overlap = session.turns > 0 && session.lastRaw ? overlapRatio(session.lastRaw, text) : 0
+  // Compare against what the model actually received last turn, not the raw
+  // recall: a turn that was cut only delivered a prefix, so the remainder is
+  // new information and must not be mistaken for a repeat. An unchanged raw
+  // recall is nonetheless a repeat for budget purposes — asking for the same
+  // (partly cut) recall again buys nothing, so it keeps the light ceiling.
+  const previous = session.lastInjectedText || session.lastRaw
+  // The stored raw recall is capped at 20k chars; compare on the same window.
+  const sameRecall = Boolean(session.lastRaw) && text?.slice(0, 20_000) === session.lastRaw
+  const overlap = session.turns > 0 && previous
+    ? (sameRecall ? 1 : repetitionRatio(previous, text))
+    : 0
   if (session.turns > 0 && overlap >= 0.6) {
-    return { name: 'light', ceiling: light, reason: `${Math.round(overlap * 100)}% of this recall repeats the previous one` }
+    return { name: 'light', ceiling: light, reason: `${Math.round(overlap * 100)}% of this recall repeats what is in context` }
   }
   if (session.turns > 0 && session.lastCapped) {
     return { name: 'light', ceiling: light, reason: 'the previous recall had to be cut' }
@@ -244,6 +322,59 @@ function chooseTier(tiers, session, text, total) {
   if (total <= light) return { name: 'light', ceiling: light, reason: 'fits the light ceiling' }
   if (total <= normal) return { name: 'normal', ceiling: normal, reason: 'fits the normal ceiling' }
   return { name: 'deep', ceiling: deep, reason: 'larger than the normal ceiling' }
+}
+
+/** Session events for the current agent, when the host exposes them. */
+function sessionEvents(session) {
+  try {
+    const events = typeof session?.snapshotEvents === 'function' ? session.snapshotEvents() : session?.events
+    return Array.isArray(events) ? events : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Where the last Hindsight injection sits in the session log, and whether a
+ * later compaction removed it from the model surface.
+ *
+ * The integration's own "unchanged recall" check scans the raw event log, which
+ * still contains shadowed events: after a compaction it believes the memory is
+ * in context when it is not. The plugin reads the log itself and checks the
+ * shadow metadata — compaction summaries list `shadowedSeqs`, and surface
+ * replacements carry a `surfaceOp` range on the event envelope. Either is
+ * authoritative for "the earlier copy is no longer in context".
+ */
+function lastInjectionState(session, sourceKind) {
+  const events = sessionEvents(session)
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event?.type !== 'user/message') continue
+    if (event?.data?.source?.kind !== sourceKind) continue
+    const seq = Number.isFinite(event.seq) ? event.seq : null
+    let shadowed = null
+    if (seq !== null) {
+      for (let next = index + 1; next < events.length; next += 1) {
+        const later = events[next]
+        const shadowedSeqs = later?.data?.shadowedSeqs
+        if (Array.isArray(shadowedSeqs) && shadowedSeqs.includes(seq)) {
+          shadowed = 'compact'
+          break
+        }
+        const op = later?.surfaceOp
+        if (
+          op && op.op === 'replace'
+          && Number.isFinite(op.startSeq) && Number.isFinite(op.endSeq)
+          && seq >= op.startSeq && seq <= op.endSeq
+        ) {
+          shadowed = 'replace'
+          break
+        }
+      }
+    }
+    return { seq, shadowed }
+  }
+  return null
 }
 
 /**
@@ -267,16 +398,43 @@ function createGovernor(settings, stats, meter) {
         last: 0,
         max: 0,
         lastRaw: '',
+        // What the model actually received last turn (the trimmed text, not the
+        // raw recall). Repetition and "is it still in context" are decided
+        // against this, never against content that was cut before delivery.
+        lastInjectedText: '',
         lastCapped: false,
         tier: null,
+        // The last scenario chosen for this session (scenario budget policy
+        // only); kept for status so a user can see why a ceiling was used.
+        scenario: null,
         capped: 0,
         dropped: 0,
         skipped: 0,
         trimmedTokens: 0,
+        lastInjected: 0,
+        injected: 0,
+        reentered: 0,
+        deltas: 0,
+        deltaSaved: 0,
+        // Message ids seen in earlier turns. An id seen before is history the
+        // model already has, so it is never silently dropped as a duplicate.
+        seenIds: new Set(),
       }
       remember(sessions, sessionId, session)
     }
     return session
+  }
+
+  /** Remember the ids a later turn can use to recognise history. */
+  function noteIds(session, messages) {
+    for (const message of messages) {
+      const id = message?.id
+      if (typeof id !== 'string' || id.length === 0) continue
+      session.seenIds.add(id)
+      while (session.seenIds.size > MAX_SEEN_IDS) {
+        session.seenIds.delete(session.seenIds.values().next().value)
+      }
+    }
   }
 
   /** Count plugin-injected messages per turn, and detect a stacked setup. */
@@ -294,112 +452,336 @@ function createGovernor(settings, stats, meter) {
     }
   }
 
+  /** Non-text blocks of a message, preserved when its text is rewritten. */
+  function extraBlocks(message) {
+    return Array.isArray(message?.content) ? message.content.filter((block) => block?.type !== 'text') : []
+  }
+
+  function rebuild(message, text) {
+    return { ...message, content: [{ type: 'text', text }, ...extraBlocks(message)] }
+  }
+
+  /**
+   * Rebuild the last recall the model actually saw, because compaction removed
+   * it while the integration's dedupe still believed it was present.
+   */
+  function reentryText(session) {
+    const text = `${REENTRY_PREFIX}${session.lastInjectedText}`
+    const cap = settings.maxInjectTokens
+    if (cap && meter.measure(text) > cap) {
+      return trimToBudget(text, cap, REENTRY_MARKER, meter.count)
+    }
+    return text
+  }
+
+  /** Append a re-injection and account for it like any other injected text. */
+  function reinject(decision, session, sessionId, logState) {
+    const text = reentryText(session)
+    if (!text) return decision
+    const tokens = meter.measure(text)
+    const message = {
+      id: randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text }],
+      source: { kind: settings.sourceKind, form: 'recall' },
+    }
+    noteIds(session, [message])
+    stats.reentered += 1
+    stats.turns += 1
+    stats.seen += 1
+    stats.lastTurnTokens = tokens
+    stats.maxTurnTokens = Math.max(stats.maxTurnTokens, tokens)
+    session.reentered += 1
+    session.turns += 1
+    session.last = tokens
+    session.lastInjected = tokens
+    session.max = Math.max(session.max, tokens)
+    session.tokens += tokens
+    session.injected = (session.injected ?? 0) + tokens
+    session.lastCapped = false
+    session.lastInjectedText = text.slice(0, 20_000)
+    record({
+      event: 'inject_reentered',
+      session: sessionId,
+      reason: logState?.shadowed === 'compact' ? 'context-compacted' : 'surface-replaced',
+      seq: logState?.seq ?? null,
+      tokens,
+    })
+    return { ...decision, messages: [...decision.messages, message] }
+  }
+
   async function onPreStep(payload, next) {
     const decision = await next()
     if (!decision || decision.kind !== 'enter' || !Array.isArray(decision.messages)) return decision
 
-    const sessionId = payload?.agent?.session?.header?.id ?? 'unknown'
+    const agentSession = payload?.agent?.session
+    const sessionId = agentSession?.header?.id ?? 'unknown'
     noteTurn(decision.messages, sessionId)
+    const session = sessionOf(sessionId)
+    const logState = lastInjectionState(agentSession, settings.sourceKind)
+    const shadowed = logState?.shadowed ?? null
+    const hadInjection = session.lastInjected > 0 && Boolean(session.lastInjectedText)
 
     const candidates = []
     decision.messages.forEach((message, index) => {
       if (message?.source?.kind !== settings.sourceKind) return
       const text = textOf(message)
       if (!text) return
-      candidates.push({ index, message, text, tokens: meter.measure(text) })
+      candidates.push({
+        index,
+        message,
+        text,
+        tokens: meter.measure(text),
+        // An id known from an earlier turn is history the model already has; it
+        // may be rewritten for budget, never silently dropped as a duplicate.
+        isNew: !session.seenIds.has(message.id),
+      })
     })
-    if (candidates.length === 0) return decision
+
+    // No new recall arrived. If the last one was shadowed by a compaction, the
+    // integration's unchanged-recall check still suppresses it (it scans the
+    // raw log, which keeps shadowed events): re-inject the text the model used
+    // to have instead of letting memory stay missing for the rest of the session.
+    if (candidates.length === 0) {
+      if (hadInjection && shadowed) return reinject(decision, session, sessionId, logState)
+      return decision
+    }
+
+    noteIds(session, candidates.map((candidate) => candidate.message))
+    const visible = candidates.filter((candidate) => !candidate.isNew)
+    const fresh = candidates.filter((candidate) => candidate.isNew)
+
+    // Repetition is measured against what the model actually received. When a
+    // compaction shadowed that text it is no longer in context, so nothing is
+    // "already there" and re-sending is required rather than wasteful.
+    const previous = shadowed || !session.lastInjectedText ? '' : session.lastInjectedText
+    const freshText = fresh.map((candidate) => candidate.text).join('\n')
+    // An unchanged raw recall is a full repeat even when last turn delivered only
+    // a trimmed prefix: re-sending it would re-trim to the same prefix and buy
+    // nothing, so no block of it can be "new facts".
+    const sameRecall = Boolean(session.lastRaw) && freshText.slice(0, 20_000) === session.lastRaw
+    const repeatRatio = previous && freshText
+      ? (sameRecall ? 1 : repetitionRatio(previous, freshText))
+      : 0
+    stats.lastRepeat = repeatRatio
+
+    const edits = new Map()
+    const removed = new Set()
+    let suppressed = 0
+    let suppressedTokens = 0
+    let deltaTurns = 0
+    let deltaBlocks = 0
+    if (
+      settings.repeatPolicy === 'skip' && session.turns > 0 && previous && freshText
+      && repeatRatio >= settings.repeatThreshold
+    ) {
+      if (sameRecall) {
+        for (const candidate of fresh) {
+          candidate.removed = true
+          removed.add(candidate.index)
+          suppressed += 1
+          suppressedTokens += candidate.tokens
+        }
+      } else {
+        // Mostly repeated but changed: keep only the blocks that carry lines the
+        // model has not seen. Dropping the whole recall would lose those facts;
+        // re-sending all of it would pay twice for the repeated part.
+        for (const candidate of fresh) {
+          const novel = subtractRepeated(previous, candidate.text)
+          if (!novel.text) {
+            candidate.removed = true
+            removed.add(candidate.index)
+            suppressed += 1
+            suppressedTokens += candidate.tokens
+            continue
+          }
+          if (novel.omitted > 0) {
+            const deltaText = `${novel.text}\n\n${DELTA_MARKER}`
+            const message = rebuild(candidate.message, deltaText)
+            candidate.text = deltaText
+            candidate.tokens = meter.measure(deltaText)
+            candidate.message = message
+            edits.set(candidate.index, message)
+            deltaBlocks += novel.omitted
+            deltaTurns += 1
+          }
+        }
+      }
+    }
+
+    const survivors = candidates.filter((candidate) => !candidate.removed)
+    if (survivors.length === 0) {
+      // The turn carried nothing but a duplicate. The earlier message stays in
+      // the conversation, so only this copy is dropped.
+      stats.repeatSkips += 1
+      stats.savedTokens += suppressedTokens
+      session.skipped += 1
+      record({ event: 'inject_skipped', session: sessionId, reason: 'repeat', ratio: repeatRatio, saved: suppressedTokens })
+      const wanted = candidates.reduce((sum, candidate) => sum + candidate.tokens, 0)
+      session.turns += 1
+      session.last = wanted
+      session.lastInjected = 0
+      session.max = Math.max(session.max, wanted)
+      session.tokens += wanted
+      session.lastCapped = false
+      stats.turns += 1
+      stats.lastTurnTokens = wanted
+      stats.maxTurnTokens = Math.max(stats.maxTurnTokens, wanted)
+      stats.seen += candidates.length
+      return { ...decision, messages: decision.messages.filter((_, index) => !removed.has(index)) }
+    }
+    if (suppressed > 0) {
+      stats.repeatSkips += 1
+      stats.savedTokens += suppressedTokens
+      session.skipped += 1
+      record({ event: 'inject_skipped', session: sessionId, reason: 'repeat', ratio: repeatRatio, saved: suppressedTokens })
+    }
+    if (deltaTurns > 0) {
+      stats.deltas += 1
+      stats.deltaSaved += suppressedTokens
+      session.deltas += 1
+      session.deltaSaved += suppressedTokens
+      record({ event: 'inject_delta', session: sessionId, ratio: repeatRatio, blocks: deltaBlocks, saved: suppressedTokens })
+    }
 
     // A recall is evidence, not authority: it was written by an earlier session
     // and may describe code that has since changed. The reminder is part of the
     // injected text and therefore part of the measured budget, never a freebie.
-    const remind = Boolean(settings.verifyReminder && candidates.length > 0)
-    let messages = decision.messages
+    const remind = Boolean(settings.verifyReminder)
     if (remind) {
-      const first = candidates[0]
+      const first = survivors[0]
       first.text = `${VERIFY_REMINDER}${first.text}`
       first.tokens = meter.measure(first.text)
-      const otherBlocks = Array.isArray(first.message.content)
-        ? first.message.content.filter((block) => block?.type !== 'text')
-        : []
-      first.message = { ...first.message, content: [{ type: 'text', text: first.text }, ...otherBlocks] }
-      messages = decision.messages.slice()
-      messages[first.index] = first.message
+      first.message = rebuild(first.message, first.text)
+      edits.set(first.index, first.message)
     }
 
-    const total = candidates.reduce((sum, candidate) => sum + candidate.tokens, 0)
-    const combined = candidates.map((candidate) => candidate.text).join('\n')
+    const total = survivors.reduce((sum, candidate) => sum + candidate.tokens, 0)
+    const combined = survivors.map((candidate) => candidate.text).join('\n')
     const cap = settings.maxInjectTokens
-    const session = sessionOf(sessionId)
-    const repeatRatio = session.turns > 0 && session.lastRaw
-      ? (combined === session.lastRaw ? 1 : overlapRatio(session.lastRaw, combined))
-      : 0
-    stats.lastRepeat = repeatRatio
-    // The previous recall is still in the conversation, so re-sending it costs
-    // tokens without adding context. This is deliberately separate from the
-    // budget: skipping is about duplication, not about the ceiling.
-    const skipRepeat = settings.repeatPolicy === 'skip' && session.turns > 0 && repeatRatio >= settings.repeatThreshold
 
     let budget = cap
     let tier = null
     let after = total
-    let removed = new Set()
     let dropped = 0
+    const finalTexts = new Map()
 
-    if (skipRepeat) {
-      removed = new Set(candidates.map((candidate) => candidate.index))
-      after = 0
-      stats.repeatSkips += 1
-      stats.savedTokens += total
-      session.skipped += 1
-      record({ event: 'inject_skipped', session: sessionId, reason: 'repeat', ratio: repeatRatio, saved: total })
-    } else {
-      if (cap && settings.budgetPolicy === 'adaptive') {
+    if (cap && (settings.budgetPolicy === 'adaptive' || settings.budgetPolicy === 'scenario')) {
+      if (settings.budgetPolicy === 'adaptive') {
         tier = chooseTier(settings.budgetTiers, session, combined, total)
-        budget = Math.min(cap, tier.ceiling)
-        session.tier = tier.name
-        stats.tiers[tier.name] = (stats.tiers[tier.name] ?? 0) + 1
-        stats.lastTier = { ...tier, budget, requested: total }
-        record({ event: 'tier_selected', session: sessionId, tier: tier.name, ceiling: tier.ceiling, budget, requested: total, reason: tier.reason })
-      }
-
-      if (budget && total > budget) {
-        const allocations = allocateBudget(candidates.map((candidate) => candidate.tokens), budget)
-        messages = decision.messages.slice()
-        after = 0
-        candidates.forEach((candidate, position) => {
-          const allotted = allocations[position]
-          if (candidate.tokens <= allotted) {
-            after += candidate.tokens
-            return
-          }
-          const marker = `\n\n…[dsh-hindsight-tuner: cut from ~${candidate.tokens} to ~${allotted} tokens. Ask Hindsight for the full recall explicitly, or raise maxInjectTokens.]`
-          const trimmed = allotted > 0 ? trimToBudget(candidate.text, allotted, marker, meter.count) : ''
-          if (!trimmed) {
-            removed.add(candidate.index)
-            dropped += 1
-            return
-          }
-          const otherBlocks = Array.isArray(candidate.message.content)
-            ? candidate.message.content.filter((block) => block?.type !== 'text')
-            : []
-          messages[candidate.index] = { ...candidate.message, content: [{ type: 'text', text: trimmed }, ...otherBlocks] }
-          after += meter.count(trimmed)
+      } else {
+        const scenario = chooseScenario({
+          firstTurn: session.turns === 0,
+          step: payload?.step,
+          shadowed,
+          repetition: repeatRatio,
+          lastCapped: session.lastCapped,
+          promptText: claimPrompt(decision.messages, settings.sourceKind),
+          overrides: settings.scenarioTiers,
         })
-        stats.capped += 1
-        stats.dropped += dropped
-        stats.trimmedTokens += Math.max(0, total - after)
-        session.capped += 1
-        session.dropped += dropped
-        session.trimmedTokens += Math.max(0, total - after)
-        stats.last = { before: total, after, at: new Date().toISOString() }
-        record({ event: 'inject_capped', session: sessionId, before: total, after, dropped, mode: meter.mode })
+        tier = {
+          name: scenario.tier,
+          ceiling: settings.budgetTiers[scenario.tier],
+          reason: scenario.reason,
+          scenario: scenario.scenario,
+        }
+        session.scenario = scenario.scenario
+        stats.scenarios[scenario.scenario] = (stats.scenarios[scenario.scenario] ?? 0) + 1
+        stats.lastScenario = { ...scenario, at: new Date().toISOString() }
       }
+      budget = Math.min(cap, tier.ceiling)
+      session.tier = tier.name
+      stats.tiers[tier.name] = (stats.tiers[tier.name] ?? 0) + 1
+      stats.lastTier = { ...tier, budget, requested: total }
+      if (settings.budgetPolicy === 'scenario' && stats.lastScenario) stats.lastScenario.budget = budget
+      record({
+        event: 'tier_selected',
+        session: sessionId,
+        policy: settings.budgetPolicy,
+        tier: tier.name,
+        scenario: tier.scenario ?? null,
+        ceiling: tier.ceiling,
+        budget,
+        requested: total,
+        reason: tier.reason,
+      })
+    }
+
+    if (budget && total > budget) {
+      const allocations = allocateBudget(survivors.map((candidate) => candidate.tokens), budget)
+      // Only the budgeted view needs to know what the turn is about; the default
+      // truncating mode never reads the other messages.
+      const viewContext = settings.viewPolicy === 'budgeted'
+        ? taskContextText(decision.messages, settings.sourceKind, settings.viewContextMessages)
+        : ''
+      after = 0
+      survivors.forEach((candidate, position) => {
+        const allotted = allocations[position]
+        if (candidate.tokens <= allotted) {
+          after += candidate.tokens
+          finalTexts.set(candidate.index, candidate.text)
+          return
+        }
+        let trimmed = ''
+        if (allotted > 0 && settings.viewPolicy === 'budgeted') {
+          // Budgeted view: spend the allotment on the fact blocks that match the
+          // task, keeping evidence pointers, instead of the leading blocks.
+          const view = budgetedView({
+            text: candidate.text,
+            contextText: viewContext,
+            budget: allotted,
+            count: (value) => meter.count(value),
+          })
+          if (view) {
+            trimmed = view.text
+            stats.viewTurns += 1
+            stats.viewKept += view.kept
+            stats.viewOmitted += view.omitted
+            record({
+              event: 'inject_view',
+              session: sessionId,
+              blocks: view.blocks,
+              kept: view.kept,
+              omitted: view.omitted,
+              tokens: view.tokens,
+              sources: view.sources,
+            })
+          }
+        }
+        if (!trimmed && allotted > 0) {
+          const marker = `\n\n…[dsh-hindsight-tuner: cut from ~${candidate.tokens} to ~${allotted} tokens. Ask Hindsight for the full recall explicitly, or raise maxInjectTokens.]`
+          trimmed = trimToBudget(candidate.text, allotted, marker, meter.count)
+        }
+        if (!trimmed) {
+          removed.add(candidate.index)
+          dropped += 1
+          return
+        }
+        const message = rebuild(candidate.message, trimmed)
+        edits.set(candidate.index, message)
+        finalTexts.set(candidate.index, trimmed)
+        after += meter.count(trimmed)
+      })
+      stats.capped += 1
+      stats.dropped += dropped
+      stats.trimmedTokens += Math.max(0, total - after)
+      session.capped += 1
+      session.dropped += dropped
+      session.trimmedTokens += Math.max(0, total - after)
+      stats.last = { before: total, after, at: new Date().toISOString() }
+      record({ event: 'inject_capped', session: sessionId, before: total, after, dropped, mode: meter.mode })
+    } else {
+      for (const candidate of survivors) finalTexts.set(candidate.index, candidate.text)
     }
 
     // Accounting records both what Hindsight wanted and what actually reached
     // the model, so a capped or skipped turn never looks like an uncapped one.
-    const cappedThisTurn = Boolean(!skipRepeat && budget && total > budget)
+    const cappedThisTurn = Boolean(budget && total > budget)
+    const deliveredText = survivors
+      .filter((candidate) => !removed.has(candidate.index))
+      .map((candidate) => finalTexts.get(candidate.index) ?? candidate.text)
+      .join('\n')
+
     session.turns += 1
     session.last = total
     session.lastInjected = after
@@ -407,14 +789,22 @@ function createGovernor(settings, stats, meter) {
     session.tokens += total
     session.injected = (session.injected ?? 0) + after
     session.lastCapped = cappedThisTurn
-    if (settings.budgetPolicy === 'adaptive' || settings.repeatPolicy === 'skip') session.lastRaw = combined.slice(0, 20_000)
+    // Remember the fresh recall request (history copies are not "the recall"
+    // that arrives next turn), so an unchanged request is detected exactly.
+    session.lastRaw = (fresh.length > 0 ? fresh : candidates)
+      .map((candidate) => candidate.text)
+      .join('\n')
+      .slice(0, 20_000)
+    if (after > 0 && deliveredText) session.lastInjectedText = deliveredText.slice(0, 20_000)
     stats.turns += 1
     stats.lastTurnTokens = total
     stats.maxTurnTokens = Math.max(stats.maxTurnTokens, total)
     stats.seen += candidates.length
 
-    if (skipRepeat || cappedThisTurn || remind) {
-      return { ...decision, messages: messages.filter((_, index) => !removed.has(index)) }
+    if (cappedThisTurn || remind || suppressed > 0 || deltaTurns > 0) {
+      const rewritten = decision.messages.slice()
+      for (const [index, message] of edits) rewritten[index] = message
+      return { ...decision, messages: rewritten.filter((_, index) => !removed.has(index)) }
     }
     return decision
   }
@@ -425,7 +815,6 @@ function createGovernor(settings, stats, meter) {
     dispose: () => sessions.clear(),
   }
 }
-
 function describeKind(kind) {
   if (kind === 'ok') return 'present'
   if (kind === 'missing') return 'absent, created on first tune'
@@ -664,11 +1053,29 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
       tiers: settings.budgetTiers,
       tier: stats.lastTier,
       tierCounts: { ...stats.tiers },
+      // Scenario policy: the table, the overrides in effect, and what has been
+      // observed this process. Kept separate from the adaptive counters so a
+      // status reader can tell which policy produced a ceiling.
+      scenarioTiers: settings.scenarioTiers,
+      scenarios: { ...stats.scenarios },
+      lastScenario: stats.lastScenario,
       repeatPolicy: settings.repeatPolicy,
       repeatThreshold: settings.repeatThreshold,
       verifyReminder: settings.verifyReminder,
       repeatSkips: stats.repeatSkips,
       savedTokens: stats.savedTokens,
+      // A re-entry is a recall re-sent because compaction shadowed the copy the
+      // model had; it is counted separately from ordinary injections.
+      reentered: stats.reentered,
+      deltas: stats.deltas,
+      deltaSaved: stats.deltaSaved,
+      // Budgeted view: how many times block selection ran, and how many blocks
+      // it kept or left out (a plain count, not a claim that omission was safe).
+      viewPolicy: settings.viewPolicy,
+      viewContextMessages: settings.viewContextMessages,
+      viewTurns: stats.viewTurns,
+      viewKept: stats.viewKept,
+      viewOmitted: stats.viewOmitted,
       trimmedTokens: stats.trimmedTokens,
       lastRepeat: stats.lastRepeat,
       turns: stats.turns,
@@ -687,10 +1094,13 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
             injected: session.injected ?? 0,
             lastInjected: session.lastInjected ?? session.last,
             tier: session.tier ?? null,
+            scenario: session.scenario ?? null,
             capped: session.capped,
             dropped: session.dropped,
             skipped: session.skipped,
             trimmedTokens: session.trimmedTokens,
+            reentered: session.reentered ?? 0,
+            deltas: session.deltas ?? 0,
           }
         : null,
     },
@@ -777,7 +1187,7 @@ function formatStatus(status) {
     recall && recall.turns > 0
       ? `  recall   ${recall.turns} turns · last ~${recall.last}${recall.lastInjected !== recall.last ? ` → ~${recall.lastInjected}` : ''} tok · wanted max ~${recall.max} tok · avg ~${Math.round(recall.tokens / recall.turns)} tok · capped ${recall.capped} · skipped ${recall.skipped}`
       : '  recall   no Hindsight recall observed in this session yet',
-    `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · dropped ${status.budget.dropped} · ${formatTier(status.budget)} · ${formatRepeat(status.budget)}${formatSavings(status.budget)}`,
+    `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · dropped ${status.budget.dropped} · ${formatTier(status.budget)} · ${formatRepeat(status.budget)}${formatScenarios(status.budget)}${formatSavings(status.budget)}`,
     `  trust    ${status.budget.verifyReminder ? 'the recall opens with a verify-before-acting reminder (counted in the cap)' : 'injected as-is (verifyReminder off)'}`,
     `  tokens   ${formatTokens(status.tokens)}`,
   ]
@@ -843,14 +1253,39 @@ function formatTokens(tokens) {
 
 /** The tier table and, once a recall has happened, the choice made for it. */
 function formatTier(budget) {
-  if (budget.policy !== 'adaptive') return 'tier off'
   const tiers = budget.tiers ?? {}
   const table = `${tiers.light ?? '?'}/${tiers.normal ?? '?'}/${tiers.deep ?? '?'} (light/normal/deep)`
   const last = budget.tier
+  if (budget.policy === 'scenario') {
+    const overrides = scenarioOverrides(budget)
+    if (!last) return `scenario ${table}${overrides} · no recall yet`
+    const used = Number.isFinite(last.budget) ? last.budget : last.ceiling
+    const wanted = Number.isFinite(last.requested) ? `; ~${last.requested} wanted` : ''
+    return `scenario ${table}${overrides} · last ${last.scenario ?? '?'} → ${last.name} ${used} (${last.reason}${wanted})`
+  }
+  if (budget.policy !== 'adaptive') return 'tier off'
   if (!last) return `adaptive ${table} · no recall yet`
   const used = Number.isFinite(last.budget) ? last.budget : last.ceiling
   const wanted = Number.isFinite(last.requested) ? `; ~${last.requested} wanted` : ''
   return `adaptive ${table} · last ${last.name} ${used} (${last.reason}${wanted})`
+}
+
+/** Overridden scenario entries only: the default table is the same every run. */
+function scenarioOverrides(budget) {
+  const tiers = budget.scenarioTiers ?? {}
+  const changed = SCENARIO_NAMES.filter((scenario) => tiers[scenario] && tiers[scenario] !== DEFAULT_SCENARIO_TIERS[scenario])
+  return changed.length > 0
+    ? ` · overrides ${changed.map((scenario) => `${scenario}=${tiers[scenario]}`).join(', ')}`
+    : ''
+}
+
+/** Scenario counts for this process, when the scenario policy has run. */
+function formatScenarios(budget) {
+  if (budget.policy !== 'scenario') return ''
+  const counts = Object.entries(budget.scenarios ?? {}).sort((left, right) => right[1] - left[1])
+  return counts.length > 0
+    ? ` · scenarios ${counts.map(([scenario, count]) => `${scenario} ${count}`).join(', ')}`
+    : ''
 }
 
 /** Duplicate governance: what was suppressed, and how much it saved. */
@@ -860,7 +1295,12 @@ function formatRepeat(budget) {
   const last = Number.isFinite(budget.lastRepeat) && budget.lastRepeat > 0
     ? ` · last ${Math.round(budget.lastRepeat * 100)}% repeat`
     : ''
-  return `repeat skip ≥${threshold}% · skipped ${budget.repeatSkips}${last}`
+  // Re-entries and deltas are names for what the tuner did about repeats rather
+  // than how many it caught: a shadowed recall had to be re-sent, and a
+  // mostly-repeated one was narrowed to its new facts instead of being dropped.
+  const reentered = budget.reentered > 0 ? ` · re-entered ${budget.reentered}` : ''
+  const deltas = budget.deltas > 0 ? ` · deltas ${budget.deltas}` : ''
+  return `repeat skip ≥${threshold}% · skipped ${budget.repeatSkips}${last}${reentered}${deltas}`
 }
 
 /** Tokens that never reached the model, from trimming plus skipped recalls. */
@@ -915,7 +1355,17 @@ function formatRevert(result) {
 
 export function apply(ctx, rawConfig) {
   const settings = normalizeConfig(rawConfig)
-  const checked = validateSettings(settings)
+  const raw = rawConfig && typeof rawConfig === 'object' ? rawConfig : {}
+  // Most settings are normalized before validation (a bad number falls back);
+  // the policy-like values are validated on the raw value so a typo is reported
+  // instead of being silently replaced by the default.
+  const checked = validateSettings({
+    ...settings,
+    budgetPolicy: raw.budgetPolicy ?? settings.budgetPolicy,
+    scenarioTiers: raw.scenarioTiers ?? settings.scenarioTiers,
+    viewPolicy: raw.viewPolicy ?? settings.viewPolicy,
+    viewContextMessages: raw.viewContextMessages ?? settings.viewContextMessages,
+  })
   settings.issues = checked.issues
   settings.preset = checked.preset
   if (settings.issues.some((issue) => issue.field === 'maxInjectTokens')) {
@@ -935,8 +1385,16 @@ export function apply(ctx, rawConfig) {
     sources: {},
     tiers: { light: 0, normal: 0, deep: 0 },
     lastTier: null,
+    scenarios: {},
+    lastScenario: null,
     repeatSkips: 0,
     savedTokens: 0,
+    reentered: 0,
+    deltas: 0,
+    deltaSaved: 0,
+    viewTurns: 0,
+    viewKept: 0,
+    viewOmitted: 0,
     trimmedTokens: 0,
     lastRepeat: 0,
     ratios: [],
@@ -1072,6 +1530,11 @@ export function apply(ctx, rawConfig) {
       const light = Math.min(p95, Math.max(128, Math.ceil(p50 * 0.9)))
       const normal = Math.min(p95, Math.max(light, Math.ceil((p50 + p95) / 2)))
       lines.push(`  tiers    light ${light} / normal ${normal} / deep ${cap}  (budgetPolicy: adaptive; from the same p50/p95, never above the cap)`)
+    }
+    // Scenario policy is an opt-in experiment: suggest it, do not imply that the
+    // default table is measured or that every session benefits from it.
+    if (status.budget.policy !== 'scenario') {
+      lines.push('  scenario budgetPolicy: scenario maps turn state (compaction, first turn, continuation, repeat, cut) and the prompt signal (debug/edit/review/question) to light/normal/deep; opt-in, tune one case with scenarioTiers')
     }
     if (status.effective.autoInject !== 'pages') {
       lines.push('  pages    autoInject: pages injects stored pages without a synthesis pass; prefer it for coding sessions')

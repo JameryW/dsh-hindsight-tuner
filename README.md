@@ -4,7 +4,8 @@ Token-budgeted tuning and diagnostics for Hindsight project memory inside DeepSe
 
 It complements [`@vectorize-io/hindsight-coding-agents`](https://www.npmjs.com/package/@vectorize-io/hindsight-coding-agents)
 rather than replacing it. That integration owns the memory (Git seeding, pages,
-cross-tool banks); this bundle owns three things it does not provide:
+cross-tool banks); this bundle owns three things it does not provide (design
+rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
 
 1. **A lean shared profile.** On the first session it fills the missing tuning
    keys in `~/.hindsight/coding-agent.json` — the same file every Hindsight
@@ -44,19 +45,57 @@ cross-tool banks); this bundle owns three things it does not provide:
    picks a ceiling per turn from `budgetTiers` (light/normal/deep, defaults
    800/1600/3000, never above `maxInjectTokens`), with a reason the status
    prints: the first recall of a session takes `deep` because nothing is in
-   context yet; a recall that mostly repeats the previous one (line overlap
-   ≥60%) or follows a turn that had to be cut takes `light`, because the model
-   already has that text; otherwise the smallest tier the recall fits is used.
+   context yet; a recall that mostly repeats what is already in context (repeat
+   ratio ≥60% of its own lines) or follows a turn that had to be cut takes
+   `light`, because the model already has that text; otherwise the smallest tier
+   the recall fits is used.
    The tier is a ceiling, not a target, and `status` shows the table, the last
    choice with its reason and the per-tier counts (`status --json` carries the
    same as data). `budgetPolicy: off` keeps the single hard ceiling.
 
+   `budgetPolicy: scenario` (opt-in) goes one step further and also reads the
+   turn itself. It keeps the same `budgetTiers` table but picks the scenario
+   first: memory re-injected after a compaction and the first recall of a
+   session take `deep`; a tool-continuation step, a recall that repeats what is
+   already in context, and a turn after one that had to be cut take `light`; a
+   prompt that reads like debugging, editing or review takes `normal`, while a
+   question takes `light`; anything else uses the `default` tier. `scenarioTiers`
+   maps any scenario to a different tier per workspace (for example
+   `{ debug: 'light' }`), and the choice, its reason and its budget appear on the
+   `budget` line, in `status --json`, and as a `scenario` field on the journal's
+   `tier_selected` record. Defaults stay `off`/`adaptive`; this policy is
+   evidence-gated and waits for the P2 `A3`-vs-`A3-T`-vs-`A3-V` comparison before
+   it can become a default.
+
    Duplicate governance is separate from the budget: with `repeatPolicy: skip`
-   (default `inject`), a recall that mostly repeats the previous turn's text
-   (line overlap ≥ `repeatThreshold`, default 0.9) is not injected again at all.
-   The earlier message is still in the conversation, so the content is not lost;
-   `status` reports the skipped turns, the tokens saved and the last repeat
-   ratio, and the recall line shows the turn as `last ~N → ~0 tok`.
+   (default `inject`), a recall is compared with the text the model actually
+   received last turn (line overlap ≥ `repeatThreshold`, default 0.9), never
+   with the raw recall — a trimmed turn only delivered a prefix, so treating the
+   raw text as "already in context" would hide the rest. Three cases are told
+   apart: an identical recall is not injected again (the earlier message is still
+   in the conversation, `status` counts the skip and the tokens saved); a recall
+   that repeats old blocks but adds facts keeps only the new blocks, labelled
+   `new-facts delta`, so the overlap rule can never drop a fact; and a candidate
+   message that was already in the claimed batch in an earlier turn is history,
+   which is never removed. If the session log shows the last delivery was
+   shadowed by a compaction (`compaction/summary.shadowedSeqs` includes it, or a
+   later event replaces its range), repetition is disabled and, when the
+   integration suppressed a new injection because its own dedupe still sees the
+   shadowed copy, the tuner re-appends the text the model used to have — labelled,
+   counted in the cap, and reported as `re-entered`.
+
+   `viewPolicy: budgeted` (default `truncate`) changes how an over-budget recall
+   is cut down. Instead of trimming the prefix, the recall is split into
+   paragraph/fact blocks, each block is scored against the current turn's
+   non-memory text (file paths, identifiers, error signatures, CJK terms), and the
+   highest-value blocks are kept until the allotment is spent. Kept blocks keep
+   their headings and carry short evidence hints (commit SHA, page id, file path)
+   when present, the payload ends with a `budgeted view kept N of M blocks`
+   footer, and the whole selection is re-measured so it can never exceed the cap.
+   With no lexical signal it falls back to the prefix, and a single-paragraph or
+   tiny-budget message falls back to `trimToBudget`. `viewContextMessages`
+   (default 8) bounds how many recent non-memory messages are used as the task
+   context; the mode stays opt-in until the P1/P2 A/B gates justify it.
 
 3. **A diagnosis that does not lie.** With no token configured, the integration
    fails silently on every turn (`pages_failed`, `inject_unchanged`, `401` in
@@ -139,6 +178,12 @@ Task-success measurement cannot live here honestly: the plugin never sees whethe
 a task passed, so a self-reported "Memory Precision@K" would be a guess. That is
 why the repository ships the external harness described next.
 
+The journal names *why* a turn received less memory instead of leaving it to be
+inferred from token counts: `inject_skipped` (repeat), `inject_delta` (only the
+new blocks travelled), `inject_reentered` (restored after a compaction) and
+`inject_view` (Budgeted View kept blocks, with evidence pointers). `status` adds
+the matching counters.
+
 The Pages budget is reported separately from the Recall budget, because they are
 different knobs: `recallOptions.max_tokens` cuts a synthesis, while
 `pageSearchLimit` counts pages. When the journal contains `inject_pages`
@@ -149,40 +194,42 @@ round number.
 
 ## A/B evaluation
 
-`eval/` is a small, dependency-free harness that runs the same task set once per
-arm and scores the outcome. It is not part of the plugin's hot path and it never
-calls a model by itself — you point it at an agent command.
+`eval/` is an experiment-grade, dependency-free harness: it runs each task in an
+isolated git worktree pinned to a recorded base SHA, gives each task up to
+`maxAttempts` attempts (every attempt is a row, failures are never dropped),
+fingerprints the Hindsight bank (`pages/tree` + `stats`) before and around a run,
+and compares arms with a **preregistered primary** and a task-level paired
+bootstrap. A completeness check turns missing rows or overlapping attempts into
+an explicit inclusion warning in the report; a completed experiment exits 0 even
+when every task failed. The harness never calls a model itself — you point it at
+an agent command.
 
 ```sh
-# exercise the whole pipeline without credentials: fake runner, real report
-node eval/ab.mjs --tasks eval/tasks.example.json --dry-run
+# offline proof that the tooling works (no network, no agents)
+node eval/selftest.mjs
 
-# a real run: one isolated checkout per task, agent on stdin, check command as truth
-node eval/ab.mjs --tasks eval/tasks.json --report eval/report.json \
-  --agent-command '["claude","-p","--output-format","json"]' --repeats 3
+# inspect the plan: tasks, arms, worktrees, bank actions — spawns nothing
+node eval/ab.mjs --tasks eval/tasks.example.json --arms A3,A1 --primary A3:A1 --dry-run
+
+# a real run, with a frozen bank fingerprint saved for reproducibility
+node eval/ab.mjs --tasks tasks.json --arms A3,A1 --primary A3:A1 --repeats 5 \
+  --fingerprint-out experiments/p1-bank.json --report experiments/p1.json
+
+# a follow-up run must match the frozen bank, or it refuses to compare
+node eval/ab.mjs --tasks tasks.json --arms A3,A1 --primary A3:A1 --repeats 5 \
+  --verify-fingerprint experiments/p1-bank.json
 ```
 
-A task is `{ id, prompt, cwd, check }`:
-
-```json
-{
-  "id": "fix-failing-test",
-  "prompt": "Make `node --test` pass without weakening the assertions.",
-  "cwd": "C:/scratch/memory-eval/fix-failing-test",
-  "check": "node --test"
-}
-```
-
-The agent receives `prompt` on stdin; `check` is run in the same directory after
-the agent exits, and its exit code decides success. Each arm is a name plus
-environment overrides, so arms stay data: the defaults are `no-memory`
-(`HINDSIGHT_AUTO_INJECT=none`), `pages`, and `recall`. Pass `--arms` to define
-your own (for example a tuned-tier arm that also sets `HINDSIGHT_PAGE_SEARCH_LIMIT`).
-
-`eval/report.json` contains every run row plus per-arm metrics: success rate
-(passed / runs), mean tokens and tokens per success when the agent reports usage,
-and p50/p95 wall time. Failed rows stay listed individually. The headline
-remains Task Success Rate — the other columns explain its cost.
+A task is `{ id, prompt, cwd, check }` (optional `maxAttempts`, `checkCwd`,
+`env`); `check` is a command, argv array or `{command, args}` object and its exit
+code is the ground truth. Arms are data: `A0` no memory, `A1` handwritten
+conventions, `A2` Reflect, `A3` Pages, `A3-T` Pages + tuner truncation, `A3-V`
+Pages + Budgeted View, plus the P0 (`R0`/`R1`/`R2`) and P3 (`A4`/`A5`) arms in
+`eval/arms.example.json`. `--prices` supplies cache-adjusted input/output prices
+so the report's cost columns reflect real cost rather than raw token counts; the
+headline metrics are Attempts to Success and Cost per Solved Node, with Task
+Success Rate as the non-inferiority guardrail. See [eval/README.md](eval/README.md)
+for the task/arm schema, the completeness assertions and the metric definitions.
 
 The check command is the limit of this design: tasks are only measurable when
 "I did it correctly" is executable (`node --test`, a linter, a golden file). A
@@ -274,10 +321,13 @@ survives upgrades):
 | `observationScopes` | `per_source` | Wanted consolidation scopes |
 | `recallMaxTokens` | `2000` | Wanted `recallOptions.max_tokens` |
 | `tokenBudgetMode` | `fast` | `fast` estimate or `accurate` tokenizer (optional `js-tiktoken`) |
-| `budgetPolicy` | `adaptive` in the shipped row (`off` default) | `adaptive` picks a per-turn ceiling from `budgetTiers`; `off` uses the cap |
+| `budgetPolicy` | `adaptive` in the shipped row (`off` default) | `off` uses the cap; `adaptive` picks a per-turn ceiling from `budgetTiers`; `scenario` also reads turn state (compaction, continuation, repeat, cut) and the prompt signal (debug/edit/review/question) to choose a scenario and its tier |
 | `budgetTiers` | `{ light: 800, normal: 1600, deep: 3000 }` | Tier ceilings, each ≤ `maxInjectTokens`; must be ordered light ≤ normal ≤ deep |
-| `repeatPolicy` | `skip` in the shipped row (`inject` default) | `skip` drops a recall that repeats the previous turn; `inject` always injects |
+| `scenarioTiers` | scenario defaults from `lib/scenario.js` | Per-scenario tier override for `budgetPolicy: scenario` (e.g. `{ debug: 'light' }`); only the chosen scenario is affected |
+| `repeatPolicy` | `skip` in the shipped row (`inject` default) | `skip` compares against the delivered text: identical turns are skipped, new fact blocks travel as a `new-facts delta`; `inject` always injects |
 | `repeatThreshold` | `0.9` | Line-overlap ratio at which a recall counts as a repeat (0.5..1) |
+| `viewPolicy` | `truncate` | `truncate` cuts the tail; `budgeted` selects task-relevant fact blocks within the allotment |
+| `viewContextMessages` | `8` | Recent non-memory messages used as task context by `budgeted` (1..40) |
 | `verifyReminder` | `true` in the shipped row (`false` default) | Prefix the recall with a one-line "verify against current code/tests" reminder, counted in the cap |
 | `sourceKind` | `plugin:hindsight` | Recall message kind to cap |
 | `allowAgentWrites` | `false` | Expose tool writes; without it the tool is read-only |
@@ -324,15 +374,19 @@ survives upgrades):
 ## Development
 
 ```sh
+node test/view.mjs         # pure selection/token-helper unit tests
 node test/smoke.mjs        # hermetic unit/behaviour tests
 node test/integration.mjs  # real @vectorize-io/hindsight-coding-agents hooks
 node eval/selftest.mjs     # A/B harness orchestration, with a fake runner
 node scripts/verify-live.mjs  # this machine, after a restart (not part of npm test)
 ```
 
-The smoke test is hermetic: it points `HINDSIGHT_CONFIG` and `DSH_HOME` at a
+`npm test` runs the first four. The smoke test is hermetic: it points
+`HINDSIGHT_CONFIG` and `DSH_HOME` at a
 scratch directory, so it never reads or writes your real memory config. The
 integration test loads the shipped Hindsight `dist/dsh.js`, registers its real
 `agent/pre-step` hook after the tuner, and asserts the payload the model would
 receive is inside the ceiling; it skips (exit 0) when the package is not
-installed, and CI installs it so every job runs it for real.
+installed, and CI installs it so every job runs it for real. The eval self-test
+is offline too (fake agent, fake bank, throwaway git repos) and exercises the
+worktree/bank/stats modules as well as the CLI dry-run path.

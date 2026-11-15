@@ -1,0 +1,228 @@
+{
+  "version": "1",
+  "description": "Arm matrix and preregistered primary comparisons for the DSH Hindsight tuner A/B eval. Gate ids (P0-P3) and arm names (R0-R2, A0-A5) are local naming conventions invented for this eval suite; they are not upstream API names. Every arm records the env it pins on top of the task env; anything that cannot be pinned by env alone is listed in `requires`.",
+  "notes": [
+    "Use `node eval/ab.mjs --arms A0,A2,A3` to select names from this file by CSV, or `--arms <path-to-json>` for a custom matrix.",
+    "HINDSIGHT_AUTO_INJECT accepts none | pages | reflect | recall (lib/validate.js AUTO_INJECT_MODES).",
+    "Set HINDSIGHT_BANK_ID and HINDSIGHT_API_URL once per experiment; the bank fingerprint freezes one bank per run.",
+    "tunerSettings below documents the DSH plugin settings that must be pinned before the run (plugin profile config / lib/config-file.js). autoTune drift invalidates the arm; pin the values and record them with the report.",
+    "HINDSIGHT_EVAL_HINT is an eval-only convention: the agent command wrapper may read it to append the matching hint text to the prompt. It is metadata for the runner, not a plugin option.",
+    "P3 compares two bank states. Run each bank as its own experiment with its own frozen fingerprint, or set per-arm HINDSIGHT_BANK_ID inside arm.env (then the single fingerprint covers only the primary bank).",
+    "Tasks must not depend on wall-clock time, network access or unseeded randomness; keep checks deterministic (see eval/README.md)."
+  ],
+  "gates": [
+    {
+      "id": "P0",
+      "title": "Failure feedback protocol",
+      "question": "Does structuring the failure information the agent receives reduce attempts to success compared with no hint or a raw error dump?",
+      "primary": "R2:R0",
+      "arms": ["R0", "R1", "R2"],
+      "notes": "Memory is disabled in this gate; the hint is delivered by the agent wrapper via HINDSIGHT_EVAL_HINT."
+    },
+    {
+      "id": "P1",
+      "title": "Memory source ablation",
+      "question": "Do Hindsight pages beat no memory and handwritten conventions, and how do they compare with reflect?",
+      "primary": "A3:A1",
+      "arms": ["A0", "A1", "A2", "A3"],
+      "notes": "Preregistered primary comparison for the memory-source gate is A3 (native pages) vs A1 (handwritten conventions)."
+    },
+    {
+      "id": "P2",
+      "title": "Injection view / budget",
+      "question": "Within the same page memory, does the tuner truncation profile or the Budgeted View reduce cost per solved node without losing success?",
+      "primary": "A3-V:A3",
+      "arms": ["A3", "A3-T", "A3-V"],
+      "notes": "A3 is the same native-pages baseline as P1. Secondary comparison of interest: A3-T vs A3."
+    },
+    {
+      "id": "P3",
+      "title": "Fact provenance",
+      "question": "Do oracle-promoted facts outperform raw session facts at equal injection budget?",
+      "primary": "A4:A5",
+      "arms": ["A4", "A5"],
+      "notes": "The two arms require differently seeded banks; see the note above about per-arm HINDSIGHT_BANK_ID and fingerprints."
+    }
+  ],
+  "arms": [
+    {
+      "name": "R0",
+      "gate": "P0",
+      "label": "no hint",
+      "description": "Control: the agent gets the task prompt and its failing check output only, with no structured failure guidance.",
+      "hypothesis": "Baseline for both failure-protocol comparisons.",
+      "env": {
+        "HINDSIGHT_AUTO_INJECT": "none",
+        "HINDSIGHT_EVAL_HINT": "none"
+      },
+      "hint": "none",
+      "tunerSettings": {},
+      "requires": []
+    },
+    {
+      "name": "R1",
+      "gate": "P0",
+      "label": "raw error",
+      "description": "The agent is shown the raw stderr/stdout of the failed check, unmodified.",
+      "hypothesis": "Raw output carries signal but also noise; may not beat no hint on attempts.",
+      "env": {
+        "HINDSIGHT_AUTO_INJECT": "none",
+        "HINDSIGHT_EVAL_HINT": "raw-error"
+      },
+      "hint": "raw-error: append the check's raw output to the next attempt prompt",
+      "tunerSettings": {},
+      "requires": ["agent wrapper must implement the raw-error hint"]
+    },
+    {
+      "name": "R2",
+      "gate": "P0",
+      "label": "structured pitfall",
+      "description": "The agent is shown a structured failure summary (failing check, failing assertion, locality, suspected pitfall) extracted by the wrapper.",
+      "hypothesis": "Structured failure information lowers attempts to success versus no hint and raw error.",
+      "env": {
+        "HINDSIGHT_AUTO_INJECT": "none",
+        "HINDSIGHT_EVAL_HINT": "structured-pitfall"
+      },
+      "hint": "structured-pitfall: append {check, assertion, file/locality, pitfall} JSON to the next attempt prompt",
+      "tunerSettings": {},
+      "requires": ["agent wrapper must implement the structured-pitfall hint"]
+    },
+    {
+      "name": "A0",
+      "gate": "P1",
+      "label": "no memory",
+      "description": "Hindsight injection disabled; the agent works from the repository and task prompt alone.",
+      "hypothesis": "Floor: any memory benefit must exceed this arm's success rate.",
+      "env": {
+        "HINDSIGHT_AUTO_INJECT": "none"
+      },
+      "hint": "none",
+      "tunerSettings": {
+        "raw.autoInject": "none"
+      },
+      "requires": []
+    },
+    {
+      "name": "A1",
+      "gate": "P1",
+      "label": "handwritten conventions",
+      "description": "Hindsight disabled; the fixture repository contains a handwritten AGENTS.md/CLAUDE.md conventions file. This is the preregistered baseline for A3.",
+      "hypothesis": "Handwritten conventions are cheap and already available; Hindsight pages must beat them to justify the plugin.",
+      "env": {
+        "HINDSIGHT_AUTO_INJECT": "none",
+        "HINDSIGHT_EVAL_HINT": "handwritten-conventions"
+      },
+      "hint": "none injected by the wrapper; conventions come from the fixture repo",
+      "tunerSettings": {
+        "raw.autoInject": "none"
+      },
+      "requires": ["fixture repo contains the handwritten conventions file before the run"]
+    },
+    {
+      "name": "A2",
+      "gate": "P1",
+      "label": "reflect",
+      "description": "Hindsight reflect synthesis injected; the agent receives a consolidated reflection rather than retrieved pages.",
+      "hypothesis": "Reflect trades retrieval breadth for synthesis; may win on cheap tasks and lose on exact-locality tasks.",
+      "env": {
+        "HINDSIGHT_AUTO_INJECT": "reflect"
+      },
+      "hint": "reflect injection via autoInject=reflect",
+      "tunerSettings": {
+        "raw.autoInject": "reflect"
+      },
+      "requires": []
+    },
+    {
+      "name": "A3",
+      "gate": "P1",
+      "label": "pages (native)",
+      "description": "Hindsight Pages injected natively by the integration (viewPolicy=truncate, default pageSearchLimit). Preregistered treatment for A3 vs A1 and the P2 baseline.",
+      "hypothesis": "Pages provide the strongest locality-specific memory; should beat A1 at higher token cost.",
+      "env": {
+        "HINDSIGHT_AUTO_INJECT": "pages"
+      },
+      "hint": "pages injection via autoInject=pages",
+      "tunerSettings": {
+        "raw.autoInject": "pages",
+        "raw.viewPolicy": "truncate"
+      },
+      "requires": []
+    },
+    {
+      "name": "A3-T",
+      "gate": "P2",
+      "label": "tuner truncation",
+      "description": "Same page memory as A3 but with the tuner's truncation profile pinned: reduced page search limit and long pages clipped before injection.",
+      "hypothesis": "Truncation lowers cost per solved node without lowering success versus native pages.",
+      "env": {
+        "HINDSIGHT_AUTO_INJECT": "pages",
+        "HINDSIGHT_PAGE_SEARCH_LIMIT": "12"
+      },
+      "hint": "pages injection; truncate view",
+      "tunerSettings": {
+        "raw.autoInject": "pages",
+        "raw.pageSearchLimit": 12,
+        "raw.viewPolicy": "truncate"
+      },
+      "requires": ["pin the tuner plugin settings/viewPolicy=truncate before the run; env alone cannot express viewPolicy"]
+    },
+    {
+      "name": "A3-V",
+      "gate": "P2",
+      "label": "Budgeted View",
+      "description": "Same page memory and page search limit as A3-T, but the tuner spends the injection budget on scored facts via settings.viewPolicy=budgeted (lib/view.js) instead of clipping text.",
+      "hypothesis": "Budgeted View reduces tokens per injection and improves cost per solved node versus both A3 and A3-T at equal success.",
+      "env": {
+        "HINDSIGHT_AUTO_INJECT": "pages",
+        "HINDSIGHT_PAGE_SEARCH_LIMIT": "12",
+        "HINDSIGHT_EVAL_HINT": "budgeted-view"
+      },
+      "hint": "pages injection; budgeted view policy",
+      "tunerSettings": {
+        "raw.autoInject": "pages",
+        "raw.pageSearchLimit": 12,
+        "raw.viewPolicy": "budgeted"
+      },
+      "requires": ["pin settings.viewPolicy=budgeted in the plugin profile config (or state.json) before the run"]
+    },
+    {
+      "name": "A4",
+      "gate": "P3",
+      "label": "oracle-promoted facts",
+      "description": "Bank seeded with oracle-promoted facts (curated, deduplicated, linked) before the run.",
+      "hypothesis": "Promoted facts improve memory precision and reduce false fact adoption versus raw session facts.",
+      "env": {
+        "HINDSIGHT_AUTO_INJECT": "pages",
+        "HINDSIGHT_EVAL_HINT": "oracle-promoted-facts"
+      },
+      "hint": "pages injection from the oracle bank",
+      "tunerSettings": {
+        "raw.autoInject": "pages"
+      },
+      "requires": [
+        "seed the bank with oracle-promoted facts, let the bank settle, then capture the fingerprint",
+        "set the bank id via HINDSIGHT_BANK_ID in this arm's env when comparing two banks in one experiment"
+      ]
+    },
+    {
+      "name": "A5",
+      "gate": "P3",
+      "label": "raw session facts",
+      "description": "Bank seeded with raw session facts (unpromoted) at a comparable fact count.",
+      "hypothesis": "Raw facts retain noise and stale statements; should lose to A4 on false-fact adoption and precision.",
+      "env": {
+        "HINDSIGHT_AUTO_INJECT": "pages",
+        "HINDSIGHT_EVAL_HINT": "raw-session-facts"
+      },
+      "hint": "pages injection from the raw bank",
+      "tunerSettings": {
+        "raw.autoInject": "pages"
+      },
+      "requires": [
+        "seed the bank with raw session facts, let the bank settle, then capture the fingerprint",
+        "set the bank id via HINDSIGHT_BANK_ID in this arm's env when comparing two banks in one experiment"
+      ]
+    }
+  ]
+}
