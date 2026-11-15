@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync, existsSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -604,6 +604,20 @@ assert.equal(
   undefined,
   'resolveWorktrees: false keeps the section local',
 )
+
+// Both sides of a lookup canonicalize, so a directory reached through a symlink
+// or junction still matches a section keyed by the real path — the same
+// conversion git does when it reports the repository root.
+const wtAlias = join(scratch, 'wt-alias')
+try {
+  symlinkSync(wtMain, wtAlias, 'junction')
+  const aliased = effectiveConfig({ paths: { [wtMain]: { pageSearchLimit: 22 } } }, { env: {}, cwd: wtAlias })
+  assert.equal(aliased.config.pageSearchLimit, 22, 'a symlinked directory canonicalizes to the path git reports')
+} catch (error) {
+  // Creating a link needs privileges on some hosts; the worktree case above
+  // already covers the lookup, so a denied symlink must not fail the suite.
+  if (error?.code !== 'EPERM' && error?.code !== 'EACCES' && error?.code !== 'ENOTSUP') throw error
+}
 
 // --- plugin surface: hooks, tool, command ----------------------------------
 writeFileSync(process.env.HINDSIGHT_CONFIG, JSON.stringify({

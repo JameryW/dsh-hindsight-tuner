@@ -369,7 +369,8 @@ survives upgrades):
   rename the bank). A layer replaces a key instead of merging it (only `banks`
   and `paths` merge), so a per-harness `recallOptions` replaces the file's
   copy rather than blending it. A directory section also matches from a linked
-  worktree when it is keyed by the main checkout. `status` shows `layers`
+  worktree when it is keyed by the main checkout, and both sides are
+  canonicalized, so a symlinked directory still matches. `status` shows `layers`
   whenever one of those layers changes a value the preset would otherwise
   report as correct.
 - Environment overrides are read the way the integration reads them: a blank
