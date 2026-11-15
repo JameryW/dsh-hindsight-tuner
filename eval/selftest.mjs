@@ -112,13 +112,27 @@ function equal(actual, expected, label) {
  * macOS) or uses an 8.3 short name (`RUNNER~1` → `runneradmin` on Windows CI).
  * Both spellings are the same directory, so the comparison must not depend on
  * which one the caller typed.
+ *
+ * The path itself may no longer exist by the time a report is compared (a run
+ * removes its worktrees), so canonicalize the deepest existing ancestor and
+ * re-append the rest.
  */
 function canonicalPath(value) {
-  try {
-    return realpathSync.native(value)
-  } catch {
-    return resolve(value)
+  const absolute = resolve(value)
+  const suffix = []
+  let current = absolute
+  for (let depth = 0; depth < 64; depth += 1) {
+    try {
+      const real = realpathSync.native(current)
+      return suffix.length > 0 ? join(real, ...suffix.reverse()) : real
+    } catch {
+      const parent = dirname(current)
+      if (parent === current) return absolute
+      suffix.push(basename(current))
+      current = parent
+    }
   }
+  return absolute
 }
 
 function equalPath(actual, expected, label) {
