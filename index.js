@@ -30,10 +30,13 @@ import {
   appliedPaths,
   applyTuning,
   autoTuneEnabled,
+  configPath,
   getPath,
   readConfigFile,
   revertTuning,
   setAutoTune,
+  sweepStaleTemps,
+  tunerState,
 } from './lib/config-file.js'
 import {
   bankResolution,
@@ -1558,6 +1561,16 @@ export function apply(ctx, rawConfig) {
   if (issueFields.has('viewPolicy')) settings.viewPolicy = 'truncate'
   if (issueFields.has('viewContextMessages')) settings.viewContextMessages = DEFAULT_VIEW_CONTEXT_MESSAGES
   settings.scenarioTiers = normalizeScenarioTiers(settings.scenarioTiers)
+
+  // Startup housekeeping: a crashed writer can leave a full copy of the shared
+  // config (apiToken included) in `<config>.tmp-*`. Sweep what is old enough to
+  // be a leftover; best effort, because housekeeping must never fail plugin load.
+  try {
+    sweepStaleTemps(configPath())
+    sweepStaleTemps(tunerState().path)
+  } catch {
+    // A read-only install or a racing writer is not an error worth surfacing.
+  }
 
   const stats = {
     activatedAt: Date.now(),

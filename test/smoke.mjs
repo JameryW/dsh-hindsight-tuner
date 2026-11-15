@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync, existsSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -37,7 +37,7 @@ delete process.env.DSH_INSTALL_DIR
 for (const name of ['HINDSIGHT_AUTO_INJECT', 'HINDSIGHT_API_URL', 'HINDSIGHT_API_PORT', 'HINDSIGHT_DISABLED']) delete process.env[name]
 
 const { estimateTokens, truncateToBudget, trimToBudget, allocateBudget, countTokens, percentile, FALLBACK_MARGIN, overlapRatio, repetitionRatio } = await import('../lib/tokens.js')
-const { applyTuning, revertTuning, readConfigFile, getPath, autoTuneEnabled, setAutoTune, tunerState } = await import('../lib/config-file.js')
+const { applyTuning, revertTuning, readConfigFile, getPath, autoTuneEnabled, setAutoTune, sweepStaleTemps, tunerState } = await import('../lib/config-file.js')
 const { bankResolution, diagPath, effectiveConfig, effectiveServer, expandBankTemplate, optedOut, projectName, summarizeActivity } = await import('../lib/diagnostics.js')
 const { record, flushJournal, journalPending, summarizeTunerJournal } = await import('../lib/log.js')
 
@@ -347,6 +347,45 @@ assert.equal(existsSync(configLock), false, 'the reclaimed lock is removed after
 writeFileSync(configLock, `${process.pid}:held-by-this-process`)
 assert.throws(() => applyTuning({ preset }), /another process is editing/, 'a live lock is not deleted')
 unlinkSync(configLock)
+
+// A lock only names a live process when it really is the process that wrote it:
+// pids are recycled (containers, WSL), so the recorded start time must match and
+// no lock may outlive its absolute lifetime.
+const agedLockTime = new Date(Date.now() - 2 * 60_000)
+writeFileSync(configLock, `${process.pid}:999999999:held-by-a-recycled-pid`)
+utimesSync(configLock, agedLockTime, agedLockTime)
+const afterAgedLock = applyTuning({ preset: [['injectTimeoutMs', 7000]] })
+assert.equal(afterAgedLock.changed.length, 0, 'an over-age lock is reclaimed even though its pid is alive')
+assert.equal(existsSync(configLock), false, 'the over-age lock is removed after the write')
+
+if (process.platform === 'linux') {
+  // /proc carries the real start time, so reuse is provable immediately.
+  writeFileSync(configLock, `${process.pid}:1:held-by-a-recycled-pid`)
+  const afterRecycledPid = applyTuning({ preset: [['injectTimeoutMs', 7000]] })
+  assert.equal(afterRecycledPid.changed.length, 0, 'a recycled pid is detected from its start time')
+  assert.equal(existsSync(configLock), false, 'the recycled-pid lock is removed after the write')
+}
+
+// A crash between writing the temporary file and renaming it leaves a full copy
+// of the config — apiToken included — beside the real file. Age is the only
+// signal available, so old ones are swept and fresh ones may belong to a writer
+// that is still running.
+const staleTemporary = `${process.env.HINDSIGHT_CONFIG}.tmp-999-1-1`
+const freshTemporary = `${process.env.HINDSIGHT_CONFIG}.tmp-999-2-2`
+writeFileSync(staleTemporary, '{"apiToken":"leaked-secret"}')
+writeFileSync(freshTemporary, '{"apiToken":"in-flight"}')
+utimesSync(staleTemporary, agedLockTime, agedLockTime)
+assert.equal(sweepStaleTemps(process.env.HINDSIGHT_CONFIG), 1, 'only the over-age temporary is swept')
+assert.equal(existsSync(staleTemporary), false, 'the crashed writer’s config copy is gone')
+assert.equal(existsSync(freshTemporary), true, 'a fresh temporary may belong to a live writer')
+unlinkSync(freshTemporary)
+
+// Wiring: every real write path sweeps leftovers too, not just the helper.
+const crashTemporary = `${process.env.HINDSIGHT_CONFIG}.tmp-999-3-3`
+writeFileSync(crashTemporary, '{"apiToken":"leaked-secret"}')
+utimesSync(crashTemporary, agedLockTime, agedLockTime)
+applyTuning({ preset: [['injectTimeoutMs', 7000]] })
+assert.equal(existsSync(crashTemporary), false, 'the write path sweeps an old temporary copy')
 
 // Existing user values win unless overwrite is requested.
 const userFile = JSON.parse(JSON.stringify(written.config))

@@ -153,7 +153,12 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    the two commits, the next run folds the journal into the applied map by
    comparing the live value, so `/hindsight revert` still works. The lock only
    serialises processes that obey the same protocol — a text editor or another
-   tool saving the JSON is not blocked, which is why the rename guard exists.
+   tool saving the JSON is not blocked, which is why the rename guard exists. A
+   lock left by a dead writer is reclaimed immediately; one whose pid was
+   recycled by an unrelated process, or one older than a minute, is reclaimed
+   too, so a crash cannot block the next session. Leftover `*.tmp-*` files from
+   a crash are swept at startup: they hold a full copy of the config, so they are
+   not left lying around.
 
 5. **Writes the model cannot authorize itself.** The `hindsight_tuner` tool is
    read-only by default: its schema offers only `status`, `probe` and `suggest`,
@@ -396,11 +401,16 @@ survives upgrades):
   `agents` mount (or if another plugin registers even later), the cap still runs
   but only sees messages appended inside its own `next()` — the `order` line
   reports whether turns have actually passed through it.
-- Token counts are an estimate by default (CJK ≈ 1 token/char, other text ≈
-  3.6 chars/token). `tokenBudgetMode: accurate` uses `js-tiktoken` when it is
-  installed and otherwise falls back to the estimate with a ×1.1 margin; `status`
-  names which path is active and, after accurate turns, reports the measured
-  fast/accurate p50 and p95 ratio.
+- Token counts are an estimate by default: CJK counts 1 token per character,
+  other text ≈ 3.6 chars/token. The CJK weight is a deliberate upper bound
+  (DeepSeek's own tokenizer averages ≈ 0.6 per Chinese character), so a Chinese
+  recall is counted at roughly 1.7× its real size and the ceiling under-fills
+  rather than overshoots. `tokenBudgetMode: accurate` counts with an
+  OpenAI-compatible tokenizer (`js-tiktoken`/`tiktoken`: gpt-4o or cl100k_base) —
+  an approximation, not DeepSeek's own tokenizer — and otherwise falls back to
+  the estimate with a ×1.1 margin; `status` names which path is active and uses
+  which encoding, and after accurate turns reports the measured fast/accurate
+  p50 and p95 ratio.
 - The budget applies to `plugin:hindsight` messages. A second provider that
   injects its own source kind is counted and flagged, not capped.
 - The shared config is global: a value written here is used by Claude Code and
