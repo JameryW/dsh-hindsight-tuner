@@ -142,6 +142,9 @@ async function main() {
         const seen = activity.lastFailure?.endpoint ?? activity.lastEndpoint
         const newest = Date.parse(activity.lastFailure?.ts ?? '')
         const succeeded = Date.parse(activity.lastSuccess?.ts ?? '')
+        // lastSuccess counts only server-confirmed work (pages/retain/reflect).
+        // A local injection is not recovery: a process still on the old config
+        // fails its fetch and then injects its static guide within milliseconds.
         const recovered = Number.isFinite(succeeded) && Number.isFinite(newest) && succeeded > newest
         const seenOrigin = seen ? originOf(seen) : null
         if (seenOrigin && seenOrigin !== expectedOrigin && !recovered) {
@@ -175,12 +178,18 @@ async function main() {
           || bankStatus === 403
           || (realRecallOk === 0 && (recallFailures > 0 || bankFailed))
         )
+        // An unseeded bank is the documented cold state (see "Verifying a
+        // restart" in the README): the integration's first page fetch 404s and
+        // it injects its static guide, so the failures are explained and the
+        // bank is reported as a NOTE. A 401/403 is never explained that way —
+        // that is a token/config problem and stays a failure.
+        const unseeded = bankStatus === 404 && realRecallOk === 0 && (activity.authFailures ?? 0) === 0
 
         if (injected > 0) {
-          if (onlyStaticGuide) {
-            fail('recall', `${injected} inject_ok event(s) in journal, but server recall/pages failed (static tool guide only, no project memory) · ${diagPath()}`)
-          } else if (bankStatus === 404 && realRecallOk === 0) {
+          if (unseeded) {
             note('recall', `${injected} inject_ok event(s) recorded, but bank is not seeded yet (static guide only) · ${diagPath()}`)
+          } else if (onlyStaticGuide) {
+            fail('recall', `${injected} inject_ok event(s) in journal, but server recall/pages failed (static tool guide only, no project memory) · ${diagPath()}`)
           } else {
             pass('recall', `${injected} successful recall(s) from the DSH harness in the window · ${diagPath()}`)
           }

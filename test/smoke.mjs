@@ -1522,13 +1522,24 @@ assert.match(stale, /Restart DSH/)
 assert.match(stale, /2 failures to another server \(old process\)/, 'failures against another origin are counted, not hidden')
 assert.match(stale, /banks coding-agent::fixture 1, coding-agent::misc 1/, 'mixed banks in the journal are visible, not averaged away')
 
-// A newer DSH success clears an earlier failure against another server.
+// A local injection after the failure is not recovery: the static guide is
+// written by this plugin, so the stale process must keep being named.
 writeFileSync(process.env.HINDSIGHT_DIAG_FILE, [
   { ts: new Date(Date.now() - 5000).toISOString(), event: 'pages_failed', error: 'GET http://127.0.0.1:9077/v1/default/banks/coding-agent%3A%3Afixture/pages/tree -> 404' },
   { ts: new Date().toISOString(), event: 'inject_ok', chars: 120 },
 ].map((entry) => JSON.stringify(entry)).join('\n'))
+const injectIsNotRecovery = JSON.parse(await tool.execute({ action: 'status', json: true }, exec))
+assert.equal(injectIsNotRecovery.stale?.seen, 'http://127.0.0.1:9077', 'a local inject_ok does not clear a foreign-origin failure')
+assert.equal(injectIsNotRecovery.activity.lastSuccess, null, 'local injections are not server successes')
+
+// A newer server-confirmed success clears the earlier failure.
+writeFileSync(process.env.HINDSIGHT_DIAG_FILE, [
+  { ts: new Date(Date.now() - 5000).toISOString(), event: 'pages_failed', error: 'GET http://127.0.0.1:9077/v1/default/banks/coding-agent%3A%3Afixture/pages/tree -> 404' },
+  { ts: new Date().toISOString(), event: 'pages_ok', count: 2 },
+].map((entry) => JSON.stringify(entry)).join('\n'))
 const recoveredStale = JSON.parse(await tool.execute({ action: 'status', json: true }, exec))
-assert.equal(recoveredStale.stale, null, 'newer DSH success clears earlier foreign-origin failure')
+assert.equal(recoveredStale.stale, null, 'a newer server success clears an earlier foreign-origin failure')
+assert.equal(Date.parse(recoveredStale.activity.lastSuccess?.ts) > 0, true, 'the server success is recorded')
 
 // endpointOf and bankOf strip wrapping punctuation and query strings cleanly.
 writeFileSync(process.env.HINDSIGHT_DIAG_FILE, JSON.stringify({
@@ -2074,6 +2085,22 @@ try {
     assert.equal(byName(resD, 'bank').status, 'note')
     assert.equal(byName(resD, 'recall').status, 'note')
     assert.equal(byName(resD, 'tuner').status, 'note')
+
+    // 6e: 404 bank + a failed page fetch + the static-guide inject_ok is the
+    // documented cold state: the failures are explained by the unseeded bank,
+    // so recall is a note, not a failure (a 401 stays a failure, see 6a).
+    writeFileSync(join(caseD, 'diag.jsonl'), [
+      { ts: aBoot, harness: 'dsh', event: 'pages_failed', error: `GET ${baseUrl}/v1/default/banks/b/pages/tree -> 404 {"detail":"Bank not found"}` },
+      { ts: aInject, harness: 'dsh', event: 'inject_ok', chars: 3232 },
+    ].map((e) => JSON.stringify(e)).join('\n') + '\n')
+    const resE = await runVerify({
+      DSH_HOME: join(caseD, 'dsh-home'),
+      HINDSIGHT_CONFIG: join(caseD, 'coding-agent.json'),
+      HINDSIGHT_DIAG_FILE: join(caseD, 'diag.jsonl'),
+    })
+    assert.equal(resE.code, 0, 'an unseeded bank with a static-guide injection is a note, not a failure')
+    assert.equal(byName(resE, 'recall').status, 'note')
+    assert.match(byName(resE, 'recall').detail, /bank is not seeded yet \(static guide only\)/)
   } finally {
     await new Promise((resolveClose) => server.close(resolveClose))
   }

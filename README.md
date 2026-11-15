@@ -124,7 +124,11 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    failing until it is restarted — a state no amount of correct file content
    fixes, so `/hindsight` names it on its own `process` line, with the age of the
    evidence; the claim expires after 15 minutes so an old failure cannot cry wolf
-   forever. Journal entries are filtered by harness (a Claude Code failure is not
+   forever. Only a server-confirmed success (`pages_ok`, `retain_ok`,
+   `reflect_ok`) clears it: the static-guide `inject_ok` a stale process writes
+   immediately after its failed fetch is local, so counting it as recovery would
+   hide exactly the state this check exists to name. Journal entries are filtered
+   by harness (a Claude Code failure is not
    DSH's), and failures whose URL points at a different origin than the
    configured server are counted separately instead of being folded into the
    auth-failure total. `/hindsight suggest` proposes a cap from the journal's own
@@ -265,8 +269,10 @@ It resolves the effective server and bank for the current directory, calls
 stale process (or a `401` static-guide-only `inject_ok` with no real recall),
 and checks the tuner's own state and journal (`state.json` and `tuner.jsonl`) to
 confirm auto-tuning and `agent/pre-step` governance actually ran. An unseeded
-bank is reported as NOTE rather than FAIL, because Hindsight creates it on the
-first real session.
+bank is reported as NOTE rather than FAIL: the first page fetch 404s and the
+integration injects its static guide, which is the expected cold state before a
+session seeds the bank. A `401`/`403` is never explained that way — it stays a
+failure, because the process is talking to the wrong server or without a token.
 
 ## Install
 

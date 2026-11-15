@@ -1296,6 +1296,10 @@ function staleProcess(status) {
   if (!seen) return null
   const failedAt = Date.parse(status.activity.lastFailure?.ts ?? '')
   if (!Number.isFinite(failedAt)) return null
+  // Recovery means the process reached the configured server. `lastSuccess`
+  // excludes local injections for this reason: a stale process wakes up, fails
+  // its page fetch, immediately writes a static-guide `inject_ok`, and would
+  // otherwise look healthy forever.
   const succeededAt = Date.parse(status.activity.lastSuccess?.ts ?? '')
   if (Number.isFinite(succeededAt) && succeededAt > failedAt) return null
   const ageMs = Date.now() - failedAt
