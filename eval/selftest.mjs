@@ -10,7 +10,7 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve, sep } from 'node:path'
@@ -102,6 +102,26 @@ function equal(actual, expected, label) {
   if (actual !== expected) {
     throw new Error(`${label}: expected ${formatValue(expected)}, got ${formatValue(actual)}`)
   }
+}
+
+/**
+ * Compare paths by their canonical spelling. `git rev-parse --show-toplevel`
+ * returns the real path of the working tree, which differs from the raw fixture
+ * path wherever the temp directory is a symlink (`/var` → `/private/var` on
+ * macOS) or uses an 8.3 short name (`RUNNER~1` → `runneradmin` on Windows CI).
+ * Both spellings are the same directory, so the comparison must not depend on
+ * which one the caller typed.
+ */
+function canonicalPath(value) {
+  try {
+    return realpathSync.native(value)
+  } catch {
+    return resolve(value)
+  }
+}
+
+function equalPath(actual, expected, label) {
+  equal(canonicalPath(actual), canonicalPath(expected), label)
 }
 
 function deepEqual(actual, expected, label) {
@@ -388,7 +408,7 @@ function pairedRows({ arm, tasks, cost, attempts = 1, solved = true }) {
 
 async function worktreeChecks(repoDir, head, previous, worktreeRoot) {
   check('repoRootOf resolves a git work tree', () => {
-    equal(repoRootOf(repoDir), resolve(repoDir), 'repoRootOf')
+    equalPath(repoRootOf(repoDir), resolve(repoDir), 'repoRootOf')
   })
 
   check('repoRootOf returns null outside git', () => {
@@ -413,7 +433,7 @@ async function worktreeChecks(repoDir, head, previous, worktreeRoot) {
     const handle = createWorktree({ repo: repoDir, root: worktreeRoot, name: 'isolation' })
     try {
       equal(handle.baseSha, head, 'handle.baseSha')
-      equal(handle.repo, resolve(repoDir), 'handle.repo')
+      equalPath(handle.repo, resolve(repoDir), 'handle.repo')
       ok(existsSync(handle.path), 'worktree path exists')
       const prefix = worktreeRoot.endsWith(sep) ? worktreeRoot : `${worktreeRoot}${sep}`
       ok(handle.path.startsWith(prefix), 'worktree path stays under the requested root')
@@ -1323,7 +1343,7 @@ async function abChecks(repoDir, tempRoot) {
     equal(plan.isolation.enabled, true, 'isolation enabled')
     equal(plan.tasks[0].isolated, true, 'git task isolated')
     equal(plan.tasks[0].maxAttempts, 2, 'per-task maxAttempts')
-    equal(plan.tasks[0].repo, resolve(repoDir), 'repo recorded')
+    equalPath(plan.tasks[0].repo, resolve(repoDir), 'repo recorded')
     equal(plan.bank.apiUrl, 'http://127.0.0.1:9077', 'bank api url')
     equal(plan.bank.bankId, `coding-agent::${basename(repoDir)}`, 'bank id')
     equal(plan.bank.verify, null, 'no fingerprint verification')
