@@ -64,7 +64,7 @@ governance bugs were fixed would have measured noise.
 
 | Concern | Mechanism | Status |
 | --- | --- | --- |
-| Hard per-turn cap | outermost `agent/pre-step`, re-registered on session start | shipped |
+| Hard per-turn cap | outermost `agent/pre-step`, re-registered on `agents` mount and `agent/created` / `agent/session-start` | shipped |
 | Budget across messages | water-filling (`allocateBudget`), no hidden floor | shipped |
 | Over-budget payload | structure-aware trim (headings/fences preserved) | shipped |
 | Over-budget selection | Budgeted View: block ranking against the task text, provenance footer, measured result | shipped, opt-in |

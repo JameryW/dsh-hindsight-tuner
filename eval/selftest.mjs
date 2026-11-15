@@ -54,7 +54,7 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const AB_FILE = join(HERE, 'ab.mjs')
-const { parseArgs, readTasks, readPrices, resolveArms, parseUsage } = await import('./ab.mjs')
+const { parseArgs, readTasks, readPrices, resolveArms, parseUsage, splitCommand, normalizeCheck, createRunner } = await import('./ab.mjs')
 
 // ---------------------------------------------------------------------------
 // Tiny assertion / reporting helpers
@@ -1226,6 +1226,25 @@ async function abChecks(repoDir, tempRoot) {
     deepEqual(tasks[2].check, { command: 'node', args: ['script.js', '--flag'] }, 'string check')
   })
 
+  check('splitCommand and normalizeCheck handle quotes, escapes, and Windows paths', () => {
+    deepEqual(
+      splitCommand('node "my agent.mjs" \'single quoted\' escaped\\ arg'),
+      ['node', 'my agent.mjs', 'single quoted', 'escaped arg'],
+      'quotes and escaped spaces',
+    )
+    deepEqual(
+      normalizeCheck('node "C:\\Program Files\\Tool\\app.exe" C:\\tools\\check.mjs'),
+      { command: 'node', args: ['C:\\Program Files\\Tool\\app.exe', 'C:\\tools\\check.mjs'] },
+      'Windows backslashes preserved',
+    )
+    deepEqual(
+      parseArgs(['--tasks', 't.json', '--agent-command', 'node "my agent.mjs" --flag']).agent,
+      ['node', 'my agent.mjs', '--flag'],
+      'parseArgs agent string quoting',
+    )
+    throws(() => splitCommand('node "unterminated'), 'unterminated', 'unterminated quote error')
+  })
+
   check('readTasks rejects malformed task files', () => {
     const duplicate = join(tempRoot, 'duplicate-tasks.json')
     writeFileSync(
@@ -1292,7 +1311,7 @@ async function abChecks(repoDir, tempRoot) {
     equal(prices.cacheReadPerMTok, 0, 'missing price defaults to zero')
   })
 
-  check('parseUsage reads the last JSON line and Claude usage shapes', () => {
+  check('parseUsage reads the last JSON line, multi-line JSON, and Claude usage shapes', () => {
     const stdout = [
       'starting agent',
       JSON.stringify({ type: 'result', usage: { input_tokens: 10, output_tokens: 4 } }),
@@ -1313,6 +1332,19 @@ async function abChecks(repoDir, tempRoot) {
     const cached = parseUsage(`${cacheLine}\nnot json`)
     equal(cached.tokens, 15, 'input+output tokens (cache priced separately)')
     deepEqual(cached.usage, { input: 10, output: 5, cacheRead: 100, cacheWrite: 20 }, 'cache usage')
+
+    const pretty = JSON.stringify({
+      type: 'result',
+      usage: {
+        input_tokens: 12,
+        output_tokens: 8,
+        cache_read_input_tokens: 40,
+        cache_creation_input_tokens: 10,
+      },
+    }, null, 2)
+    const prettyParsed = parseUsage(pretty)
+    equal(prettyParsed.tokens, 20, 'multi-line pretty JSON tokens')
+    deepEqual(prettyParsed.usage, { input: 12, output: 8, cacheRead: 40, cacheWrite: 10 }, 'multi-line pretty JSON usage')
 
     const total = parseUsage(JSON.stringify({ total_tokens: 7 }))
     equal(total.tokens, 7, 'top-level total_tokens')
@@ -1350,6 +1382,112 @@ async function abChecks(repoDir, tempRoot) {
     equal(plan.bank.fingerprintOut, null, 'no fingerprint capture')
     equal(plan.reportFile, null, 'no report written')
     equal(plan.prices, null, 'no prices')
+  })
+
+  const frozenFile = join(tempRoot, 'frozen-fingerprint.json')
+  const frozenDigest = fingerprintOf({ tree: { roots: [] }, stats: {} })
+  writeFileSync(
+    frozenFile,
+    JSON.stringify({
+      format: 'dsh-hindsight-tuner/bank-fingerprint@1',
+      apiUrl: 'http://frozen.invalid:1',
+      bankId: 'frozen-bank',
+      tree: { roots: [] },
+      stats: {},
+      fingerprint: frozenDigest,
+    }),
+    'utf8',
+  )
+  const overrideDryRun = await runAbCli([
+    '--tasks',
+    tasksFile,
+    '--arms',
+    'A0',
+    '--verify-fingerprint',
+    frozenFile,
+    '--api-url',
+    'http://explicit.invalid:2',
+    '--bank',
+    'explicit-bank',
+    '--dry-run',
+    '--json',
+  ])
+  check('ab --verify-fingerprint preserves explicit --api-url and --bank in --dry-run', () => {
+    equal(overrideDryRun.status, 0, `exit code (stderr: ${overrideDryRun.stderr.trim()})`)
+    const plan = JSON.parse(overrideDryRun.stdout)
+    equal(plan.bank.apiUrl, 'http://explicit.invalid:2', 'explicit api-url preserved')
+    equal(plan.bank.bankId, 'explicit-bank', 'explicit bank preserved')
+    equal(plan.bank.expectedFingerprint, frozenDigest, 'fingerprint recorded')
+  })
+
+  await checkAsync('createRunner isolates HINDSIGHT_CONFIG keys overridden by arm env', async () => {
+    const cfgFile = join(tempRoot, 'shared-hindsight.json')
+    const outFile = join(tempRoot, 'runner-seen.json')
+    writeFileSync(
+      cfgFile,
+      JSON.stringify({
+        apiToken: 'keep-secret',
+        autoInject: 'pages',
+        injectTimeoutMs: 7000,
+        harnesses: { dsh: { autoInject: 'recall', pageSearchLimit: 6 } },
+        paths: { [repoDir]: { autoInject: 'pages', seedLimit: 20 } },
+        banks: { 'coding-agent::x': { autoInject: 'reflect', dynamicBankId: true } },
+      }, null, 2),
+      'utf8',
+    )
+    const agentScript = join(tempRoot, 'inspect-agent.mjs')
+    writeFileSync(
+      agentScript,
+      [
+        "import { readFileSync, writeFileSync } from 'node:fs'",
+        'const cfgPath = process.env.HINDSIGHT_CONFIG',
+        'writeFileSync(process.env.OUT_FILE, JSON.stringify({',
+        '  cfgPath,',
+        '  autoInjectEnv: process.env.HINDSIGHT_AUTO_INJECT,',
+        "  cfg: JSON.parse(readFileSync(cfgPath, 'utf8')),",
+        '}))',
+      ].join('\n'),
+      'utf8',
+    )
+    const prevCfg = process.env.HINDSIGHT_CONFIG
+    process.env.HINDSIGHT_CONFIG = cfgFile
+    try {
+      const runner = createRunner({
+        agent: [process.execPath, agentScript],
+        timeoutMs: 10_000,
+        resetBetweenAttempts: false,
+      })
+      const result = await runner({
+        task: {
+          id: 'iso',
+          prompt: 'test',
+          cwd: repoDir,
+          check: { command: process.execPath, args: ['-e', 'process.exit(0)'] },
+          env: { OUT_FILE: outFile },
+        },
+        arm: { name: 'A0', env: { HINDSIGHT_AUTO_INJECT: 'none' } },
+        attempt: 1,
+        worktree: null,
+      })
+      equal(result.passed, true, `runner passed: ${result.error || result.note || ''}`)
+      const seen = JSON.parse(readFileSync(outFile, 'utf8'))
+      ok(seen.cfgPath !== cfgFile, 'isolated config path used')
+      equal(seen.autoInjectEnv, 'none', 'arm env preserved')
+      equal(seen.cfg.apiToken, 'keep-secret', 'non-overridden top-level key kept')
+      equal(seen.cfg.injectTimeoutMs, 7000, 'non-overridden injectTimeoutMs kept')
+      equal('autoInject' in seen.cfg, false, 'top-level autoInject stripped')
+      equal('autoInject' in seen.cfg.harnesses.dsh, false, 'harnesses.dsh.autoInject stripped')
+      equal(seen.cfg.harnesses.dsh.pageSearchLimit, 6, 'non-overridden harness key kept')
+      equal('autoInject' in seen.cfg.paths[repoDir], false, 'paths.*.autoInject stripped')
+      equal(seen.cfg.paths[repoDir].seedLimit, 20, 'non-overridden path key kept')
+      equal('autoInject' in seen.cfg.banks['coding-agent::x'], false, 'banks.*.autoInject stripped')
+      equal(seen.cfg.banks['coding-agent::x'].dynamicBankId, true, 'non-overridden bank key kept')
+      equal(JSON.parse(readFileSync(cfgFile, 'utf8')).autoInject, 'pages', 'original config file untouched')
+      equal(existsSync(dirname(seen.cfgPath)), false, 'isolated scratch dir cleaned up')
+    } finally {
+      if (prevCfg === undefined) delete process.env.HINDSIGHT_CONFIG
+      else process.env.HINDSIGHT_CONFIG = prevCfg
+    }
   })
 
   const textRun = await runAbCli(['--tasks', tasksFile, '--arms', 'A0', '--dry-run'])

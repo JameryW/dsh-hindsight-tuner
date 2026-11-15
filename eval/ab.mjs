@@ -13,9 +13,12 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { configPath } from '../lib/config-file.js'
+import { ENV_KEYS } from '../lib/diagnostics.js'
 import {
   DEFAULT_ARMS,
   evaluate,
@@ -49,6 +52,9 @@ const DEFAULT_BOOTSTRAPS = 4000
 const DEFAULT_SEED = 20260101
 const MAX_CAPTURE_BYTES = 4 * 1024 * 1024
 const EXAMPLE_ARMS_FILE = resolve(HERE, 'arms.example.json')
+const ENV_TO_CONFIG_KEY = Object.fromEntries(
+  Object.entries(ENV_KEYS).map(([configKey, envName]) => [envName, configKey]),
+)
 
 export const USAGE = `Usage: node eval/ab.mjs --tasks <file> [options]
 
@@ -119,6 +125,49 @@ const VALUE_FLAGS = new Set([
   '--prices',
 ])
 
+/** Split a command string respecting quotes and escaped spaces without breaking Windows paths. */
+export function splitCommand(raw) {
+  const source = String(raw ?? '')
+  const parts = []
+  let current = ''
+  let quote = null
+  let hasToken = false
+  for (let index = 0; index < source.length; index += 1) {
+    const ch = source[index]
+    if (quote) {
+      if (ch === quote) {
+        quote = null
+      } else if (quote === '"' && ch === '\\' && index + 1 < source.length && ['"', '\\', '$'].includes(source[index + 1])) {
+        current += source[index + 1]
+        index += 1
+      } else {
+        current += ch
+      }
+      continue
+    }
+    if (ch === '\'' || ch === '"') {
+      quote = ch
+      hasToken = true
+    } else if (ch === '\\' && index + 1 < source.length && /[\s'"\\]/.test(source[index + 1])) {
+      current += source[index + 1]
+      hasToken = true
+      index += 1
+    } else if (/\s/.test(ch)) {
+      if (hasToken) {
+        parts.push(current)
+        current = ''
+        hasToken = false
+      }
+    } else {
+      current += ch
+      hasToken = true
+    }
+  }
+  if (quote) throw new Error(`unterminated ${quote} quote in command: ${source}`)
+  if (hasToken) parts.push(current)
+  return parts
+}
+
 function parseInteger(value, flag, { min = 0 } = {}) {
   const text = String(value).trim()
   if (!/^[+-]?\d+$/.test(text)) {
@@ -152,8 +201,8 @@ function parseAgentCommand(value) {
     }
     return parsed
   }
-  const parts = text.split(/\s+/).filter(Boolean)
-  if (parts.length === 0) throw new Error('--agent-command requires a command')
+  const parts = splitCommand(text)
+  if (parts.length === 0 || !parts[0]) throw new Error('--agent-command requires a command')
   return parts
 }
 
@@ -308,10 +357,11 @@ function readJsonFile(file, label) {
   }
 }
 
-function normalizeCheck(check, label) {
+/** Normalize string, array, or object check commands using quote-aware parsing. */
+export function normalizeCheck(check, label = 'task') {
   if (typeof check === 'string') {
-    const parts = check.trim().split(/\s+/).filter(Boolean)
-    if (parts.length === 0) throw new Error(`${label}.check must not be empty`)
+    const parts = splitCommand(check.trim())
+    if (parts.length === 0 || !parts[0]) throw new Error(`${label}.check must not be empty`)
     return { command: parts[0], args: parts.slice(1) }
   }
   if (Array.isArray(check)) {
@@ -661,7 +711,7 @@ function usageFromObject(parsed) {
   return null
 }
 
-/** Parse usage from the last JSON line on stdout; returns {usage, tokens}. */
+/** Parse usage from the last JSON line (or a multi-line JSON object) on stdout; returns {usage, tokens}. */
 export function parseUsage(stdout) {
   const text = typeof stdout === 'string' ? stdout : ''
   const lines = text.split(/\r?\n/)
@@ -677,92 +727,153 @@ export function parseUsage(stdout) {
     const found = usageFromObject(parsed)
     if (found) return found
   }
+  const trimmed = text.trim()
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed)
+      const found = usageFromObject(parsed)
+      if (found) return found
+    } catch {
+      // Output is not valid JSON.
+    }
+  }
   return { usage: null, tokens: null }
 }
 
-function createRunner(options) {
+function stripOverriddenKeys(section, keys) {
+  if (!section || typeof section !== 'object' || Array.isArray(section)) return
+  for (const key of keys) delete section[key]
+}
+
+function prepareIsolatedConfigKeys(baseEnv, overrideEnv) {
+  const overriddenKeys = new Set()
+  for (const [envName, value] of Object.entries(overrideEnv ?? {})) {
+    if (value === undefined) continue
+    const configKey = ENV_TO_CONFIG_KEY[envName]
+    if (configKey) overriddenKeys.add(configKey)
+  }
+  if (overriddenKeys.size === 0) return { env: {}, dir: null }
+  const sourceFile = baseEnv.HINDSIGHT_CONFIG || configPath()
+  if (!existsSync(sourceFile)) return { env: {}, dir: null }
+  let parsed
+  try {
+    const raw = JSON.parse(readFileSync(sourceFile, 'utf8'))
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { env: {}, dir: null }
+    parsed = raw
+  } catch {
+    return { env: {}, dir: null }
+  }
+  stripOverriddenKeys(parsed, overriddenKeys)
+  for (const container of ['harnesses', 'paths', 'banks']) {
+    const map = parsed[container]
+    if (!map || typeof map !== 'object' || Array.isArray(map)) continue
+    for (const section of Object.values(map)) stripOverriddenKeys(section, overriddenKeys)
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'tuner-ab-cfg-'))
+  const target = join(dir, 'hindsight-config.json')
+  writeFileSync(target, `${JSON.stringify(parsed, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+  return { env: { HINDSIGHT_CONFIG: target }, dir }
+}
+
+/** Create the per-run agent + check runner, isolating HINDSIGHT_CONFIG keys overridden by arm/task env. */
+export function createRunner(options) {
   return async function runTask({ task, arm, attempt, worktree }) {
     const cwd = worktree ? worktree.path : resolve(task.cwd)
     if (options.resetBetweenAttempts && attempt > 1 && worktree) {
       resetWorktree(worktree)
     }
-    const env = buildEnvForRun(task, arm, attempt)
-    const agentResult = await runProcess(options.agent[0], options.agent.slice(1), {
-      cwd,
-      env,
-      stdin: task.prompt,
-      timeoutMs: options.timeoutMs,
-    })
-    const usage = parseUsage(agentResult.stdout)
-    const base = {
-      tokens: usage.tokens,
-      usage: usage.usage,
-      durationMs: agentResult.durationMs,
-    }
-    if (agentResult.timedOut) {
-      return {
-        ...base,
-        passed: false,
-        failureSignature: 'timeout',
-        error: `agent timed out after ${options.timeoutMs}ms`,
-        note: clipTail(agentResult.stderr) || clipTail(agentResult.stdout),
+    const baseEnv = buildEnvForRun(task, arm, attempt)
+    const armSetsConfig = arm?.env && Object.prototype.hasOwnProperty.call(arm.env, 'HINDSIGHT_CONFIG')
+    const isolated = armSetsConfig
+      ? { env: {}, dir: null }
+      : prepareIsolatedConfigKeys(baseEnv, { ...task.env, ...arm.env })
+    const env = { ...baseEnv, ...isolated.env }
+    try {
+      const agentResult = await runProcess(options.agent[0], options.agent.slice(1), {
+        cwd,
+        env,
+        stdin: task.prompt,
+        timeoutMs: options.timeoutMs,
+      })
+      const usage = parseUsage(agentResult.stdout)
+      const base = {
+        tokens: usage.tokens,
+        usage: usage.usage,
+        durationMs: agentResult.durationMs,
       }
-    }
-    if (agentResult.error) {
-      return {
-        ...base,
-        passed: false,
-        failureSignature: 'spawn-error',
-        error: agentResult.error,
-        note: clipTail(agentResult.stderr),
+      if (agentResult.timedOut) {
+        return {
+          ...base,
+          passed: false,
+          failureSignature: 'timeout',
+          error: `agent timed out after ${options.timeoutMs}ms`,
+          note: clipTail(agentResult.stderr) || clipTail(agentResult.stdout),
+        }
       }
-    }
-    if (agentResult.exitCode !== 0) {
-      const code = agentResult.exitCode === null ? agentResult.signal : agentResult.exitCode
-      return {
-        ...base,
-        passed: false,
-        failureSignature: `agent-exit-${code}`,
-        error: `agent exited with ${code}`,
-        note: clipTail(agentResult.stderr) || clipTail(agentResult.stdout),
+      if (agentResult.error) {
+        return {
+          ...base,
+          passed: false,
+          failureSignature: 'spawn-error',
+          error: agentResult.error,
+          note: clipTail(agentResult.stderr),
+        }
       }
-    }
+      if (agentResult.exitCode !== 0) {
+        const code = agentResult.exitCode === null ? agentResult.signal : agentResult.exitCode
+        return {
+          ...base,
+          passed: false,
+          failureSignature: `agent-exit-${code}`,
+          error: `agent exited with ${code}`,
+          note: clipTail(agentResult.stderr) || clipTail(agentResult.stdout),
+        }
+      }
 
-    const check = task.check
-    if (!check || typeof check !== 'object' || Array.isArray(check) || typeof check.command !== 'string') {
-      throw new Error(`task ${task.id} has an unnormalized check command`)
-    }
-    const checkCwd = task.checkCwd ? resolve(cwd, task.checkCwd) : cwd
-    const checkResult = await runProcess(check.command, check.args ?? [], {
-      cwd: checkCwd,
-      env,
-      stdin: null,
-      timeoutMs: options.timeoutMs,
-    })
-    const durationMs = agentResult.durationMs + checkResult.durationMs
-    if (checkResult.timedOut || checkResult.error || checkResult.exitCode !== 0) {
-      let failureSignature
-      let error
-      if (checkResult.timedOut) {
-        failureSignature = 'check-timeout'
-        error = `check timed out after ${options.timeoutMs}ms`
-      } else if (checkResult.error) {
-        failureSignature = 'check-spawn-error'
-        error = checkResult.error
-      } else {
-        failureSignature = `check-exit-${checkResult.exitCode}`
-        error = `check failed with exit code ${checkResult.exitCode}`
+      const check = task.check
+      if (!check || typeof check !== 'object' || Array.isArray(check) || typeof check.command !== 'string') {
+        throw new Error(`task ${task.id} has an unnormalized check command`)
       }
-      return {
-        ...base,
-        durationMs,
-        passed: false,
-        failureSignature,
-        error,
-        note: clipTail(checkResult.stderr) || clipTail(checkResult.stdout),
+      const checkCwd = task.checkCwd ? resolve(cwd, task.checkCwd) : cwd
+      const checkResult = await runProcess(check.command, check.args ?? [], {
+        cwd: checkCwd,
+        env,
+        stdin: null,
+        timeoutMs: options.timeoutMs,
+      })
+      const durationMs = agentResult.durationMs + checkResult.durationMs
+      if (checkResult.timedOut || checkResult.error || checkResult.exitCode !== 0) {
+        let failureSignature
+        let error
+        if (checkResult.timedOut) {
+          failureSignature = 'check-timeout'
+          error = `check timed out after ${options.timeoutMs}ms`
+        } else if (checkResult.error) {
+          failureSignature = 'check-spawn-error'
+          error = checkResult.error
+        } else {
+          failureSignature = `check-exit-${checkResult.exitCode}`
+          error = `check failed with exit code ${checkResult.exitCode}`
+        }
+        return {
+          ...base,
+          durationMs,
+          passed: false,
+          failureSignature,
+          error,
+          note: clipTail(checkResult.stderr) || clipTail(checkResult.stdout),
+        }
+      }
+      return { ...base, durationMs, passed: true }
+    } finally {
+      if (isolated.dir) {
+        try {
+          rmSync(isolated.dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })
+        } catch {
+          // Best-effort scratch config cleanup.
+        }
       }
     }
-    return { ...base, durationMs, passed: true }
   }
 }
 
@@ -845,8 +956,8 @@ async function prepareBank(options, tasks) {
   if (options.verifyFingerprint) {
     const expected = readFingerprint(options.verifyFingerprint)
     info.expectedFingerprint = expected.fingerprint
-    info.apiUrl = expected.apiUrl ?? info.apiUrl
-    info.bankId = expected.bankId ?? info.bankId
+    if (!options.apiUrl) info.apiUrl = expected.apiUrl ?? info.apiUrl
+    if (!options.bank) info.bankId = expected.bankId ?? info.bankId
   }
   if (options.dryRun) return { info, fingerprint: null, resolved }
 
@@ -912,8 +1023,8 @@ function buildPlan(options, tasks, armsResult, resolved, repoInfo) {
   if (options.verifyFingerprint) {
     const expected = readFingerprint(options.verifyFingerprint)
     bankPlan.expectedFingerprint = expected.fingerprint
-    bankPlan.apiUrl = expected.apiUrl ?? bankPlan.apiUrl
-    bankPlan.bankId = expected.bankId ?? bankPlan.bankId
+    if (!options.apiUrl) bankPlan.apiUrl = expected.apiUrl ?? bankPlan.apiUrl
+    if (!options.bank) bankPlan.bankId = expected.bankId ?? bankPlan.bankId
   }
   return {
     tasksFile: resolve(options.tasks),

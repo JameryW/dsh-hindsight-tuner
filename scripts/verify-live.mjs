@@ -13,15 +13,17 @@
 // Exit code 0 means every hard check passed. A not-yet-seeded bank is a note,
 // not a failure: Hindsight creates it on the first real session.
 
-import { configPath, readConfigFile } from '../lib/config-file.js'
+import { readConfigFile, tunerState } from '../lib/config-file.js'
 import {
   bankResolution,
   diagPath,
+  effectiveConfig,
   effectiveServer,
   optedOut,
   projectName,
   summarizeActivity,
 } from '../lib/diagnostics.js'
+import { summarizeTunerJournal } from '../lib/log.js'
 
 const STALE_MS = 15 * 60_000
 
@@ -41,9 +43,9 @@ function fail(name, detail) {
 
 function originOf(url) {
   try {
-    return new URL(url).origin
+    return new URL(url).origin.toLowerCase()
   } catch {
-    return String(url ?? '').replace(/\/+$/, '')
+    return String(url ?? '').replace(/\/+$/, '').toLowerCase()
   }
 }
 
@@ -78,11 +80,30 @@ async function main() {
   }
 
   if (config) {
-    const server = effectiveServer(config)
+    const baseLayers = effectiveConfig(config, { cwd })
+    let resolution = null
+    try {
+      resolution = bankResolution(baseLayers.config, repo, cwd)
+    } catch (error) {
+      fail('bank', `could not resolve the bank: ${error.message}`)
+    }
+    const layers = effectiveConfig(config, { cwd, bank: resolution?.base ?? resolution?.bank })
+    const effective = layers.config
+    const server = effectiveServer(effective, {}, { tokenSource: layers.tokenSource })
+    const isOptedOut = optedOut(effective, cwd)
+    const disabled = server.disabled || isOptedOut
     const expectedOrigin = originOf(server.apiUrl)
-    check('server', server.disabled ? 'fail' : 'pass', `mode ${server.mode} · ${server.apiUrl}${server.disabled ? ' · disabled in config' : ''}`)
+    check(
+      'server',
+      disabled ? 'fail' : 'pass',
+      `mode ${server.mode} · ${server.apiUrl}${server.disabled ? ' · disabled in config' : isOptedOut ? ' · optInOnly excludes this directory' : ''}`,
+    )
 
-    if (!server.disabled) {
+    if (!disabled) {
+      let bankStatus = null
+      let bankSeeded = false
+      let bankFailed = false
+
       try {
         const health = await request(`${server.apiUrl.replace(/\/+$/, '')}/health`, server.token)
         if (health.status === 200) pass('health', `${server.apiUrl}/health -> 200`)
@@ -91,54 +112,127 @@ async function main() {
         fail('health', `${server.apiUrl}/health unreachable: ${error.message}`)
       }
 
-      let resolution = null
-      try {
-        resolution = bankResolution(config, repo, cwd)
-      } catch (error) {
-        fail('bank', `could not resolve the bank: ${error.message}`)
-      }
       if (resolution) {
         const bank = resolution.bank
         const url = `${server.apiUrl.replace(/\/+$/, '')}/v1/default/banks/${encodeURIComponent(bank)}/pages/tree`
         try {
           const tree = await request(url, server.token)
-          if (tree.status === 200) pass('bank', `${bank} (${resolution.source}) is seeded`)
-          else if (tree.status === 404) note('bank', `${bank} (${resolution.source}) is not seeded yet — run one DSH session, then re-run this script`)
-          else fail('bank', `${bank} -> ${tree.status} ${tree.body}`)
+          bankStatus = tree.status
+          if (tree.status === 200) {
+            bankSeeded = true
+            pass('bank', `${bank} (${resolution.source}) is seeded`)
+          } else if (tree.status === 404) {
+            note('bank', `${bank} (${resolution.source}) is not seeded yet — run one DSH session, then re-run this script`)
+          } else {
+            bankFailed = true
+            fail('bank', `${bank} -> ${tree.status} ${tree.body}`)
+          }
         } catch (error) {
+          bankFailed = true
           fail('bank', `${bank} unreachable: ${error.message}`)
         }
-        if (optedOut(config, cwd)) note('opt-in', 'this directory is opted out of memory; the integration will not inject here')
+      } else {
+        bankFailed = true
       }
 
+      let injected = 0
+      let lastInjectAt = Number.NaN
       try {
         const activity = summarizeActivity({ expectedOrigin, harness: 'dsh' })
-        if (activity.foreignFailures > 0 && activity.lastFailure) {
-          const newest = Date.parse(activity.lastFailure.ts ?? '')
+        const seen = activity.lastFailure?.endpoint ?? activity.lastEndpoint
+        const newest = Date.parse(activity.lastFailure?.ts ?? '')
+        const succeeded = Date.parse(activity.lastSuccess?.ts ?? '')
+        const recovered = Number.isFinite(succeeded) && Number.isFinite(newest) && succeeded > newest
+        const seenOrigin = seen ? originOf(seen) : null
+        if (seenOrigin && seenOrigin !== expectedOrigin && !recovered) {
           const recent = Number.isFinite(newest) && Date.now() - newest <= STALE_MS
           if (recent) {
             fail(
               'stale',
-              `the newest journal failure targets ${activity.lastEndpoint ?? 'another server'} but the config points at ${expectedOrigin}: the running process loaded the old config (restart DSH). ${activity.foreignFailures} failures to another server in the window.`,
+              `the newest journal failure targets ${seenOrigin} but the config points at ${expectedOrigin}: the running process loaded the old config (restart DSH). ${activity.foreignFailures} failures to another server in the window.`,
             )
           } else {
             note('stale', `${activity.foreignFailures} historical failures to another server, none in the last 15 minutes`)
           }
+        } else if (activity.foreignFailures > 0) {
+          note(
+            'stale',
+            recovered
+              ? `newer DSH success recorded after earlier failures to another server (${activity.foreignFailures} in window)`
+              : `${activity.foreignFailures} historical failures to another server; newest failure matches the configured server`,
+          )
         } else {
           pass('stale', 'no failures against a different server in the journal window')
         }
-        const injected = activity.recent?.inject_ok ?? 0
-        if (injected > 0) pass('recall', `${injected} successful recall(s) from the DSH harness in the window · ${diagPath()}`)
-        else note('recall', `no successful recall from the DSH harness yet in the window · ${diagPath()} (start a session first)`)
+
+        const recent = activity.recent ?? {}
+        injected = recent.inject_ok ?? 0
+        lastInjectAt = activity.lastInject?.ts ? Date.parse(activity.lastInject.ts) : Number.NaN
+        const realRecallOk = (recent.pages_ok ?? 0) + (recent.reflect_ok ?? 0) + (recent.recall_ok ?? 0) + (recent.inject_pages ?? 0)
+        const recallFailures = (recent.pages_failed ?? 0) + (recent.reflect_failed ?? 0) + (recent.recall_failed ?? 0) + (activity.authFailures ?? 0)
+        const onlyStaticGuide = injected > 0 && (
+          bankStatus === 401
+          || bankStatus === 403
+          || (realRecallOk === 0 && (recallFailures > 0 || bankFailed))
+        )
+
+        if (injected > 0) {
+          if (onlyStaticGuide) {
+            fail('recall', `${injected} inject_ok event(s) in journal, but server recall/pages failed (static tool guide only, no project memory) · ${diagPath()}`)
+          } else if (bankStatus === 404 && realRecallOk === 0) {
+            note('recall', `${injected} inject_ok event(s) recorded, but bank is not seeded yet (static guide only) · ${diagPath()}`)
+          } else if (realRecallOk === 0 && !bankSeeded) {
+            note('recall', `${injected} inject_ok event(s) recorded, awaiting seeded bank confirmation · ${diagPath()}`)
+          } else {
+            pass('recall', `${injected} successful recall(s) from the DSH harness in the window · ${diagPath()}`)
+          }
+        } else {
+          note('recall', `no successful recall from the DSH harness yet in the window · ${diagPath()} (start a session first)`)
+        }
       } catch (error) {
         fail('journal', `could not read ${diagPath()}: ${error.message}`)
       }
+
+      try {
+        const tuner = summarizeTunerJournal({ windowHours: 24 })
+        const state = tunerState()
+        const governed = tuner.tierSelected + tuner.capped + tuner.skipped + tuner.deltas + tuner.reentered + tuner.viewed
+        const tuneRan = tuner.tuneApplied > 0 || tuner.tuneRequested > 0 || tuner.tuneSkipped > 0 || state.exists
+        const activatedAt = tuner.lastActivated?.ts ? Date.parse(tuner.lastActivated.ts) : Number.NaN
+        const injectSinceActivated = injected > 0 && (!Number.isFinite(activatedAt) || (Number.isFinite(lastInjectAt) && lastInjectAt >= activatedAt))
+        const expectsTierEvents = tuner.lastActivated?.cap !== 0
+          && (tuner.lastActivated?.budgetPolicy === 'adaptive' || tuner.lastActivated?.budgetPolicy === 'scenario')
+
+        if (tuner.tuneErrorActive) {
+          fail('tuner', `auto-tune failed (${tuner.tuneFailed}x): ${tuner.lastTuneError ?? 'unknown error'} · ${tuner.path}`)
+        } else if (!tuner.exists && !state.exists) {
+          note('tuner', `no tuner state or journal yet · ${tuner.path} (open a DSH session with dsh-hindsight-tuner enabled)`)
+        } else if (tuner.activated > 0 && tuner.lastActivated?.autoTune === true && !tuneRan && injectSinceActivated) {
+          fail('tuner', `plugin activated with autoTune=true, but auto-tune never ran (${injected} DSH inject_ok, 0 tune events, no ${state.path})`)
+        } else if (tuner.activated > 0 && expectsTierEvents && injectSinceActivated && governed === 0) {
+          fail('tuner', `plugin activated (budgetPolicy=${tuner.lastActivated.budgetPolicy}), DSH injected after activation, but 0 governed events reached tuner (hook order or lifecycle mismatch)`)
+        } else if (governed > 0 || tuneRan) {
+          const parts = []
+          if (governed > 0) parts.push(`${governed} governed event(s) (${tuner.tierSelected} tiered · ${tuner.capped} capped · ${tuner.skipped} skipped)`)
+          else if (tuner.activated > 0) parts.push(`activated (${tuner.activated}x)`)
+          if (state.exists) parts.push(`state.json (${state.applied.length} applied)`)
+          else if (tuner.tuneApplied > 0 || tuner.tuneRequested > 0) parts.push(`${tuner.tuneApplied + tuner.tuneRequested} tune run(s)`)
+          pass('tuner', `${parts.join(' · ')} · ${tuner.path}`)
+        } else {
+          note('tuner', `activated (${tuner.activated}x), waiting for first DSH session or injection · ${tuner.path}`)
+        }
+      } catch (error) {
+        fail('tuner', `could not read tuner state: ${error.message}`)
+      }
+    } else if (isOptedOut) {
+      note('opt-in', 'this directory is opted out of memory; the integration will not inject here')
     }
   }
 
   const failed = results.filter((result) => result.status === 'fail')
   if (json) {
-    console.log(JSON.stringify({ cwd, repo, passed: failed.length === 0, results }, null, 2))  } else {
+    console.log(JSON.stringify({ cwd, repo, passed: failed.length === 0, results }, null, 2))
+  } else {
     const mark = { pass: 'PASS', note: 'NOTE', fail: 'FAIL' }
     for (const result of results) console.log(`${mark[result.status].padEnd(5)} ${result.name.padEnd(8)} ${result.detail}`)
     console.log(`${failed.length === 0 ? 'verify: all checks passed' : `verify: ${failed.length} check(s) failed`}`)

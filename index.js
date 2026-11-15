@@ -46,7 +46,7 @@ import {
   projectName,
   summarizeActivity,
 } from './lib/diagnostics.js'
-import { flushJournal, record } from './lib/log.js'
+import { flushJournal, record, summarizeTunerJournal } from './lib/log.js'
 import {
   allocateBudget,
   countTokens,
@@ -77,6 +77,7 @@ const MAX_REMEMBERED_SESSIONS = 40
 // Remembered message ids per session; enough to tell "this recall existed in an
 // earlier turn" from "this recall is new", without holding arbitrary history.
 const MAX_SEEN_IDS = 400
+const RAW_MEMORY_LIMIT = 50_000
 const REENTRY_PREFIX = '[dsh-hindsight-tuner: memory re-injected after context compaction]\n\n'
 const REENTRY_MARKER = '\n\n…[dsh-hindsight-tuner: re-injected after the context was compacted; the earlier copy is no longer in context.]'
 const DELTA_MARKER = '…[dsh-hindsight-tuner: new-facts delta — repeated blocks omitted; the earlier recall is still in the conversation.]'
@@ -98,59 +99,67 @@ function normalizeScenarioTiers(raw) {
 
 function normalizeConfig(input) {
   const raw = input && typeof input === 'object' ? input : {}
-  const number = (value, fallback) => (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback)
-  const text = (value, fallback) => (typeof value === 'string' && value.length > 0 ? value : fallback)
+  const rawTiers = raw.budgetTiers
+  const budgetTiers = rawTiers === undefined
+    ? { light: 800, normal: 1600, deep: 3000 }
+    : (rawTiers !== null && typeof rawTiers === 'object' && !Array.isArray(rawTiers))
+      ? {
+          light: rawTiers.light === undefined ? 800 : rawTiers.light,
+          normal: rawTiers.normal === undefined ? 1600 : rawTiers.normal,
+          deep: rawTiers.deep === undefined ? 3000 : rawTiers.deep,
+        }
+      : rawTiers
   return {
     autoTune: raw.autoTune !== false,
     overwrite: raw.overwrite === true,
-    maxInjectTokens: number(raw.maxInjectTokens, 3000),
-    autoInject: text(raw.autoInject, 'pages'),
-    injectTimeoutMs: number(raw.injectTimeoutMs, 7000),
+    maxInjectTokens: raw.maxInjectTokens === undefined ? 3000 : raw.maxInjectTokens,
+    autoInject: raw.autoInject === undefined ? 'pages' : raw.autoInject,
+    injectTimeoutMs: raw.injectTimeoutMs === undefined ? 7000 : raw.injectTimeoutMs,
     // Accept the named mode or the integration's explicit list form; validation
     // rejects anything else instead of silently writing a broken value.
-    observationScopes: raw.observationScopes ?? 'per_source',
+    observationScopes: raw.observationScopes === undefined ? 'per_source' : raw.observationScopes,
     // The integration's own recall default is 2000; pinning it keeps the budget
     // explicit and survives a future release that raises its default.
-    recallMaxTokens: number(raw.recallMaxTokens, 2000),
-    sourceKind: text(raw.sourceKind, 'plugin:hindsight'),
+    recallMaxTokens: raw.recallMaxTokens === undefined ? 2000 : raw.recallMaxTokens,
+    sourceKind: raw.sourceKind === undefined ? 'plugin:hindsight' : raw.sourceKind,
     // off: one hard ceiling per turn (the 0.3–0.7 behaviour). adaptive: the
     // ceiling for a turn is chosen from a small tier table (light/normal/deep)
     // and can only lower the configured maxInjectTokens, never raise it.
     // scenario: the same tier table, chosen from the turn's state and lexical
     // task signal (debug/edit/review/question/continuation). Opt-in experiment.
-    budgetPolicy: raw.budgetPolicy === 'adaptive' || raw.budgetPolicy === 'scenario'
-      ? raw.budgetPolicy
-      : 'off',
-    budgetTiers: {
-      light: number(raw.budgetTiers?.light, 800),
-      normal: number(raw.budgetTiers?.normal, 1600),
-      deep: number(raw.budgetTiers?.deep, 3000),
-    },
+    budgetPolicy: raw.budgetPolicy === undefined
+      ? 'off'
+      : (typeof raw.budgetPolicy === 'string' ? raw.budgetPolicy.toLowerCase() : raw.budgetPolicy),
+    budgetTiers,
     // Per-scenario tier overrides. Defaults are a starting table, not a measured
-    // optimum; an invalid key or tier is reported and falls back per entry.
-    scenarioTiers: normalizeScenarioTiers(raw.scenarioTiers),
+    // optimum; invalidated on the raw shape first, then normalized per entry.
+    scenarioTiers: raw.scenarioTiers,
     // inject: every turn gets the recall again (the integration's behaviour).
     // skip: a recall that mostly repeats what the model already received last
     // turn is dropped instead of re-sent; the earlier message is still in the
     // conversation, so the content is not lost, only the duplicate.
-    repeatPolicy: text(raw.repeatPolicy, 'inject').toLowerCase() === 'skip' ? 'skip' : 'inject',
-    repeatThreshold: Math.min(1, Math.max(0.5, number(raw.repeatThreshold, 0.9))),
+    repeatPolicy: raw.repeatPolicy === undefined
+      ? 'inject'
+      : (typeof raw.repeatPolicy === 'string' ? raw.repeatPolicy.toLowerCase() : raw.repeatPolicy),
+    repeatThreshold: raw.repeatThreshold === undefined ? 0.9 : raw.repeatThreshold,
     // A recall is evidence, not authority: the pages were written by an earlier
     // session and may describe code that has since changed. With this on, the
     // injected text opens with a short reminder to verify before acting.
-    verifyReminder: raw.verifyReminder === true,
+    verifyReminder: raw.verifyReminder === undefined ? false : raw.verifyReminder,
 
     // truncate: keep the leading blocks of a recall within the budget (the 0.x
     // behaviour). budgeted: score fact-sized blocks against the current turn and
     // spend the budget on the blocks whose evidence matches the task.
-    viewPolicy: VIEW_POLICIES.includes(text(raw.viewPolicy, 'truncate').toLowerCase())
-      ? text(raw.viewPolicy, 'truncate').toLowerCase()
-      : 'truncate',
-    viewContextMessages: Math.min(40, Math.max(1, Math.round(number(raw.viewContextMessages, DEFAULT_VIEW_CONTEXT_MESSAGES)))),
+    viewPolicy: raw.viewPolicy === undefined
+      ? 'truncate'
+      : (typeof raw.viewPolicy === 'string' ? raw.viewPolicy.toLowerCase() : raw.viewPolicy),
+    viewContextMessages: raw.viewContextMessages === undefined ? DEFAULT_VIEW_CONTEXT_MESSAGES : raw.viewContextMessages,
 
     // fast: dependency-free estimate. accurate: the model tokenizer when one is
     // installed, with a labelled fallback when it is not.
-    tokenBudgetMode: text(raw.tokenBudgetMode, 'fast').toLowerCase(),
+    tokenBudgetMode: raw.tokenBudgetMode === undefined
+      ? 'fast'
+      : (typeof raw.tokenBudgetMode === 'string' ? raw.tokenBudgetMode.toLowerCase() : raw.tokenBudgetMode),
     // A tool call is an agent action; writing the user's global config from it
     // is only allowed when the user edited this flag into the bundle config.
     // There is deliberately no per-call "confirm" argument: a model can set that
@@ -166,6 +175,7 @@ function buildPreset(settings) {
 }
 
 function textOf(message) {
+  if (typeof message?.content === 'string') return message.content
   if (!Array.isArray(message?.content)) return ''
   return message.content
     .filter((block) => block?.type === 'text' && typeof block.text === 'string')
@@ -284,6 +294,24 @@ function remember(map, key, value) {
   while (map.size > MAX_REMEMBERED_SESSIONS) map.delete(map.keys().next().value)
 }
 
+function leadingPrefix(text) {
+  let offset = 0
+  while (text.startsWith(REENTRY_PREFIX, offset) || text.startsWith(VERIFY_REMINDER, offset)) {
+    if (text.startsWith(REENTRY_PREFIX, offset)) offset += REENTRY_PREFIX.length
+    else offset += VERIFY_REMINDER.length
+  }
+  return text.slice(0, offset)
+}
+
+function stripRuntimePrefixes(text) {
+  let out = String(text ?? '')
+  while (out.startsWith(REENTRY_PREFIX) || out.startsWith(VERIFY_REMINDER)) {
+    if (out.startsWith(REENTRY_PREFIX)) out = out.slice(REENTRY_PREFIX.length)
+    else out = out.slice(VERIFY_REMINDER.length)
+  }
+  return out
+}
+
 /**
  * Pick this turn's ceiling from the tier table.
  *
@@ -293,33 +321,43 @@ function remember(map, key, value) {
  * the session's turn index, whether the last recall had to be cut, and how much
  * of the current recall repeats the previous one. Tiers can only lower the
  * configured ceiling — they never bypass `maxInjectTokens`.
+ *
+ * A post-cut cooldown drops one turn to `light`, then steps up through `normal`
+ * so a single large turn cannot lock an entire session in `light` forever.
  */
-function chooseTier(tiers, session, text, total) {
+function chooseTier(tiers, session, text, total, { shadowed = null } = {}) {
   const size = (value) => (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0)
   const light = size(tiers?.light)
   const normal = size(tiers?.normal)
   const deep = size(tiers?.deep)
+  const cleanText = stripRuntimePrefixes(text)
   // Compare against what the model actually received last turn, not the raw
   // recall: a turn that was cut only delivered a prefix, so the remainder is
   // new information and must not be mistaken for a repeat. An unchanged raw
   // recall is nonetheless a repeat for budget purposes — asking for the same
   // (partly cut) recall again buys nothing, so it keeps the light ceiling.
-  const previous = session.lastInjectedText || session.lastRaw
-  // The stored raw recall is capped at 20k chars; compare on the same window.
-  const sameRecall = Boolean(session.lastRaw) && text?.slice(0, 20_000) === session.lastRaw
+  const previous = shadowed ? '' : stripRuntimePrefixes(session.lastInjectedText || session.lastRaw)
+  // The stored raw recall is capped at RAW_MEMORY_LIMIT chars; compare on the same window.
+  const sameRecall = !shadowed && Boolean(session.lastRaw) && cleanText.slice(0, RAW_MEMORY_LIMIT) === session.lastRaw
   const overlap = session.turns > 0 && previous
-    ? (sameRecall ? 1 : repetitionRatio(previous, text))
+    ? (sameRecall ? 1 : repetitionRatio(previous, cleanText))
     : 0
-  if (session.turns > 0 && overlap >= 0.6) {
-    return { name: 'light', ceiling: light, reason: `${Math.round(overlap * 100)}% of this recall repeats what is in context` }
-  }
-  if (session.turns > 0 && session.lastCapped) {
-    return { name: 'light', ceiling: light, reason: 'the previous recall had to be cut' }
-  }
   if (session.turns === 0) {
     return { name: 'deep', ceiling: deep, reason: 'first recall of the session, nothing is in context yet' }
   }
+  if (overlap >= 0.6) {
+    return { name: 'light', ceiling: light, reason: `${Math.round(overlap * 100)}% of this recall repeats what is in context` }
+  }
+  if (!shadowed && session.lastCapped && (session.cutCooldowns ?? 0) === 0) {
+    return { name: 'light', ceiling: light, cooldown: true, reason: 'the previous recall had to be cut' }
+  }
+  if (overlap >= 0.3) {
+    return { name: 'normal', ceiling: normal, reason: `${Math.round(overlap * 100)}% of this recall overlaps the previous one` }
+  }
   if (total <= light) return { name: 'light', ceiling: light, reason: 'fits the light ceiling' }
+  if (!shadowed && session.lastCapped && (session.cutCooldowns ?? 0) > 0) {
+    return { name: 'normal', ceiling: normal, reason: 'stepping back up after a cut' }
+  }
   if (total <= normal) return { name: 'normal', ceiling: normal, reason: 'fits the normal ceiling' }
   return { name: 'deep', ceiling: deep, reason: 'larger than the normal ceiling' }
 }
@@ -386,7 +424,7 @@ function lastInjectionState(session, sourceKind) {
  * per-message limit, and there is no hidden minimum — when a message cannot fit
  * even a marker it is dropped so the turn stays under the ceiling.
  */
-function createGovernor(settings, stats, meter) {
+function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
   const sessions = new Map()
 
   function sessionOf(sessionId) {
@@ -403,6 +441,7 @@ function createGovernor(settings, stats, meter) {
         // against this, never against content that was cut before delivery.
         lastInjectedText: '',
         lastCapped: false,
+        cutCooldowns: 0,
         tier: null,
         // The last scenario chosen for this session (scenario budget policy
         // only); kept for status so a user can see why a ceiling was used.
@@ -458,6 +497,7 @@ function createGovernor(settings, stats, meter) {
   }
 
   function rebuild(message, text) {
+    if (typeof message?.content === 'string') return { ...message, content: text }
     return { ...message, content: [{ type: 'text', text }, ...extraBlocks(message)] }
   }
 
@@ -466,10 +506,12 @@ function createGovernor(settings, stats, meter) {
    * it while the integration's dedupe still believed it was present.
    */
   function reentryText(session) {
-    const text = `${REENTRY_PREFIX}${session.lastInjectedText}`
+    const prior = session.lastInjectedText
+    const text = prior.startsWith(REENTRY_PREFIX) ? prior : `${REENTRY_PREFIX}${prior}`
     const cap = settings.maxInjectTokens
     if (cap && meter.measure(text) > cap) {
-      return trimToBudget(text, cap, REENTRY_MARKER, meter.count)
+      const countFn = meter.fastCount ?? meter.count
+      return trimToBudget(text, cap, REENTRY_MARKER, countFn, { minOffset: leadingPrefix(text).length })
     }
     return text
   }
@@ -499,7 +541,8 @@ function createGovernor(settings, stats, meter) {
     session.tokens += tokens
     session.injected = (session.injected ?? 0) + tokens
     session.lastCapped = false
-    session.lastInjectedText = text.slice(0, 20_000)
+    session.cutCooldowns = 0
+    session.lastInjectedText = text.slice(0, RAW_MEMORY_LIMIT)
     record({
       event: 'inject_reentered',
       session: sessionId,
@@ -511,8 +554,10 @@ function createGovernor(settings, stats, meter) {
   }
 
   async function onPreStep(payload, next) {
+    if (typeof onBeforeStep === 'function') onBeforeStep(payload)
     const decision = await next()
     if (!decision || decision.kind !== 'enter' || !Array.isArray(decision.messages)) return decision
+    stats.preSteps += 1
 
     const agentSession = payload?.agent?.session
     const sessionId = agentSession?.header?.id ?? 'unknown'
@@ -523,15 +568,23 @@ function createGovernor(settings, stats, meter) {
     const hadInjection = session.lastInjected > 0 && Boolean(session.lastInjectedText)
 
     const candidates = []
+    let measuredChars = 0
+    let measuredTokens = 0
     decision.messages.forEach((message, index) => {
       if (message?.source?.kind !== settings.sourceKind) return
       const text = textOf(message)
       if (!text) return
+      const rawText = stripRuntimePrefixes(text)
+      const tokens = meter.measure(text)
+      const rawTokens = rawText === text ? tokens : meter.count(rawText)
+      measuredChars += rawText.length
+      measuredTokens += rawTokens
       candidates.push({
         index,
         message,
         text,
-        tokens: meter.measure(text),
+        rawText,
+        tokens,
         // An id known from an earlier turn is history the model already has; it
         // may be rewritten for budget, never silently dropped as a duplicate.
         isNew: !session.seenIds.has(message.id),
@@ -547,19 +600,21 @@ function createGovernor(settings, stats, meter) {
       return decision
     }
 
+    stats.totalChars = (stats.totalChars ?? 0) + measuredChars
+    stats.totalTokens = (stats.totalTokens ?? 0) + measuredTokens
+
     noteIds(session, candidates.map((candidate) => candidate.message))
-    const visible = candidates.filter((candidate) => !candidate.isNew)
     const fresh = candidates.filter((candidate) => candidate.isNew)
 
     // Repetition is measured against what the model actually received. When a
     // compaction shadowed that text it is no longer in context, so nothing is
     // "already there" and re-sending is required rather than wasteful.
-    const previous = shadowed || !session.lastInjectedText ? '' : session.lastInjectedText
-    const freshText = fresh.map((candidate) => candidate.text).join('\n')
+    const previous = shadowed || !session.lastInjectedText ? '' : stripRuntimePrefixes(session.lastInjectedText)
+    const freshText = fresh.map((candidate) => candidate.rawText).join('\n')
     // An unchanged raw recall is a full repeat even when last turn delivered only
-    // a trimmed prefix: re-sending it would re-trim to the same prefix and buy
+    // a trimmed prefix or stripped runtime banners: re-sending it would buy
     // nothing, so no block of it can be "new facts".
-    const sameRecall = Boolean(session.lastRaw) && freshText.slice(0, 20_000) === session.lastRaw
+    const sameRecall = Boolean(session.lastRaw) && Boolean(freshText) && freshText.slice(0, RAW_MEMORY_LIMIT) === session.lastRaw
     const repeatRatio = previous && freshText
       ? (sameRecall ? 1 : repetitionRatio(previous, freshText))
       : 0
@@ -571,6 +626,7 @@ function createGovernor(settings, stats, meter) {
     let suppressedTokens = 0
     let deltaTurns = 0
     let deltaBlocks = 0
+    let deltaSavedTokens = 0
     if (
       settings.repeatPolicy === 'skip' && session.turns > 0 && previous && freshText
       && repeatRatio >= settings.repeatThreshold
@@ -587,7 +643,7 @@ function createGovernor(settings, stats, meter) {
         // model has not seen. Dropping the whole recall would lose those facts;
         // re-sending all of it would pay twice for the repeated part.
         for (const candidate of fresh) {
-          const novel = subtractRepeated(previous, candidate.text)
+          const novel = subtractRepeated(previous, candidate.rawText)
           if (!novel.text) {
             candidate.removed = true
             removed.add(candidate.index)
@@ -597,9 +653,11 @@ function createGovernor(settings, stats, meter) {
           }
           if (novel.omitted > 0) {
             const deltaText = `${novel.text}\n\n${DELTA_MARKER}`
+            const deltaTokens = meter.measure(deltaText)
+            deltaSavedTokens += Math.max(0, candidate.tokens - deltaTokens)
             const message = rebuild(candidate.message, deltaText)
             candidate.text = deltaText
-            candidate.tokens = meter.measure(deltaText)
+            candidate.tokens = deltaTokens
             candidate.message = message
             edits.set(candidate.index, message)
             deltaBlocks += novel.omitted
@@ -638,26 +696,30 @@ function createGovernor(settings, stats, meter) {
     }
     if (deltaTurns > 0) {
       stats.deltas += 1
-      stats.deltaSaved += suppressedTokens
+      stats.deltaSaved += deltaSavedTokens
       session.deltas += 1
-      session.deltaSaved += suppressedTokens
-      record({ event: 'inject_delta', session: sessionId, ratio: repeatRatio, blocks: deltaBlocks, saved: suppressedTokens })
+      session.deltaSaved += deltaSavedTokens
+      record({ event: 'inject_delta', session: sessionId, ratio: repeatRatio, blocks: deltaBlocks, saved: deltaSavedTokens })
     }
 
     // A recall is evidence, not authority: it was written by an earlier session
     // and may describe code that has since changed. The reminder is part of the
     // injected text and therefore part of the measured budget, never a freebie.
     const remind = Boolean(settings.verifyReminder)
+    let remindApplied = false
     if (remind) {
-      const first = survivors[0]
-      first.text = `${VERIFY_REMINDER}${first.text}`
-      first.tokens = meter.measure(first.text)
-      first.message = rebuild(first.message, first.text)
-      edits.set(first.index, first.message)
+      const target = survivors.find((candidate) => candidate.isNew) ?? survivors[0]
+      if (!target.text.startsWith(VERIFY_REMINDER) && !target.text.startsWith(`${REENTRY_PREFIX}${VERIFY_REMINDER}`)) {
+        target.text = `${VERIFY_REMINDER}${target.text}`
+        target.tokens = meter.measure(target.text)
+        target.message = rebuild(target.message, target.text)
+        edits.set(target.index, target.message)
+        remindApplied = true
+      }
     }
 
     const total = survivors.reduce((sum, candidate) => sum + candidate.tokens, 0)
-    const combined = survivors.map((candidate) => candidate.text).join('\n')
+    const combined = survivors.map((candidate) => stripRuntimePrefixes(candidate.text)).join('\n')
     const cap = settings.maxInjectTokens
 
     let budget = cap
@@ -668,7 +730,7 @@ function createGovernor(settings, stats, meter) {
 
     if (cap && (settings.budgetPolicy === 'adaptive' || settings.budgetPolicy === 'scenario')) {
       if (settings.budgetPolicy === 'adaptive') {
-        tier = chooseTier(settings.budgetTiers, session, combined, total)
+        tier = chooseTier(settings.budgetTiers, session, combined, total, { shadowed })
       } else {
         const scenario = chooseScenario({
           firstTurn: session.turns === 0,
@@ -689,10 +751,11 @@ function createGovernor(settings, stats, meter) {
         stats.scenarios[scenario.scenario] = (stats.scenarios[scenario.scenario] ?? 0) + 1
         stats.lastScenario = { ...scenario, at: new Date().toISOString() }
       }
+      const { cooldown: _cooldown, ...publicTier } = tier
       budget = Math.min(cap, tier.ceiling)
       session.tier = tier.name
       stats.tiers[tier.name] = (stats.tiers[tier.name] ?? 0) + 1
-      stats.lastTier = { ...tier, budget, requested: total }
+      stats.lastTier = { ...publicTier, budget, requested: total }
       if (settings.budgetPolicy === 'scenario' && stats.lastScenario) stats.lastScenario.budget = budget
       record({
         event: 'tier_selected',
@@ -714,6 +777,7 @@ function createGovernor(settings, stats, meter) {
       const viewContext = settings.viewPolicy === 'budgeted'
         ? taskContextText(decision.messages, settings.sourceKind, settings.viewContextMessages)
         : ''
+      const countFn = meter.fastCount ?? meter.count
       after = 0
       survivors.forEach((candidate, position) => {
         const allotted = allocations[position]
@@ -722,18 +786,36 @@ function createGovernor(settings, stats, meter) {
           finalTexts.set(candidate.index, candidate.text)
           return
         }
+        const prefix = leadingPrefix(candidate.text)
+        const prefixTokens = prefix ? countFn(prefix) : 0
         let trimmed = ''
-        if (allotted > 0 && settings.viewPolicy === 'budgeted') {
+        if (allotted > prefixTokens && settings.viewPolicy === 'budgeted') {
           // Budgeted view: spend the allotment on the fact blocks that match the
           // task, keeping evidence pointers, instead of the leading blocks.
-          const view = budgetedView({
-            text: candidate.text,
+          const body = candidate.text.slice(prefix.length)
+          const bodyBudget = allotted - prefixTokens
+          let view = budgetedView({
+            text: body,
             contextText: viewContext,
-            budget: allotted,
-            count: (value) => meter.count(value),
+            budget: bodyBudget,
+            count: countFn,
           })
+          if (view && prefix) {
+            const over = countFn(`${prefix}${view.text}`) - allotted
+            if (over > 0) {
+              view = bodyBudget - over > 0
+                ? budgetedView({
+                    text: body,
+                    contextText: viewContext,
+                    budget: bodyBudget - over,
+                    count: countFn,
+                  })
+                : null
+              if (view && countFn(`${prefix}${view.text}`) > allotted) view = null
+            }
+          }
           if (view) {
-            trimmed = view.text
+            trimmed = `${prefix}${view.text}`
             stats.viewTurns += 1
             stats.viewKept += view.kept
             stats.viewOmitted += view.omitted
@@ -743,14 +825,14 @@ function createGovernor(settings, stats, meter) {
               blocks: view.blocks,
               kept: view.kept,
               omitted: view.omitted,
-              tokens: view.tokens,
+              tokens: meter.count(trimmed),
               sources: view.sources,
             })
           }
         }
         if (!trimmed && allotted > 0) {
           const marker = `\n\n…[dsh-hindsight-tuner: cut from ~${candidate.tokens} to ~${allotted} tokens. Ask Hindsight for the full recall explicitly, or raise maxInjectTokens.]`
-          trimmed = trimToBudget(candidate.text, allotted, marker, meter.count)
+          trimmed = trimToBudget(candidate.text, allotted, marker, countFn, { minOffset: prefix.length })
         }
         if (!trimmed) {
           removed.add(candidate.index)
@@ -789,19 +871,22 @@ function createGovernor(settings, stats, meter) {
     session.tokens += total
     session.injected = (session.injected ?? 0) + after
     session.lastCapped = cappedThisTurn
+    session.cutCooldowns = tier?.cooldown ? 1 : 0
     // Remember the fresh recall request (history copies are not "the recall"
     // that arrives next turn), so an unchanged request is detected exactly.
-    session.lastRaw = (fresh.length > 0 ? fresh : candidates)
-      .map((candidate) => candidate.text)
-      .join('\n')
-      .slice(0, 20_000)
-    if (after > 0 && deliveredText) session.lastInjectedText = deliveredText.slice(0, 20_000)
+    if (after > 0) {
+      session.lastRaw = (fresh.length > 0 ? fresh : candidates)
+        .map((candidate) => candidate.rawText)
+        .join('\n')
+        .slice(0, RAW_MEMORY_LIMIT)
+      if (deliveredText) session.lastInjectedText = deliveredText.slice(0, RAW_MEMORY_LIMIT)
+    }
     stats.turns += 1
     stats.lastTurnTokens = total
     stats.maxTurnTokens = Math.max(stats.maxTurnTokens, total)
     stats.seen += candidates.length
 
-    if (cappedThisTurn || remind || suppressed > 0 || deltaTurns > 0) {
+    if (cappedThisTurn || remindApplied || suppressed > 0 || deltaTurns > 0) {
       const rewritten = decision.messages.slice()
       for (const [index, message] of edits) rewritten[index] = message
       return { ...decision, messages: rewritten.filter((_, index) => !removed.has(index)) }
@@ -962,8 +1047,11 @@ function hintFor(status) {
   if (!status.server.tokenSet && status.server.mode === 'cloud') {
     return 'No API token is configured, so Cloud calls fail with 401. Add "apiToken" to the shared config or set HINDSIGHT_API_TOKEN, then run /hindsight probe.'
   }
-  if (status.budget.turns === 0 && (status.activity.recent?.inject_ok ?? 0) > 0) {
-    return 'The journal shows Hindsight injections but none reached this hook: another pre-step listener is wrapping it. Restart DSH so the tuner registers after its bundle, then check /hindsight again.'
+  if (status.tuneError) {
+    return `Automatic tuning failed (${status.tuneError}). Fix the permission or file error above, then run /hindsight tune.`
+  }
+  if (status.budget.turns === 0 && status.budget.preSteps > 0 && status.budget.injectSinceBoot) {
+    return 'The journal shows Hindsight injections since this process started, but none reached this hook: another pre-step listener is wrapping it. Restart DSH or check bundle order, then check /hindsight again.'
   }
   if (probe?.ok) {
     return 'Memory is reachable. A cold bank seeds git history on the first session; pages appear as they consolidate.'
@@ -971,7 +1059,7 @@ function hintFor(status) {
   return 'Run /hindsight tune to apply the lean profile, or inspect the config path above.'
 }
 
-async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessionId = null) {
+async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessionId = null, { skipProbe = false } = {}) {
   const file = readConfigFile()
   const integration = findIntegration()
   const project = projectName(cwd)
@@ -979,9 +1067,11 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
   const resolution = bankResolution(baseLayers.config, project.name, cwd)
   const layers = effectiveConfig(file.config, { cwd, bank: resolution.base ?? resolution.bank })
   const effective = layers.config
-  const disabled = effectiveServer(effective, {}).disabled || optedOut(effective, cwd)
-  const server = { ...effectiveServer(effective, {}), disabled }
-  const probe = !integration.installed || server.disabled ? null : await probeServer({
+  const isOptedOut = optedOut(effective, cwd)
+  const resolvedServer = effectiveServer(effective, {}, { tokenSource: layers.tokenSource })
+  const disabled = resolvedServer.disabled || isOptedOut
+  const server = { ...resolvedServer, disabled }
+  const probe = skipProbe || !integration.installed || server.disabled ? null : await probeServer({
     apiUrl: server.apiUrl,
     apiToken: server.token,
     bankId: resolution.bank,
@@ -992,6 +1082,10 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
   const ratios = stats.ratios ?? []
   const expectedOrigin = originOf(server.apiUrl)
   const activity = summarizeActivity({ expectedOrigin, harness: 'dsh' })
+  const history = summarizeTunerJournal({ windowHours: 24 })
+  const charRatio = stats.totalChars > 0 ? Math.round((stats.totalTokens / stats.totalChars) * 100) / 100 : null
+  const lastInjectAt = activity.lastInject?.ts ? Date.parse(activity.lastInject.ts) : Number.NaN
+  const injectSinceBoot = Number.isFinite(lastInjectAt) && Number.isFinite(stats.activatedAt) && lastInjectAt >= stats.activatedAt
   const status = {
     file: { path: file.path, kind: file.kind, error: file.error ?? null },
     integration,
@@ -1001,7 +1095,7 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
       apiUrl: server.apiUrl,
       disabled: server.disabled,
       disabledReason: server.disabled
-        ? (optedOut(effective, cwd) ? 'optInOnly excludes this directory' : 'disabled is set in the effective config')
+        ? (isOptedOut ? 'optInOnly excludes this directory' : 'disabled is set in the effective config')
         : null,
       tokenSet: server.tokenSet,
       tokenSource: server.tokenSource,
@@ -1013,7 +1107,9 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
     bundles: installedBundles().bundles,
     sources: { ...stats.sources },
     stackTurns: stats.stackTurns,
+    lastStack: stats.lastStack,
     autoTune: autoTuneEnabled(),
+    tuneError: stats.lastTuneError ?? null,
     // Invalid bundle settings are never written; invalid file values are shown
     // because the integration would otherwise use them (or their fallback).
     settingsIssues: settings.issues ?? [],
@@ -1077,7 +1173,10 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
       viewKept: stats.viewKept,
       viewOmitted: stats.viewOmitted,
       trimmedTokens: stats.trimmedTokens,
+      charRatio,
       lastRepeat: stats.lastRepeat,
+      preSteps: stats.preSteps,
+      injectSinceBoot,
       turns: stats.turns,
       seen: stats.seen,
       lastTurnTokens: stats.lastTurnTokens,
@@ -1106,6 +1205,7 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
     },
     probe,
     activity,
+    history,
     memory: memoryMetrics(activity),
   }
   status.stale = staleProcess(status)
@@ -1132,10 +1232,12 @@ function originOf(url) {
 }
 
 function staleProcess(status) {
-  const seen = status.activity.lastEndpoint
+  const seen = status.activity.lastFailure?.endpoint ?? status.activity.lastEndpoint
   if (!seen) return null
   const failedAt = Date.parse(status.activity.lastFailure?.ts ?? '')
   if (!Number.isFinite(failedAt)) return null
+  const succeededAt = Date.parse(status.activity.lastSuccess?.ts ?? '')
+  if (Number.isFinite(succeededAt) && succeededAt > failedAt) return null
   const ageMs = Date.now() - failedAt
   if (ageMs < 0 || ageMs > STALE_FAILURE_MS) return null
   const expected = originOf(status.server.apiUrl)
@@ -1172,6 +1274,7 @@ function formatStatus(status) {
     ...(status.compat ? [`  compat   ${formatCompat(status.compat)}`] : []),
     `  config   ${status.file.path} (${describeKind(status.file.kind)}${status.file.error ? `: ${status.file.error}` : ''})`,
     `  auto     ${status.autoTune ? 'tune on the first session of a new process' : 'off (persisted; /hindsight enable turns it back on)'}`,
+    ...(status.tuneError ? [`  tune     auto-tune error: ${status.tuneError}`] : []),
     `  tuning   ${formatPreset(status.preset)}`,
     ...(() => {
       const drift = presetDrift(status.preset, status.desired)
@@ -1198,6 +1301,8 @@ function formatStatus(status) {
         ? '  order    outermost hook: a recall in this process passed through the budget'
         : '  order    outermost hook: saw the recall and it was within the ceiling',
     )
+  } else if (status.budget.preSteps > 0 && status.budget.injectSinceBoot) {
+    lines.push('  order    WARNING: pre-step ran and DSH logged an injection, but none reached this hook (another listener wrapped it)')
   } else {
     lines.push('  order    outermost hook installed (prepend); confirmed on the first recall')
   }
@@ -1217,10 +1322,22 @@ function formatStatus(status) {
     ? `  sources  ${sources.map(([kind, count]) => `${kind} ${count} turns`).join(' · ')}`
     : '  sources  no plugin-injected messages in this session yet')
   if (status.stackTurns > 0) {
-    lines.push(`  stack    more than one plugin injects per turn (${status.stackTurns} turns: ${(status.sources && Object.keys(status.sources).join(', ')) || 'unknown'}); their budgets add up — keep one memory lane`)
+    const stackList = (status.lastStack ?? Object.keys(status.sources ?? {})).join(', ') || 'unknown'
+    lines.push(`  stack    more than one plugin injects per turn (${status.stackTurns} turns: ${stackList}); their budgets add up — keep one memory lane`)
   }
   if (status.budget.last) {
     lines.push(`  last     cut ~${status.budget.last.before} → ~${status.budget.last.after} tokens`)
+  }
+  const sessionSaved = (status.budget.trimmedTokens ?? 0) + (status.budget.savedTokens ?? 0) + (status.budget.deltaSaved ?? 0)
+  if (
+    status.history
+    && (
+      status.history.capped > status.budget.capped
+      || status.history.skipped > status.budget.repeatSkips
+      || status.history.totalSaved > sessionSaved
+    )
+  ) {
+    lines.push(`  history  24h across processes: ${status.history.capped} capped · ${status.history.skipped} skipped · saved ~${status.history.totalSaved} tok`)
   }
   lines.push(`  journal  ${status.activity.path ?? diagPath()}`)
   lines.push(`  activity ${formatActivity(status.activity)}`)
@@ -1303,9 +1420,9 @@ function formatRepeat(budget) {
   return `repeat skip ≥${threshold}% · skipped ${budget.repeatSkips}${last}${reentered}${deltas}`
 }
 
-/** Tokens that never reached the model, from trimming plus skipped recalls. */
+/** Tokens that never reached the model, from trimming plus skipped and delta recalls. */
 function formatSavings(budget) {
-  const saved = (budget.trimmedTokens ?? 0) + (budget.savedTokens ?? 0)
+  const saved = (budget.trimmedTokens ?? 0) + (budget.savedTokens ?? 0) + (budget.deltaSaved ?? 0)
   return saved > 0 ? ` · saved ~${saved} tok` : ''
 }
 
@@ -1355,24 +1472,29 @@ function formatRevert(result) {
 
 export function apply(ctx, rawConfig) {
   const settings = normalizeConfig(rawConfig)
-  const raw = rawConfig && typeof rawConfig === 'object' ? rawConfig : {}
-  // Most settings are normalized before validation (a bad number falls back);
-  // the policy-like values are validated on the raw value so a typo is reported
-  // instead of being silently replaced by the default.
-  const checked = validateSettings({
-    ...settings,
-    budgetPolicy: raw.budgetPolicy ?? settings.budgetPolicy,
-    scenarioTiers: raw.scenarioTiers ?? settings.scenarioTiers,
-    viewPolicy: raw.viewPolicy ?? settings.viewPolicy,
-    viewContextMessages: raw.viewContextMessages ?? settings.viewContextMessages,
-  })
+  const checked = validateSettings(settings)
   settings.issues = checked.issues
   settings.preset = checked.preset
-  if (settings.issues.some((issue) => issue.field === 'maxInjectTokens')) {
-    settings.maxInjectTokens = 3000
-  }
+  const issueFields = new Set(settings.issues.map((issue) => issue.field))
+  if (issueFields.has('autoInject')) settings.autoInject = 'pages'
+  if (issueFields.has('injectTimeoutMs')) settings.injectTimeoutMs = 7000
+  if (issueFields.has('observationScopes')) settings.observationScopes = 'per_source'
+  if (issueFields.has('recallMaxTokens')) settings.recallMaxTokens = 2000
+  if (issueFields.has('maxInjectTokens')) settings.maxInjectTokens = 3000
+  if (issueFields.has('sourceKind')) settings.sourceKind = 'plugin:hindsight'
+  if (issueFields.has('tokenBudgetMode')) settings.tokenBudgetMode = 'fast'
+  if (issueFields.has('budgetPolicy')) settings.budgetPolicy = 'off'
+  if (issueFields.has('budgetTiers')) settings.budgetTiers = { light: 800, normal: 1600, deep: 3000 }
+  if (issueFields.has('repeatPolicy')) settings.repeatPolicy = 'inject'
+  if (issueFields.has('repeatThreshold')) settings.repeatThreshold = 0.9
+  if (issueFields.has('verifyReminder')) settings.verifyReminder = false
+  if (issueFields.has('viewPolicy')) settings.viewPolicy = 'truncate'
+  if (issueFields.has('viewContextMessages')) settings.viewContextMessages = DEFAULT_VIEW_CONTEXT_MESSAGES
+  settings.scenarioTiers = normalizeScenarioTiers(settings.scenarioTiers)
 
   const stats = {
+    activatedAt: Date.now(),
+    preSteps: 0,
     turns: 0,
     seen: 0,
     lastTurnTokens: 0,
@@ -1396,8 +1518,11 @@ export function apply(ctx, rawConfig) {
     viewKept: 0,
     viewOmitted: 0,
     trimmedTokens: 0,
+    totalChars: 0,
+    totalTokens: 0,
     lastRepeat: 0,
     ratios: [],
+    lastTuneError: null,
     tokenizer: { mode: settings.tokenBudgetMode, name: null, ready: settings.tokenBudgetMode === 'fast' },
   }
 
@@ -1414,6 +1539,7 @@ export function apply(ctx, rawConfig) {
 
   const meter = {
     mode: settings.tokenBudgetMode,
+    fastCount: settings.tokenBudgetMode === 'fast' ? estimateTokens : null,
     measure(text) {
       const counted = countTokens(text, { mode: settings.tokenBudgetMode, encode: tokenizer?.encode })
       if (settings.tokenBudgetMode === 'accurate' && counted.exact) {
@@ -1428,11 +1554,10 @@ export function apply(ctx, rawConfig) {
     },
   }
 
-  const governor = createGovernor(settings, stats, meter)
   const preset = buildPreset(settings)
   let tuning = null
   let disposePreStep = null
-  let reordered = false
+  let disposed = false
 
   function ensureTuned() {
     if (tuning) return tuning
@@ -1444,10 +1569,12 @@ export function apply(ctx, rawConfig) {
       }
       try {
         const result = applyTuning({ preset, overwrite: settings.overwrite })
+        stats.lastTuneError = null
         record({ event: 'tune_applied', changed: result.changed.map((change) => change.path) })
         return result
       } catch (error) {
         const message = String(error?.message ?? error)
+        stats.lastTuneError = message
         record({ event: 'tune_failed', error: message })
         return { error: message }
       }
@@ -1455,34 +1582,64 @@ export function apply(ctx, rawConfig) {
     return tuning
   }
 
+  const governor = createGovernor(settings, stats, meter, {
+    onBeforeStep(payload) {
+      if (settings.autoTune && !tuning && payload?.agent?.session?.header?.origin !== 'subagent') {
+        ensureTuned().catch(() => {})
+      }
+    },
+  })
+
   /**
    * Re-register the pre-step hook as the outermost waterfall listener. This is
    * what makes the budget authoritative: Cordis prepends, so the last registration
-   * wins, and a session-start fires after every bundle has mounted — that is the
-   * first moment at which "after Hindsight" can be guaranteed regardless of the
-   * profile's bundle order.
+   * wins. Because other bundles (like Hindsight) declare `inject: ['agents']`
+   * and register inside that deferred phase, we re-prepend both when `agents`
+   * mounts and on session creation (`agent/created` in DSH 0.2.x, plus
+   * `agent/session-start` for older hosts).
    */
   function attachPreStep() {
+    if (disposed) return
     try { disposePreStep?.() } catch { /* already gone */ }
     disposePreStep = ctx.on('agent/pre-step', governor.onPreStep, { prepend: true })
   }
 
   attachPreStep()
 
-  ctx.on('agent/session-start', ({ agent } = {}) => {
+  const disposeAgents = typeof ctx.inject === 'function'
+    ? ctx.inject(['agents'], () => {
+        attachPreStep()
+      })
+    : null
+
+  function onSessionLifecycle(payload) {
+    const agent = payload?.agent ?? payload
+    attachPreStep()
     if (agent?.session?.header?.origin === 'subagent') return
-    if (!reordered) {
-      reordered = true
-      attachPreStep()
-    }
     ensureTuned().catch(() => {})
-  })
+  }
+
+  const disposeCreated = ctx.on('agent/created', onSessionLifecycle)
+  const disposeSessionStart = ctx.on('agent/session-start', onSessionLifecycle)
   ctx.effect(() => () => {
+    disposed = true
     try { disposePreStep?.() } catch { /* already gone */ }
+    try { disposeAgents?.() } catch { /* already gone */ }
+    try { disposeCreated?.() } catch { /* already gone */ }
+    try { disposeSessionStart?.() } catch { /* already gone */ }
     governor.dispose()
     flushJournal()
   })
-  record({ event: 'activated', autoTune: settings.autoTune, cap: settings.maxInjectTokens, recall: settings.recallMaxTokens, tokenBudgetMode: settings.tokenBudgetMode })
+  record({
+    event: 'activated',
+    autoTune: settings.autoTune,
+    cap: settings.maxInjectTokens,
+    recall: settings.recallMaxTokens,
+    budgetPolicy: settings.budgetPolicy,
+    repeatPolicy: settings.repeatPolicy,
+    verifyReminder: Boolean(settings.verifyReminder),
+    tokenBudgetMode: settings.tokenBudgetMode,
+  })
 
   /**
    * Writes are a user action, not an agent action. There is deliberately no
@@ -1518,6 +1675,13 @@ export function apply(ctx, rawConfig) {
       lines.push('  no recall measured yet: the suggestion starts from the 2000-token default')
     }
     lines.push(`  cap      maxInjectTokens: ${cap}  (1.25× the p95, clamped 512..8000; current ${status.budget.cap})`)
+    if (status.budget.charRatio && status.budget.charRatio > 0.4 && p95 && chars.length > 0) {
+      const cjkP95 = percentile(chars.map((size) => Math.ceil(size * status.budget.charRatio)), 95)
+      const cjkCap = Math.max(512, Math.min(8000, Math.ceil(cjkP95 * 1.25)))
+      if (cjkCap > cap) {
+        lines.push(`  density  observed recalls in this process average ~${status.budget.charRatio} tok/char (vs 0.3 baseline); ~${cjkCap} maxInjectTokens fits CJK density`)
+      }
+    }
     lines.push(`  recall   recallOptions.max_tokens: ${recall}  (Pages and Recall are separate ceilings; do not make recall larger than the cap by accident)`)
     const observedPages = status.activity?.pages
     if (observedPages?.events > 0) {
@@ -1567,7 +1731,10 @@ export function apply(ctx, rawConfig) {
         dryRun,
         enableAutoTune: !dryRun,
       })
-      if (!dryRun) tuning = Promise.resolve(result)
+      if (!dryRun) {
+        stats.lastTuneError = null
+        tuning = Promise.resolve(result)
+      }
       record({ event: dryRun ? 'tune_previewed' : 'tune_requested', changed: result.changed.map((change) => change.path) })
       return formatTune(result)
     }
@@ -1598,13 +1765,13 @@ export function apply(ctx, rawConfig) {
       const file = readConfigFile()
       const base = effectiveConfig(file.config, { cwd }).config
       const resolution = bankResolution(base, projectName(cwd).name, cwd)
-      const effective = effectiveConfig(file.config, { cwd, bank: resolution.base ?? resolution.bank }).config
-      const server = effectiveServer(effective, {})
+      const layers = effectiveConfig(file.config, { cwd, bank: resolution.base ?? resolution.bank })
+      const server = effectiveServer(layers.config, {}, { tokenSource: layers.tokenSource })
       const probe = await probeServer({ apiUrl: server.apiUrl, apiToken: server.token, bankId: resolution.bank, timeoutMs: 4000 })
       return `Hindsight server — ${formatProbe(probe)}\n  ${server.apiUrl} · bank ${resolution.bank} (${resolution.source})${server.tokenSet ? '' : ' · no token configured'}`
     }
     if (action === 'suggest') {
-      return formatSuggestion(await buildStatus(settings, stats, governor, cwd, options.sessionId))
+      return formatSuggestion(await buildStatus(settings, stats, governor, cwd, options.sessionId, { skipProbe: true }))
     }
     const status = await buildStatus(settings, stats, governor, cwd, options.sessionId)
     if (options.json === true) return JSON.stringify(status, null, 2)
@@ -1646,6 +1813,9 @@ export function apply(ctx, rawConfig) {
       },
       async execute(args, exec) {
         const action = typeof args?.action === 'string' ? args.action : 'status'
+        if (!ACTIONS.includes(action)) {
+          return `Unknown action "${action}". Use ${ACTIONS.join(', ')}.`
+        }
         if (args?.json === true && action !== 'status') {
           return 'hindsight_tuner: json is only valid with status.'
         }
@@ -1717,9 +1887,13 @@ function parseCommandFlags(parts) {
     if (part === '--dry-run') flags.dryRun = true
     else if (part === '--overwrite') flags.overwrite = true
     else if (part === '--json') flags.json = true
-    else if (part === '--cap') flags.cap = Number(parts[++index])
-    else if (part.startsWith('--cap=')) flags.cap = Number(part.slice('--cap='.length))
-    else flags.unknown = part
+    else if (part === '--cap') {
+      const raw = index + 1 < parts.length ? parts[++index] : ''
+      flags.cap = raw.trim() === '' ? Number.NaN : Number(raw)
+    } else if (part.startsWith('--cap=')) {
+      const raw = part.slice('--cap='.length)
+      flags.cap = raw.trim() === '' ? Number.NaN : Number(raw)
+    } else flags.unknown = part
   }
   return flags
 }

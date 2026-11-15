@@ -40,6 +40,10 @@ assert.equal(replaced.scenario, 'compaction-recovery')
 assert.match(replaced.reason, /replaced/)
 
 assert.equal(chooseScenario({ firstTurn: true, step: 2, promptText: 'fix the error' }).scenario, 'first-turn')
+// DSH passes 1-based step numbers inside a turn: step 1 is turn entry, >=2 is continuation.
+assert.equal(chooseScenario({ step: 1, promptText: 'Fix the error' }).scenario, 'debug')
+assert.equal(chooseScenario({ step: 1 }).scenario, 'default')
+assert.equal(chooseScenario({ step: 2, promptText: 'Fix the error' }).scenario, 'continuation')
 assert.equal(chooseScenario({ step: 3 }).scenario, 'continuation')
 assert.equal(chooseScenario({ step: 3 }).tier, 'light')
 assert.equal(chooseScenario({ repetition: 0.8, promptText: 'fix the error' }).scenario, 'repeat')

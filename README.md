@@ -25,9 +25,10 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    automatic tuning.
 
 2. **A hard per-turn injection budget.** The tuner registers as the *outermost*
-   `agent/pre-step` waterfall listener (`prepend: true`, re-registered once on
-   the first session start so it ends up outside the Hindsight hook regardless
-   of bundle load order). It therefore sees the final message list and enforces
+   `agent/pre-step` waterfall listener (`prepend: true`), re-prepends when the
+   optional `agents` service mounts, and re-prepends on `agent/created` /
+   `agent/session-start` so it ends up outside the Hindsight hook regardless of
+   bundle load order. It therefore sees the final message list and enforces
    one shared ceiling: the sum of every `plugin:hindsight` message in a turn is
    at most `maxInjectTokens`. Trimming is structure-aware: it cuts at a paragraph
    boundary or after a closed code fence (so markdown never ends inside an open
@@ -247,10 +248,12 @@ node scripts/verify-live.mjs --json   # same result as JSON
 ```
 
 It resolves the effective server and bank for the current directory, calls
-`/health` and the bank's page tree, then reads the integration journal to catch
-the fingerprint of a stale process (recent failures against an origin that is
-not the configured one). An unseeded bank is reported as NOTE rather than FAIL,
-because Hindsight creates it on the first real session.
+`/health` and the bank's page tree, reads the integration journal to catch a
+stale process (or a `401` static-guide-only `inject_ok` with no real recall),
+and checks the tuner's own state and journal (`state.json` and `tuner.jsonl`) to
+confirm auto-tuning and `agent/pre-step` governance actually ran. An unseeded
+bank is reported as NOTE rather than FAIL, because Hindsight creates it on the
+first real session.
 
 ## Install
 
@@ -354,10 +357,12 @@ survives upgrades):
   is reported as disabled instead of healthy.
 - The journal path honours `HINDSIGHT_DIAG_FILE`, the same override the
   integration uses; otherwise it reads `~/.hindsight/coding-agents-logs/diag.jsonl`.
-- The outermost registration is re-applied on the first non-subagent session
-  start. Without a session (or if another plugin registers later), the cap still
-  runs but only sees messages appended inside its own `next()` — the `order` line
-  reports whether a turn has actually passed through it.
+- The outermost registration is re-applied when the `agents` service mounts and
+  on `agent/created` / `agent/session-start` (with an `onPreStep` safety
+  fallback for `autoTune` on the first non-subagent turn). Without a session or
+  `agents` mount (or if another plugin registers even later), the cap still runs
+  but only sees messages appended inside its own `next()` — the `order` line
+  reports whether turns have actually passed through it.
 - Token counts are an estimate by default (CJK ≈ 1 token/char, other text ≈
   3.6 chars/token). `tokenBudgetMode: accurate` uses `js-tiktoken` when it is
   installed and otherwise falls back to the estimate with a ×1.1 margin; `status`

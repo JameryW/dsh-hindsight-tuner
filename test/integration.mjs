@@ -169,4 +169,79 @@ const untouchedText = untouched.messages.find((message) => message?.source?.kind
 assert.equal(untouchedText, injection, 'cap off leaves the integration payload alone')
 
 for (const dispose of [...harness.disposers, ...openHarness.disposers]) dispose()
+
+// DSH 0.2.x flow: `inject(['agents'])` mounts asynchronously after `apply()`,
+// the integration registers `agent/pre-step` inside that `agents` callback,
+// and session startup emits `agent/created` (with 1-based `step`).
+const modernHarness = makeHarness()
+const agentWaiters = []
+let agentsMounted = false
+const baseModernInject = modernHarness.ctx.inject
+modernHarness.ctx.inject = (services, callback) => {
+  if (services.includes('agents')) {
+    if (agentsMounted) {
+      callback({ agents: {} })
+      return () => {}
+    }
+    agentWaiters.push(callback)
+    return () => {
+      const index = agentWaiters.indexOf(callback)
+      if (index >= 0) agentWaiters.splice(index, 1)
+    }
+  }
+  return baseModernInject(services, callback)
+}
+
+injection = bulk
+apply(modernHarness.ctx, {
+  autoTune: true,
+  maxInjectTokens: cap,
+  budgetPolicy: 'scenario',
+  budgetTiers: { light: 120, normal: 250, deep: cap },
+})
+// Upstream declares `inject: ['agents']` and mounts its `pre-step` after the tuner's callback.
+modernHarness.ctx.inject(['agents'], () => {
+  modernHarness.ctx.on('agent/pre-step', hooks.preStep, { prepend: true })
+})
+agentsMounted = true
+for (const cb of agentWaiters.splice(0)) cb({ agents: {} })
+
+const modernAgent = {
+  session: {
+    header: { id: 'modern-session', cwd: scratch, origin: 'main' },
+    events: [],
+  },
+}
+for (const entry of [...(modernHarness.handlers.get('agent/created') ?? [])]) {
+  entry.handler({ agent: modernAgent, source: 'startup' })
+}
+await new Promise((done) => setTimeout(done, 50))
+const tunedFile = JSON.parse(readFileSync(process.env.HINDSIGHT_CONFIG, 'utf8'))
+assert.equal(tunedFile.autoInject, 'pages', 'agent/created auto-tunes coding-agent.json in DSH 0.2.x')
+
+const step1Decision = await waterfall(modernHarness, 'agent/pre-step', { agent: modernAgent, step: 1, signal: { aborted: false } }, async () => ({
+  kind: 'enter',
+  messages: [human],
+}))
+const step1Text = step1Decision.messages.find((message) => message?.source?.kind === 'plugin:hindsight')?.content[0]?.text ?? ''
+assert.ok(estimateTokens(step1Text) <= cap && estimateTokens(step1Text) > 250, 'turn 1 (step: 1) wraps deferred agents hook and gets deep tier')
+
+injection = Array.from({ length: 220 }, (_, i) => `debug turn line ${i}: fresh memory item for modern DSH scenario check.`).join('\n')
+const debugPrompt = { id: 'human-debug', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'do the thing: fix the failing error' }] }
+const step1Debug = await waterfall(modernHarness, 'agent/pre-step', { agent: modernAgent, step: 1, signal: { aborted: false } }, async () => ({
+  kind: 'enter',
+  messages: [debugPrompt],
+}))
+const step1DebugText = step1Debug.messages.find((message) => message?.source?.kind === 'plugin:hindsight')?.content[0]?.text ?? ''
+assert.ok(estimateTokens(step1DebugText) <= 250 && estimateTokens(step1DebugText) > 120, 'turn 2 (step: 1) picks debug/normal rather than continuation/light')
+
+injection = Array.from({ length: 220 }, (_, i) => `continuation turn line ${i}: unique content for step 2 light ceiling check.`).join('\n')
+const step2Decision = await waterfall(modernHarness, 'agent/pre-step', { agent: modernAgent, step: 2, signal: { aborted: false } }, async () => ({
+  kind: 'enter',
+  messages: [debugPrompt],
+}))
+const step2Text = step2Decision.messages.find((message) => message?.source?.kind === 'plugin:hindsight')?.content[0]?.text ?? ''
+assert.ok(estimateTokens(step2Text) <= 120, 'step 2 triggers continuation/light tier')
+
+for (const dispose of modernHarness.disposers) dispose()
 console.log(`integration: all checks passed against ${join(packageDir, 'dist', 'dsh.js')}`)

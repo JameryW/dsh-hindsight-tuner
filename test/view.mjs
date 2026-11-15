@@ -18,6 +18,7 @@ import {
 } from '../lib/view.js'
 import {
   estimateTokens,
+  overlapRatio,
   repetitionRatio,
   splitBlocks,
   subtractRepeated,
@@ -55,6 +56,36 @@ check('splitBlocks keeps blank lines inside fences and splits paragraphs', () =>
   assert.ok(blocks[3].startsWith('### Page B'))
 })
 
+check('splitBlocks keeps nested 4-backtick and tilde fences intact across blank lines', () => {
+  const text = [
+    'Before paragraph',
+    '',
+    '````md',
+    'Example fence:',
+    '```js',
+    'const x = 1',
+    '',
+    'const y = 2',
+    '```',
+    '',
+    'After nested fence',
+    '````',
+    '',
+    '~~~sh',
+    'echo one',
+    '',
+    'echo two',
+    '~~~',
+    '',
+    'After tilde',
+  ].join('\n')
+  const blocks = splitBlocks(text)
+  assert.equal(blocks.length, 4)
+  assert.ok(blocks[1].includes('```js') && blocks[1].includes('After nested fence'), '4-backtick fence stays intact across inner fences and blank lines')
+  assert.ok(blocks[2].includes('echo one\n\necho two'), 'tilde fence stays intact across blank lines')
+  assert.equal(blocks[3], 'After tilde')
+})
+
 check('extractTerms weights paths and backticked identifiers above prose', () => {
   const terms = extractTerms('Fix lib/tokens.js so `trimToBudget` respects the cap and zetaFunction does not leak')
   assert.ok(terms.get('lib/tokens.js') >= 4, 'a slash-path is a strong term')
@@ -69,6 +100,14 @@ check('createMatcher ranks the task-matching block above unrelated ones', () => 
   const unrelated = '### Deployment\n- The old service used a different queue and was removed years ago.'
   assert.ok(score(relevant) > 0)
   assert.equal(score(unrelated), 0)
+})
+
+check('createMatcher rewards tilde fences identically sized to plain text', () => {
+  const score = createMatcher('Inspect `lib/tokens.js` trimToBudget boundary')
+  const withTilde = 'lib/tokens.js trimToBudget\n~~~\n~~~'
+  const plain = 'lib/tokens.js trimToBudget\n   \n   '
+  assert.equal(estimateTokens(withTilde), estimateTokens(plain))
+  assert.ok(score(withTilde) > score(plain), 'tilde fence receives fence bonus')
 })
 
 check('evidenceHints keeps commit, page and path pointers', () => {
@@ -117,10 +156,10 @@ check('budgetedView returns null when there is nothing to select or no room', ()
   assert.equal(budgetedView({ text: big.join('\n\n'), contextText: context, budget: 5, count: () => 40 }), null)
 })
 
-check('taskContextText reads recent non-memory messages in chronological order', () => {
+check('taskContextText reads recent non-memory messages in chronological order including string content', () => {
   const messages = [
-    { id: 'a', source: { kind: 'user' }, content: [{ type: 'text', text: 'first' }] },
-    { id: 'b', source: { kind: 'plugin:hindsight' }, content: [{ type: 'text', text: 'memory' }] },
+    { id: 'a', source: { kind: 'user' }, content: 'first' },
+    { id: 'b', source: { kind: 'plugin:hindsight' }, content: 'memory' },
     { id: 'c', source: { kind: 'user' }, content: [{ type: 'text', text: 'second' }, { type: 'image' }] },
   ]
   assert.equal(taskContextText(messages, 'plugin:hindsight'), 'first\nsecond')
@@ -135,6 +174,20 @@ check('repetitionRatio measures what is new, not what is old', () => {
   assert.equal(repetitionRatio(old, old), 1)
   assert.ok(repetitionRatio(old, superset) > 0.5 && repetitionRatio(old, superset) < 1, 'a superset with new facts is not a full repeat')
   assert.equal(repetitionRatio(old, '- totally different content here'), 0)
+})
+
+check('repetitionRatio, overlapRatio, and subtractRepeated handle CJK facts and ignore bare fences', () => {
+  assert.equal(overlapRatio('```\n```', '```\n```'), 0, 'bare fences alone carry no substantive lines')
+  const oldCjk = ['- 端口 9077', '- 模式 daemon'].join('\n')
+  const supersetCjk = `${oldCjk}\n\n- 新增配置检查`
+  assert.equal(repetitionRatio(oldCjk, oldCjk), 1)
+  const ratio = repetitionRatio(oldCjk, supersetCjk)
+  assert.ok(ratio > 0.5 && ratio < 1, `CJK superset ratio is between 0.5 and 1, got ${ratio}`)
+  const delta = subtractRepeated(oldCjk, supersetCjk)
+  assert.equal(delta.text, '- 新增配置检查')
+  assert.equal(delta.omitted, 1)
+  assert.equal(delta.kept, 1)
+  assert.equal(delta.novelLines, 1)
 })
 
 check('subtractRepeated keeps only the new blocks of a superset recall', () => {

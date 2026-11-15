@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
+import { execFileSync, spawn } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { createServer } from 'node:http'
+import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 const root = resolve(import.meta.dirname, '..')
@@ -32,10 +34,10 @@ delete process.env.DSH_PROFILE
 delete process.env.DSH_INSTALL_DIR
 for (const name of ['HINDSIGHT_AUTO_INJECT', 'HINDSIGHT_API_URL', 'HINDSIGHT_API_PORT', 'HINDSIGHT_DISABLED']) delete process.env[name]
 
-const { estimateTokens, truncateToBudget, trimToBudget, allocateBudget, countTokens, percentile, FALLBACK_MARGIN } = await import('../lib/tokens.js')
-const { applyTuning, revertTuning, readConfigFile, getPath, autoTuneEnabled, setAutoTune } = await import('../lib/config-file.js')
-const { bankResolution, diagPath, effectiveConfig, optedOut } = await import('../lib/diagnostics.js')
-const { record, flushJournal, journalPending } = await import('../lib/log.js')
+const { estimateTokens, truncateToBudget, trimToBudget, allocateBudget, countTokens, percentile, FALLBACK_MARGIN, overlapRatio, repetitionRatio } = await import('../lib/tokens.js')
+const { applyTuning, revertTuning, readConfigFile, getPath, autoTuneEnabled, setAutoTune, tunerState } = await import('../lib/config-file.js')
+const { bankResolution, diagPath, effectiveConfig, effectiveServer, optedOut, projectName, summarizeActivity } = await import('../lib/diagnostics.js')
+const { record, flushJournal, journalPending, summarizeTunerJournal } = await import('../lib/log.js')
 
 // --- journal buffering ------------------------------------------------------
 record({ event: 'buffered_probe' })
@@ -140,6 +142,60 @@ const latinCount = (text) => Math.ceil(text.length / 4)
 const latinTrimmed = truncateToBudget(latinLong, 100, '\n…', latinCount)
 assert.ok(latinCount(latinTrimmed) <= 100, 'custom counter governs the cut')
 
+// Nested 4-backtick and tilde fences stay whole in trimToBudget.
+const nestedFencePrefix = `## Nested Guide
+\`\`\`\`md
+\`\`\`js
+const inner = 'inside nested fence'
+\`\`\`
+\`\`\`\`
+`
+const nestedCap = estimateTokens(nestedFencePrefix) + 30
+const nestedTrimmed = trimToBudget(nestedFencePrefix + fenceTail, nestedCap, '\n…[cut]')
+assert.ok(estimateTokens(nestedTrimmed) <= nestedCap, 'nested fence trim holds cap')
+assert.ok(nestedTrimmed.includes("const inner = 'inside nested fence'"), 'keeps inner block')
+assert.ok(nestedTrimmed.endsWith('````\n…[cut]'), 'closes at outer 4-backtick fence')
+
+const tildeFencePrefix = `## Tilde Guide
+~~~sh
+echo first
+
+echo second
+~~~
+`
+const tildeCap = estimateTokens(tildeFencePrefix) + 30
+const tildeTrimmed = trimToBudget(tildeFencePrefix + fenceTail, tildeCap, '\n…[cut]')
+assert.ok(estimateTokens(tildeTrimmed) <= tildeCap, 'tilde fence trim holds cap')
+assert.ok(tildeTrimmed.endsWith('~~~\n…[cut]'), 'closes at tilde fence')
+
+// Orphan line-1 heading leaves nothing to keep and drops cleanly instead of keeping an empty shell.
+assert.equal(
+  trimToBudget(`# Only a heading line that is too long to fit\n${'body '.repeat(40)}`, 6, '\n…'),
+  '',
+  'orphan line-1 heading returns empty string',
+)
+
+// Non-subadditive custom counter shrink-back invariant.
+const nonSubadditive = (text) => (text.includes('a…') ? 999 : text.length)
+const weirdInput = `bbbbbb${'a'.repeat(40)}`
+const weirdOut = truncateToBudget(weirdInput, 10, '…', nonSubadditive)
+assert.ok(nonSubadditive(weirdOut) <= 10, `non-subadditive counter shrinks back cleanly: ${weirdOut}`)
+assert.equal(weirdOut, 'bbbbbb…')
+
+// UTF-16 surrogate pairs are never torn apart.
+const emojis = '😀'.repeat(100)
+for (const emojiCap of [10, 15, 25, 41]) {
+  const emojiCut = trimToBudget(emojis, emojiCap, '\n…')
+  assert.ok(estimateTokens(emojiCut) <= emojiCap, `emoji cap ${emojiCap} holds`)
+  assert.equal(emojiCut.isWellFormed(), true, `emoji cut at cap ${emojiCap} preserves valid surrogate pairs`)
+}
+
+// Repetition ratio superset asymmetry, CJK weight, and bare fences.
+const supersetBase = ['- line one is long enough', '- line two is long enough', '- line three is long enough'].join('\n')
+assert.ok(repetitionRatio(supersetBase, `${supersetBase}\n- brand new fourth line here`) < 1, 'superset scores below 1')
+assert.equal(overlapRatio('```\n```', '```\n```'), 0, 'bare fences alone carry no substantive lines')
+assert.ok(repetitionRatio('- 端口 9077\n- 模式 daemon', '- 端口 9077\n- 模式 daemon') === 1, 'CJK facts count as substantive lines')
+
 // --- config validation ------------------------------------------------------
 const { validateConfig, validateSettings } = await import('../lib/validate.js')
 
@@ -186,6 +242,16 @@ assert.deepEqual(
   'a zero tier would silently disable the ceiling',
 )
 assert.deepEqual(
+  validateSettings({ autoInject: 'pages', injectTimeoutMs: 7000, observationScopes: 'shared', recallMaxTokens: 2000, maxInjectTokens: 3000, sourceKind: 'plugin:x', tokenBudgetMode: 'fast', budgetPolicy: 'adaptive', budgetTiers: null }).issues.map((issue) => issue.field),
+  ['budgetTiers'],
+  'null budgetTiers fails cleanly without throwing',
+)
+assert.deepEqual(
+  validateSettings({ autoInject: 'pages', injectTimeoutMs: 7000, observationScopes: 'shared', recallMaxTokens: 2000, maxInjectTokens: 3000, sourceKind: 'plugin:x', tokenBudgetMode: 'fast', budgetPolicy: 'adaptive', budgetTiers: [100, 200, 300] }).issues.map((issue) => issue.field),
+  ['budgetTiers'],
+  'array budgetTiers is rejected',
+)
+assert.deepEqual(
   validateSettings({ autoInject: 'pages', injectTimeoutMs: 7000, observationScopes: 'shared', recallMaxTokens: 2000, maxInjectTokens: 3000, sourceKind: 'plugin:x', tokenBudgetMode: 'fast', budgetPolicy: 'sometimes' }).issues.map((issue) => issue.field),
   ['budgetPolicy'],
 )
@@ -201,6 +267,28 @@ assert.deepEqual(
   validateSettings({ autoInject: 'pages', injectTimeoutMs: 7000, observationScopes: 'shared', recallMaxTokens: 2000, maxInjectTokens: 3000, sourceKind: 'plugin:x', tokenBudgetMode: 'fast', verifyReminder: 'yes' }).issues.map((issue) => issue.field),
   ['verifyReminder'],
   'the trust reminder is a boolean, not a stringly-typed setting',
+)
+assert.deepEqual(
+  validateConfig({
+    apiUrl: 'ftp://bad.example',
+    optInPaths: [''],
+    reflectBudget: 'extreme',
+    daemonIdleTimeout: -1,
+    retainTags: [123],
+  }).map((issue) => issue.path).sort(),
+  ['apiUrl', 'daemonIdleTimeout', 'optInPaths', 'reflectBudget', 'retainTags'],
+  'expanded config rules flag bad URL, lists, reflectBudget, and idle timeout',
+)
+assert.deepEqual(
+  validateConfig({
+    apiUrl: 'https://api.hindsight.vectorize.io',
+    optInPaths: ['/tmp/repo'],
+    reflectBudget: 'mid',
+    daemonIdleTimeout: 600,
+    retainTags: ['tag-a'],
+  }),
+  [],
+  'valid expanded config rules pass cleanly',
 )
 
 // --- shared config tuning ---------------------------------------------------
@@ -277,6 +365,44 @@ const recoveredRevert = revertTuning()
 assert.deepEqual(recoveredRevert.reverted.map((entry) => entry.path), ['autoInject'], 'crash-recovered write is revertible')
 assert.equal(readConfigFile().config.autoInject, undefined)
 
+// Nested object cleanup on revert + explicit removed/had journal recovery.
+flushJournal()
+const savedDshHome = process.env.DSH_HOME
+const savedCfgFile = process.env.HINDSIGHT_CONFIG
+const cfgIsolated = join(scratch, 'cfg-isolated')
+process.env.DSH_HOME = join(cfgIsolated, 'dsh-home')
+process.env.HINDSIGHT_CONFIG = join(cfgIsolated, 'coding-agent.json')
+try {
+  applyTuning({ preset: [['recallOptions.max_tokens', 2500]] })
+  assert.equal(readConfigFile().config.recallOptions.max_tokens, 2500)
+  revertTuning()
+  assert.equal('recallOptions' in readConfigFile().config, false, 'empty parent plain objects are pruned on revert')
+
+  const isoStateDir = join(process.env.DSH_HOME, 'storages', 'dsh-hindsight-tuner')
+  mkdirSync(isoStateDir, { recursive: true })
+  writeFileSync(process.env.HINDSIGHT_CONFIG, JSON.stringify({ keptNull: null }, null, 2))
+  writeFileSync(join(isoStateDir, 'state.json'), JSON.stringify({
+    applied: {
+      'recallOptions.max_tokens': { value: 2500, had: false, previous: null },
+      keptNull: { value: 'override', had: true, previous: null },
+    },
+    journal: {
+      kind: 'revert',
+      startedAt: new Date().toISOString(),
+      changes: [
+        { path: 'recallOptions.max_tokens', to: null, removed: true },
+        { path: 'keptNull', to: null, removed: false },
+      ],
+    },
+  }))
+  const afterCrashRevert = revertTuning()
+  assert.deepEqual(afterCrashRevert.reverted, [], 'explicit removed=true and had=true null-restore both settle pending state')
+  assert.equal(readConfigFile().config.keptNull, null)
+} finally {
+  process.env.DSH_HOME = savedDshHome
+  process.env.HINDSIGHT_CONFIG = savedCfgFile
+}
+
 // --- effective config resolution -------------------------------------------
 const mapRoot = join(scratch, 'shared-repo')
 writeFileSync(process.env.HINDSIGHT_CONFIG, JSON.stringify({
@@ -300,6 +426,19 @@ assert.equal(envLayers.envKeys.length, 2)
 
 const baseOnly = effectiveConfig({ autoInject: 'pages', harnesses: { dsh: { autoInject: 'recall' } } }, { env: { HINDSIGHT_AUTO_INJECT: 'reflect' } })
 assert.equal(baseOnly.config.autoInject, 'recall', 'cumulative precedence')
+
+const mergedRecall = effectiveConfig({
+  recallOptions: { max_tokens: 2000, mode: 'fast' },
+  harnesses: { dsh: { recallOptions: { budget: 'low' } } },
+}, { env: {} })
+assert.deepEqual(mergedRecall.config.recallOptions, { max_tokens: 2000, mode: 'fast', budget: 'low' }, 'recallOptions shallow-merges across layers')
+
+const envTokLayers = effectiveConfig({}, { env: { HINDSIGHT_API_TOKEN: 'env-secret' } })
+assert.equal(envTokLayers.tokenSource, 'env', 'env tokenSource reported when token comes from env')
+assert.equal(effectiveServer(envTokLayers.config, {}, { tokenSource: envTokLayers.tokenSource }).tokenSource, 'env')
+const cfgTokLayers = effectiveConfig({ apiToken: 'cfg-secret' }, { env: { HINDSIGHT_API_TOKEN: 'env-secret' } })
+assert.equal(cfgTokLayers.tokenSource, 'config', 'config tokenSource wins over env')
+assert.equal(effectiveServer(cfgTokLayers.config, {}, { tokenSource: cfgTokLayers.tokenSource }).tokenSource, 'config')
 
 const mapped = bankResolution(readConfigFile().config, 'repo', join(mapRoot, 'sub'))
 assert.equal(mapped.bank, 'coding-agent::shared')
@@ -330,6 +469,25 @@ assert.equal(renamed.base, 'coding-agent::repo')
 assert.equal(optedOut({ optInOnly: true, optInPaths: [join(scratch, 'elsewhere')] }, mapRoot), true, 'opt-in excludes other directories')
 assert.equal(optedOut({ optInOnly: true, optInPaths: [mapRoot] }, join(mapRoot, 'sub')), false)
 assert.equal(optedOut({ optInOnly: true, mapPathToBank: { [mapRoot]: 'coding-agent::shared' } }, mapRoot), false, 'a mapped path counts as opted in')
+
+// Tilde paths expand consistently across paths, mapPathToBank, and optInPaths.
+const tildeSub = join(homedir(), 'dsh-tilde-repo', 'sub')
+assert.equal(
+  effectiveConfig({ paths: { '~/dsh-tilde-repo': { pageSearchLimit: 9 } } }, { env: {}, cwd: tildeSub }).config.pageSearchLimit,
+  9,
+  '~/ expands in paths keys',
+)
+assert.equal(
+  bankResolution({ mapPathToBank: { '~/dsh-tilde-repo': 'coding-agent::tilde' } }, 'repo', tildeSub).bank,
+  'coding-agent::tilde',
+  '~/ expands in mapPathToBank keys',
+)
+assert.equal(optedOut({ optInOnly: true, optInPaths: ['~/dsh-tilde-repo'] }, tildeSub), false, '~/ expands in optInPaths')
+
+// Bare .git repository strips .git suffix for projectName.
+const bareRepo = join(scratch, 'my-bare-project.git')
+execFileSync('git', ['init', '--bare', '-q', bareRepo], { stdio: 'ignore', windowsHide: true })
+assert.deepEqual(projectName(bareRepo), { name: 'my-bare-project', source: 'git' }, 'bare repo strips .git suffix')
 
 // --- plugin surface: hooks, tool, command ----------------------------------
 writeFileSync(process.env.HINDSIGHT_CONFIG, JSON.stringify({
@@ -574,6 +732,14 @@ assert.ok(estimateTokens(injectedText(afterCutTurn)) <= 100, 'a turn after a cut
 adaptiveStatus = JSON.parse(await adaptiveTool.execute({ action: 'status', json: true }, adaptiveExec))
 assert.match(adaptiveStatus.budget.tier.reason, /previous recall had to be cut/)
 
+const stepUpRecall = Array.from({ length: 400 }, (_, index) => `alpha-zeta-${index} unique fact item for cooldown step-up check.`).join('\n')
+const stepUpTurn = await adaptiveTurn('recover', stepUpRecall)
+assert.ok(estimateTokens(injectedText(stepUpTurn)) <= 200, 'turn after light cooldown steps up to normal ceiling')
+adaptiveStatus = JSON.parse(await adaptiveTool.execute({ action: 'status', json: true }, adaptiveExec))
+assert.equal(adaptiveStatus.budget.tier.name, 'normal')
+assert.match(adaptiveStatus.budget.tier.reason, /stepping back up after a cut/)
+assert.equal('cooldown' in adaptiveStatus.budget.tier, false, 'internal cooldown flag is stripped from public status')
+
 // A tier can never raise the hard cap.
 const tight = makeHarness()
 apply(tight.ctx, {
@@ -641,7 +807,25 @@ assert.ok(estimateTokens(deltaText) <= 600, 'the delta still fits the cap')
 const deltaStatus = await statusOf(deltaHarness, 'delta')
 assert.equal(deltaStatus.budget.deltas, 1, 'a delta is not reported as a skipped turn')
 assert.equal(deltaStatus.budget.repeatSkips, 0)
+assert.ok(deltaStatus.budget.deltaSaved > 0, 'delta savings are recorded')
+assert.match(
+  await deltaHarness.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status' }, { agent: { session: { header: { id: 'delta' } } } }),
+  /deltas 1.*saved ~\d+ tok/,
+  'formatSavings surfaces deltaSaved in status',
+)
 for (const dispose of deltaHarness.disposers) dispose()
+
+// (1b) Dropped recall (after === 0) must not overwrite prior session memory state.
+const dropPreserve = makeHarness()
+apply(dropPreserve.ctx, { autoTune: false, maxInjectTokens: 30, repeatPolicy: 'skip', repeatThreshold: 0.9 })
+const dropPreserveTurn = (messages) => waterfall(dropPreserve, 'agent/pre-step', { agent: { session: { header: { id: 'drop-keep' } } } }, async () => ({ kind: 'enter', messages }))
+const firstShort = '- short kept fact that survives drop'
+assert.equal((await dropPreserveTurn([human, adaptiveRecall('dk1', firstShort)])).messages.length, 2, 'short turn fits cap=30')
+const droppedBig = await dropPreserveTurn([human, adaptiveRecall('dk2', big)])
+assert.equal(droppedBig.messages.length, 1, 'oversized turn whose marker cannot fit is dropped')
+const stillSkipped = await dropPreserveTurn([human, adaptiveRecall('dk3', firstShort)])
+assert.equal(stillSkipped.messages.length, 1, 'dropped middle turn did not clobber lastRaw/lastInjectedText')
+for (const dispose of dropPreserve.disposers) dispose()
 
 // (2) History is kept when a duplicate arrives in the same turn; only the copy
 // that has never reached the model is removed.
@@ -657,8 +841,10 @@ for (const dispose of historyHarness.disposers) dispose()
 
 // (3) Compaction shadowed the recall: re-send it, even when the integration
 // suppressed a new injection because its own dedupe scans shadowed events.
+// Consecutive compactions do not double-prepend the re-entry banner, and
+// reentry trim preserves prefixes (REENTRY_PREFIX + VERIFY_REMINDER).
 const compactionHarness = makeHarness()
-apply(compactionHarness.ctx, { autoTune: false, maxInjectTokens: 600, repeatPolicy: 'skip' })
+apply(compactionHarness.ctx, { autoTune: false, maxInjectTokens: 600, repeatPolicy: 'skip', verifyReminder: true })
 const logged = []
 const compactTurn = (messages) => waterfall(
   compactionHarness,
@@ -675,10 +861,40 @@ const reentry = await compactTurn([human])
 assert.equal(reentry.messages.length, 2, 'memory removed by compaction is re-injected')
 const reentryText = injectedText(reentry)
 assert.ok(reentryText.startsWith('[dsh-hindsight-tuner: memory re-injected after context compaction]'), 'the re-injection is labelled')
+logged.push({ type: 'user/message', seq: 4, data: { source: { kind: 'plugin:hindsight' }, content: [{ type: 'text', text: reentryText }] } })
+logged.push({ type: 'compaction/summary', seq: 5, data: { shadowedSeqs: [4] } })
+const reentryAgain = await compactTurn([human])
+const reentryAgainText = injectedText(reentryAgain)
+assert.equal(
+  (reentryAgainText.match(/\[dsh-hindsight-tuner: memory re-injected after context compaction\]/g) ?? []).length,
+  1,
+  'consecutive compactions do not double-prepend REENTRY_PREFIX',
+)
+assert.equal((reentryAgainText.match(/\[verify:/g) ?? []).length, 1, 'verify reminder stays single across re-entries')
 const reentryStatus = await statusOf(compactionHarness, 'compact')
-assert.equal(reentryStatus.budget.reentered, 1, 'the re-entry is counted separately from ordinary injections')
-assert.match(await compactionHarness.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status' }, { agent: { session: { header: { id: 'compact' } } } }), /re-entered 1/)
+assert.equal(reentryStatus.budget.reentered, 2, 'the re-entries are counted separately from ordinary injections')
+assert.match(await compactionHarness.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status' }, { agent: { session: { header: { id: 'compact' } } } }), /re-entered 2/)
 for (const dispose of compactionHarness.disposers) dispose()
+
+const tightReentry = makeHarness()
+apply(tightReentry.ctx, { autoTune: false, maxInjectTokens: 80, repeatPolicy: 'skip', verifyReminder: true })
+const tightLog = []
+const tightTurnFn = (messages) => waterfall(
+  tightReentry,
+  'agent/pre-step',
+  { agent: { session: { header: { id: 'tight-re' }, snapshotEvents: () => tightLog } } },
+  async () => ({ kind: 'enter', messages }),
+)
+const seedReentry = Array.from({ length: 12 }, (_, i) => `- item ${i}: detail`).join('\n')
+await tightTurnFn([human, adaptiveRecall('tr1', seedReentry)])
+tightLog.push({ type: 'user/message', seq: 2, data: { source: { kind: 'plugin:hindsight' }, content: [{ type: 'text', text: seedReentry }] } })
+tightLog.push({ type: 'compaction/summary', seq: 3, data: { shadowedSeqs: [2] } })
+const cappedReentry = await tightTurnFn([human])
+const cappedReentryText = injectedText(cappedReentry)
+assert.ok(estimateTokens(cappedReentryText) <= 80, 'trimmed re-entry respects cap')
+assert.ok(cappedReentryText.startsWith('[dsh-hindsight-tuner: memory re-injected after context compaction]'), 'reentry trim protects REENTRY_PREFIX')
+assert.ok(cappedReentryText.includes('[verify:'), 'reentry trim protects VERIFY_REMINDER')
+for (const dispose of tightReentry.disposers) dispose()
 
 // --- budgeted view ----------------------------------------------------------
 // Truncation keeps the prefix; the budgeted view spends the same budget on the
@@ -769,8 +985,8 @@ assert.equal(firstStatus.budget.lastScenario.scenario, 'first-turn')
 assert.equal(firstStatus.budget.tier.name, 'deep', 'a first turn gets the deep ceiling')
 assert.equal(firstStatus.budget.tier.budget, 400)
 
-// Second turn: a debugging prompt with a fresh recall lands on the normal tier.
-const debugTurn = await scenarioTurn(scenarioHarness, [debugPrompt, freshRecall('s2')])
+// Second turn: a debugging prompt with step: 1 (DSH turn entry) lands on normal, not continuation.
+const debugTurn = await scenarioTurn(scenarioHarness, [debugPrompt, freshRecall('s2')], { step: 1 })
 const debugText = injectedText(debugTurn)
 assert.ok(estimateTokens(debugText) <= 200, 'the debug scenario honours the normal ceiling')
 const debugStatus = await scenarioStatus()
@@ -780,8 +996,8 @@ assert.equal(debugStatus.budget.tier.scenario, 'debug')
 assert.equal(debugStatus.budget.scenarios.debug, 1)
 assert.match(await scenarioHarness.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status' }, scenarioExec), /scenario .*last debug → normal/)
 
-// A tool-continuation step inside the turn already carries the recall: light.
-const continuationTurn = await scenarioTurn(scenarioHarness, [human, freshRecall('s3')], { step: 1 })
+// A tool-continuation step (step >= 2) inside the turn already carries the recall: light.
+const continuationTurn = await scenarioTurn(scenarioHarness, [human, freshRecall('s3')], { step: 2 })
 assert.ok(estimateTokens(injectedText(continuationTurn)) <= 100, 'a continuation step gets the light ceiling')
 assert.equal((await scenarioStatus()).budget.lastScenario.scenario, 'continuation')
 
@@ -864,6 +1080,104 @@ assert.match(await trusting.tools.find((candidate) => candidate.name === 'hindsi
 assert.equal(JSON.parse(await trusting.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status', json: true }, { agent: { session: { header: { id: 'other' } } } })).budget.verifyReminder, true)
 for (const dispose of trusting.disposers) dispose()
 
+// verifyReminder + repeat/history + short unrelated recall + huge paragraph.
+const verifySkip = makeHarness()
+apply(verifySkip.ctx, { autoTune: false, maxInjectTokens: 300, repeatPolicy: 'skip', repeatThreshold: 0.9, verifyReminder: true })
+const vsTurn = (messages) => waterfall(verifySkip, 'agent/pre-step', { agent: { session: { header: { id: 'vs' } } } }, async () => ({ kind: 'enter', messages }))
+const vsFirst = await vsTurn([human, adaptiveRecall('vs1', conventions)])
+const vsFirstText = injectedText(vsFirst)
+assert.ok(vsFirstText.startsWith('[verify:'), 'first turn starts with verify reminder')
+const vsHistoryOnly = await vsTurn([human, adaptiveRecall('vs1', vsFirstText)])
+assert.equal((injectedText(vsHistoryOnly).match(/\[verify:/g) ?? []).length, 1, 'history copy does not get a second verify banner')
+const vsDuplicateNewId = await vsTurn([human, adaptiveRecall('vs1-dup', conventions)])
+assert.equal(vsDuplicateNewId.messages.length, 1, 'sameRecall strips VERIFY_REMINDER before matching lastRaw')
+const vsShortUnrelated = await vsTurn([human, adaptiveRecall('vs1', vsFirstText), adaptiveRecall('vs2', '- short unrelated fact about sockets and locks')])
+assert.equal(vsShortUnrelated.messages.length, 3, 'unrelated short turn-2 recall is not skipped')
+assert.equal((vsShortUnrelated.messages[1].content[0].text.match(/\[verify:/g) ?? []).length, 1, 'existing history copy stays single-banner')
+assert.equal((vsShortUnrelated.messages[2].content[0].text.match(/\[verify:/g) ?? []).length, 1, 'fresh survivor receives verify banner')
+const vsHugePara = await vsTurn([human, adaptiveRecall('vs3', 'gianttoken '.repeat(400))])
+const vsHugeText = injectedText(vsHugePara)
+assert.ok(vsHugeText.startsWith('[verify:'), 'huge single paragraph preserves verify reminder')
+assert.ok(estimateTokens(vsHugeText) <= 300, 'huge single paragraph stays within cap')
+for (const dispose of verifySkip.disposers) dispose()
+
+// verifyReminder + viewPolicy: 'budgeted' (both multi-block selection & 1-block trim fallback).
+const verifyView = makeHarness()
+apply(verifyView.ctx, { autoTune: false, maxInjectTokens: 260, viewPolicy: 'budgeted', verifyReminder: true })
+const vvMulti = await waterfall(verifyView, 'agent/pre-step', { agent: { session: { header: { id: 'vv1' } } } }, async () => ({
+  kind: 'enter',
+  messages: [viewTask, adaptiveRecall('vvm', [...irrelevant, relevant].join('\n\n'))],
+}))
+const vvMultiText = injectedText(vvMulti)
+assert.ok(vvMultiText.startsWith('[verify:'), 'budgeted view with verifyReminder keeps banner at start')
+assert.ok(vvMultiText.includes('lib/tokens.js'), 'budgeted view keeps task-relevant block behind banner')
+assert.ok(vvMultiText.includes('budgeted view'), 'budgeted view marker survives')
+assert.ok(estimateTokens(vvMultiText) <= 260, `budgeted view + verifyReminder respects cap (got ${estimateTokens(vvMultiText)})`)
+const vvSingle = await waterfall(verifyView, 'agent/pre-step', { agent: { session: { header: { id: 'vv2' } } } }, async () => ({
+  kind: 'enter',
+  messages: [viewTask, adaptiveRecall('vvs', 'singleblock '.repeat(350))],
+}))
+const vvSingleText = injectedText(vvSingle)
+assert.ok(vvSingleText.startsWith('[verify:'), '1-block trim fallback keeps verify banner')
+assert.ok(vvSingleText.includes('dsh-hindsight-tuner: cut from'), '1-block trim fallback includes cut marker')
+assert.ok(estimateTokens(vvSingleText) <= 260, '1-block trim fallback stays within cap')
+for (const dispose of verifyView.disposers) dispose()
+
+// String `message.content` works across under-cap, trimmed, and budgeted-view turns.
+const strHarness = makeHarness()
+apply(strHarness.ctx, { autoTune: false, maxInjectTokens: 200, viewPolicy: 'budgeted' })
+const strTurn = (messages) => waterfall(strHarness, 'agent/pre-step', { agent: { session: { header: { id: 'str' } } } }, async () => ({ kind: 'enter', messages }))
+const strUnder = await strTurn([
+  { id: 'u-str', role: 'user', source: { kind: 'user' }, content: 'Fix lib/tokens.js' },
+  { id: 'r-str-1', role: 'user', source: { kind: 'plugin:hindsight', form: 'recall' }, content: 'short string recall' },
+])
+assert.equal(strUnder.messages[1].content, 'short string recall', 'under-cap string content untouched')
+const strView = await strTurn([
+  { id: 'u-str-2', role: 'user', source: { kind: 'user' }, content: 'Fix the budget accounting in lib/tokens.js trimToBudget recallBudget' },
+  { id: 'r-str-2', role: 'user', source: { kind: 'plugin:hindsight', form: 'recall' }, content: [...irrelevant, relevant].join('\n\n') },
+])
+assert.equal(typeof strView.messages[1].content, 'string', 'rewritten string message preserves string shape')
+assert.ok(strView.messages[1].content.includes('lib/tokens.js') && strView.messages[1].content.includes('budgeted view'))
+assert.ok(estimateTokens(strView.messages[1].content) <= 200, 'string content view fits cap')
+const strTrim = await strTurn([
+  { id: 'u-str-3', role: 'user', source: { kind: 'user' }, content: 'hello' },
+  { id: 'r-str-3', role: 'user', source: { kind: 'plugin:hindsight', form: 'recall' }, content: 'word '.repeat(500) },
+])
+assert.equal(typeof strTrim.messages[1].content, 'string', 'trimmed string message preserves string shape')
+assert.ok(estimateTokens(strTrim.messages[1].content) <= 200, 'trimmed string message fits cap')
+for (const dispose of strHarness.disposers) dispose()
+
+// Invalid settings are rejected completely and fall back to safe defaults on apply().
+const allBad = makeHarness()
+apply(allBad.ctx, {
+  autoTune: false,
+  maxInjectTokens: -5,
+  sourceKind: 'bad',
+  tokenBudgetMode: 'bad',
+  budgetPolicy: 'magic',
+  budgetTiers: null,
+  repeatPolicy: 'maybe',
+  repeatThreshold: 2,
+  verifyReminder: 'yes',
+  viewPolicy: 'wrong',
+  viewContextMessages: 99,
+  scenarioTiers: { debug: 'ultra' },
+})
+const allBadStatus = JSON.parse(await allBad.tools.find((c) => c.name === 'hindsight_tuner').execute({ action: 'status', json: true }, trustExec))
+for (const field of ['budgetTiers', 'maxInjectTokens', 'sourceKind', 'tokenBudgetMode', 'budgetPolicy', 'repeatPolicy', 'repeatThreshold', 'verifyReminder', 'viewPolicy', 'viewContextMessages', 'scenarioTiers']) {
+  assert.ok(allBadStatus.settingsIssues.some((issue) => issue.field === field), `reports invalid ${field}`)
+}
+assert.equal(allBadStatus.budget.cap, 3000)
+assert.equal(allBadStatus.budget.policy, 'off')
+assert.deepEqual(allBadStatus.budget.tiers, { light: 800, normal: 1600, deep: 3000 })
+assert.equal(allBadStatus.budget.repeatPolicy, 'inject')
+assert.equal(allBadStatus.budget.repeatThreshold, 0.9)
+assert.equal(allBadStatus.budget.verifyReminder, false)
+assert.equal(allBadStatus.budget.viewPolicy, 'truncate')
+assert.equal(allBadStatus.budget.viewContextMessages, 8)
+assert.equal(allBadStatus.budget.scenarioTiers.debug, 'normal')
+for (const dispose of allBad.disposers) dispose()
+
 // A second memory plugin injecting on the same turn is visible and flagged.
 const mnemonMessage = {
   id: 'mnemon-1',
@@ -939,6 +1253,9 @@ assert.equal(previewCap.kind, 'success')
 assert.match(previewCap.text, /no file was changed/)
 assert.match(await tool.execute({ action: 'status' }, exec), /budget\s+cap 400 tok\/turn/, 'dry run leaves the live cap alone')
 assert.equal((await command.handler({ rawInput: ' frobnicate' })).kind, 'error', 'unknown actions are rejected')
+assert.equal((await command.handler({ rawInput: ' tune --cap=' })).kind, 'error', 'blank --cap= is rejected')
+assert.equal((await command.handler({ rawInput: ' tune --cap' })).kind, 'error', 'bare --cap without value is rejected')
+assert.match(await tool.execute({ action: 'unknown-action' }, exec), /Unknown action "unknown-action"/, 'tool rejects unknown action cleanly')
 
 const suggestion = await tool.execute({ action: 'suggest' }, exec)
 assert.match(suggestion, /budget suggestion/)
@@ -984,6 +1301,33 @@ assert.match(stale, /Restart DSH/)
 assert.match(stale, /2 failures to another server \(old process\)/, 'failures against another origin are counted, not hidden')
 assert.match(stale, /banks coding-agent::fixture 1, coding-agent::misc 1/, 'mixed banks in the journal are visible, not averaged away')
 
+// A newer DSH success clears an earlier failure against another server.
+writeFileSync(process.env.HINDSIGHT_DIAG_FILE, [
+  { ts: new Date(Date.now() - 5000).toISOString(), event: 'pages_failed', error: 'GET http://127.0.0.1:9077/v1/default/banks/coding-agent%3A%3Afixture/pages/tree -> 404' },
+  { ts: new Date().toISOString(), event: 'inject_ok', chars: 120 },
+].map((entry) => JSON.stringify(entry)).join('\n'))
+const recoveredStale = JSON.parse(await tool.execute({ action: 'status', json: true }, exec))
+assert.equal(recoveredStale.stale, null, 'newer DSH success clears earlier foreign-origin failure')
+
+// endpointOf and bankOf strip wrapping punctuation and query strings cleanly.
+writeFileSync(process.env.HINDSIGHT_DIAG_FILE, JSON.stringify({
+  ts: now,
+  event: 'pages_failed',
+  error: 'GET (https://api.example:8443/v1/default/banks/coding-agent%3A%3Asub/pages/tree?limit=10) -> 500.',
+}))
+const punctActivity = summarizeActivity({ harness: 'dsh', expectedOrigin: 'http://127.0.0.1:9' })
+assert.equal(punctActivity.lastEndpoint, 'https://api.example:8443')
+assert.equal(punctActivity.lastBank, 'coding-agent::sub')
+
+// 550 foreign-harness lines after a DSH event still preserve the DSH failure in the tail scan.
+const flooded = [
+  JSON.stringify({ ts: now, event: 'pages_failed', error: 'GET http://127.0.0.1:9077/v1/default/banks/coding-agent%3A%3Adsh/pages/tree -> 500' }),
+  ...Array.from({ length: 550 }, (_, index) => JSON.stringify({ ts: now, harness: 'claude-code', event: 'inject_ok', chars: index + 10 })),
+].join('\n')
+writeFileSync(process.env.HINDSIGHT_DIAG_FILE, flooded)
+const filteredActivity = summarizeActivity({ lines: 500, harness: 'dsh', expectedOrigin: 'http://127.0.0.1:9' })
+assert.equal(filteredActivity.lastFailure?.endpoint, 'http://127.0.0.1:9077', 'backwards harness filter finds DSH event beyond 500 foreign lines')
+
 // Only recent evidence counts: a failure from twenty minutes ago is history,
 // not proof that this process is still misconfigured.
 writeFileSync(process.env.HINDSIGHT_DIAG_FILE, JSON.stringify({
@@ -1004,6 +1348,45 @@ const foreignOnly = await tool.execute({ action: 'status' }, exec)
 assert.doesNotMatch(foreignOnly, /process\s+newest journal failure/, 'another harness failure is ignored')
 assert.doesNotMatch(foreignOnly, /failures to another server/, 'another harness failure is not counted as DSH foreign traffic')
 writeFileSync(process.env.HINDSIGHT_DIAG_FILE, injectionJournal)
+
+// Tuner journal >256KB tail read (multi-byte UTF-8 boundary), delta/cap aggregation, and cross-process history status line.
+flushJournal()
+const prevDshForJournal = process.env.DSH_HOME
+const journalIso = join(scratch, 'tuner-journal-iso')
+process.env.DSH_HOME = journalIso
+try {
+  const isoTunerDir = join(journalIso, 'storages', 'dsh-hindsight-tuner')
+  mkdirSync(isoTunerDir, { recursive: true })
+  const oldTs = new Date(Date.now() - 48 * 3_600_000).toISOString()
+  const freshTs = new Date().toISOString()
+  const padLine = JSON.stringify({ ts: oldTs, event: 'old_pad', note: '中文多字节内容'.repeat(20) })
+  const padCount = Math.ceil((270 * 1024) / Buffer.byteLength(`${padLine}\n`, 'utf8'))
+  const recentLines = [
+    JSON.stringify({ ts: freshTs, event: 'inject_capped', before: 500, after: 200 }),
+    JSON.stringify({ ts: freshTs, event: 'inject_skipped', saved: 150 }),
+    JSON.stringify({ ts: freshTs, event: 'inject_delta', saved: 80 }),
+  ]
+  writeFileSync(
+    join(isoTunerDir, 'tuner.jsonl'),
+    `${Array.from({ length: padCount }, () => padLine).join('\n')}\n${recentLines.join('\n')}\n`,
+    'utf8',
+  )
+  const historySummary = summarizeTunerJournal({ windowHours: 24 })
+  assert.deepEqual(
+    { capped: historySummary.capped, skipped: historySummary.skipped, trimmedTokens: historySummary.trimmedTokens, savedTokens: historySummary.savedTokens, totalSaved: historySummary.totalSaved },
+    { capped: 1, skipped: 1, trimmedTokens: 300, savedTokens: 230, totalSaved: 530 },
+    'summarizeTunerJournal reads >256KB multi-byte tail and aggregates capped, skipped, and delta savings',
+  )
+
+  const crossProc = makeHarness()
+  apply(crossProc.ctx, { autoTune: false, maxInjectTokens: 500 })
+  const crossStatusText = await crossProc.tools.find((c) => c.name === 'hindsight_tuner').execute({ action: 'status' }, exec)
+  assert.match(crossStatusText, /history\s+24h across processes: 1 capped · 1 skipped · saved ~530 tok/, 'formatStatus prints cross-process 24h history line')
+  for (const dispose of crossProc.disposers) dispose()
+} finally {
+  flushJournal()
+  process.env.DSH_HOME = prevDshForJournal
+}
 
 // A config with an invalid value is reported, not silently accepted.
 const savedConfig = readFileSync(process.env.HINDSIGHT_CONFIG, 'utf8')
@@ -1054,6 +1437,400 @@ try {
   process.env.DSH_PROFILE_DIR = savedProfileDir
 }
 
+// --- DSH 0.2.x lifecycle, deferred agents mount, wrapped-hook status, & verify-live ---
+{
+  // (1) agent/created triggers autoTune on main sessions and skips subagents.
+  flushJournal()
+  const prevDsh = process.env.DSH_HOME
+  const prevCfg = process.env.HINDSIGHT_CONFIG
+  const prevDiag = process.env.HINDSIGHT_DIAG_FILE
+  const isoCreated = join(scratch, 'iso-created')
+  mkdirSync(isoCreated, { recursive: true })
+  process.env.DSH_HOME = join(isoCreated, 'dsh-home')
+  process.env.HINDSIGHT_CONFIG = join(isoCreated, 'coding-agent.json')
+  process.env.HINDSIGHT_DIAG_FILE = join(isoCreated, 'diag.jsonl')
+  writeFileSync(process.env.HINDSIGHT_CONFIG, JSON.stringify({ apiUrl: 'http://127.0.0.1:9', observationScopes: 'shared' }, null, 2))
+  let createdHarness = null
+  try {
+    createdHarness = makeHarness()
+    apply(createdHarness.ctx, { autoTune: true, maxInjectTokens: 500 })
+    const createdHandlers = createdHarness.handlers.get('agent/created') ?? []
+    assert.equal(createdHandlers.length, 1, 'registers agent/created lifecycle listener')
+
+    createdHandlers[0].handler({ agent: { session: { header: { id: 'sub-1', origin: 'subagent' } } }, source: 'subagent' })
+    await new Promise((done) => setTimeout(done, 30))
+    assert.equal(readConfigFile().config.autoInject, undefined, 'subagent agent/created does not trigger auto-tune')
+    assert.equal(tunerState().exists, false, 'subagent does not create tuner state.json')
+
+    createdHandlers[0].handler({ agent: { session: { header: { id: 'main-1', origin: 'main' } } }, source: 'startup' })
+    await new Promise((done) => setTimeout(done, 30))
+    assert.equal(readConfigFile().config.autoInject, 'pages', 'main agent/created auto-tunes coding-agent.json')
+    assert.equal(tunerState().exists, true, 'auto-tune writes state.json')
+    assert.equal(summarizeTunerJournal({ windowHours: 24 }).tuneApplied, 1, 'records tune_applied in tuner journal')
+  } finally {
+    if (createdHarness) for (const dispose of createdHarness.disposers) dispose()
+    flushJournal()
+    process.env.DSH_HOME = prevDsh
+    process.env.HINDSIGHT_CONFIG = prevCfg
+    process.env.HINDSIGHT_DIAG_FILE = prevDiag
+  }
+}
+
+{
+  // (2) Deferred ctx.inject(['agents']) mount race: regardless of bundle order,
+  // re-prepending on agents mount and agent/created keeps tuner outermost.
+  function makeDeferredAgentsHarness() {
+    const base = makeHarness()
+    const waiters = []
+    let mounted = false
+    const origInject = base.ctx.inject
+    base.ctx.inject = (services, callback) => {
+      if (services.includes('agents')) {
+        if (mounted) {
+          callback({ agents: {} })
+          return () => {}
+        }
+        waiters.push(callback)
+        return () => {
+          const idx = waiters.indexOf(callback)
+          if (idx >= 0) waiters.splice(idx, 1)
+        }
+      }
+      return origInject(services, callback)
+    }
+    base.mountAgents = () => {
+      mounted = true
+      for (const cb of waiters.splice(0)) cb({ agents: {} })
+    }
+    return base
+  }
+
+  const upstreamLate = async (payload, next) => {
+    const decision = await next()
+    return { ...decision, messages: [...decision.messages, { ...recallMessage, id: 'deferred-upstream' }] }
+  }
+
+  // Case 2a: tuner activates first, upstream also registers inside delayed `agents`,
+  // then `agent/created` re-prepends tuner outside upstream.
+  const raceA = makeDeferredAgentsHarness()
+  apply(raceA.ctx, { autoTune: false, maxInjectTokens: 120 })
+  raceA.ctx.inject(['agents'], () => {
+    raceA.ctx.on('agent/pre-step', upstreamLate, { prepend: true })
+  })
+  raceA.mountAgents()
+  for (const entry of [...(raceA.handlers.get('agent/created') ?? [])]) {
+    entry.handler({ agent: { session: { header: { id: 'race-a', origin: 'main' } } }, source: 'startup' })
+  }
+  assert.equal(raceA.handlers.get('agent/pre-step').length, 2, 're-prepend disposes previous pre-step listener instead of duplicating')
+  const raceADecision = await waterfall(raceA, 'agent/pre-step', { agent: { session: { header: { id: 'race-a' } } } }, async () => ({
+    kind: 'enter',
+    messages: [human],
+  }))
+  assert.ok(estimateTokens(raceADecision.messages[1].content[0].text) <= 120, 'tuner wraps upstream after delayed agents mount + agent/created')
+  assert.match(raceADecision.messages[1].content[0].text, /dsh-hindsight-tuner: cut from/)
+  for (const dispose of raceA.disposers) dispose()
+
+  // Case 2b: upstream registers inside delayed `agents` before tuner; agents mount
+  // alone restores tuner as outermost even before any session lifecycle event.
+  const raceB = makeDeferredAgentsHarness()
+  raceB.ctx.inject(['agents'], () => {
+    raceB.ctx.on('agent/pre-step', upstreamLate, { prepend: true })
+  })
+  apply(raceB.ctx, { autoTune: false, maxInjectTokens: 120 })
+  raceB.mountAgents()
+  const raceBDecision = await waterfall(raceB, 'agent/pre-step', { agent: { session: { header: { id: 'race-b' } } } }, async () => ({
+    kind: 'enter',
+    messages: [human],
+  }))
+  assert.ok(estimateTokens(raceBDecision.messages[1].content[0].text) <= 120, 'tuner wraps upstream on agents mount alone when loaded after upstream')
+  for (const dispose of raceB.disposers) dispose()
+}
+
+{
+  // (3) onBeforeStep safety fallback triggers autoTune on the first non-subagent
+  // pre-step even if the host did not emit agent/created or agent/session-start.
+  flushJournal()
+  const prevDsh = process.env.DSH_HOME
+  const prevCfg = process.env.HINDSIGHT_CONFIG
+  const prevDiag = process.env.HINDSIGHT_DIAG_FILE
+  const isoFallback = join(scratch, 'iso-fallback')
+  mkdirSync(isoFallback, { recursive: true })
+  process.env.DSH_HOME = join(isoFallback, 'dsh-home')
+  process.env.HINDSIGHT_CONFIG = join(isoFallback, 'coding-agent.json')
+  process.env.HINDSIGHT_DIAG_FILE = join(isoFallback, 'diag.jsonl')
+  writeFileSync(process.env.HINDSIGHT_CONFIG, JSON.stringify({ apiUrl: 'http://127.0.0.1:9', observationScopes: 'shared' }, null, 2))
+  let fallbackHarness = null
+  try {
+    fallbackHarness = makeHarness()
+    apply(fallbackHarness.ctx, { autoTune: true, maxInjectTokens: 500 })
+
+    await waterfall(fallbackHarness, 'agent/pre-step', { agent: { session: { header: { id: 'sub-pre', origin: 'subagent' } } } }, async () => ({
+      kind: 'enter',
+      messages: [human],
+    }))
+    await new Promise((done) => setTimeout(done, 20))
+    assert.equal(readConfigFile().config.autoInject, undefined, 'subagent pre-step does not auto-tune')
+
+    await waterfall(fallbackHarness, 'agent/pre-step', { agent: { session: { header: { id: 'main-pre', origin: 'main' } } } }, async () => ({
+      kind: 'enter',
+      messages: [human],
+    }))
+    await new Promise((done) => setTimeout(done, 20))
+    assert.equal(readConfigFile().config.autoInject, 'pages', 'first non-subagent pre-step falls back to auto-tuning')
+    assert.equal(tunerState().exists, true)
+  } finally {
+    if (fallbackHarness) for (const dispose of fallbackHarness.disposers) dispose()
+    flushJournal()
+    process.env.DSH_HOME = prevDsh
+    process.env.HINDSIGHT_CONFIG = prevCfg
+    process.env.HINDSIGHT_DIAG_FILE = prevDiag
+  }
+}
+
+{
+  // (4) Wrapped-hook status detection ignores pre-boot injections and accurately
+  // warns when preSteps > 0 and DSH logs an injection after activation.
+  flushJournal()
+  const prevDsh = process.env.DSH_HOME
+  const prevCfg = process.env.HINDSIGHT_CONFIG
+  const prevDiag = process.env.HINDSIGHT_DIAG_FILE
+  const isoOrder = join(scratch, 'iso-order')
+  mkdirSync(isoOrder, { recursive: true })
+  process.env.DSH_HOME = join(isoOrder, 'dsh-home')
+  process.env.HINDSIGHT_CONFIG = join(isoOrder, 'coding-agent.json')
+  process.env.HINDSIGHT_DIAG_FILE = join(isoOrder, 'diag.jsonl')
+  writeFileSync(process.env.HINDSIGHT_CONFIG, JSON.stringify({ apiUrl: 'http://127.0.0.1:9', apiToken: 'test-token' }, null, 2))
+  const preBootTs = new Date(Date.now() - 60_000).toISOString()
+  writeFileSync(process.env.HINDSIGHT_DIAG_FILE, `${JSON.stringify({ ts: preBootTs, harness: 'dsh', event: 'inject_ok', chars: 4000 })}\n`)
+  let orderHarness = null
+  const savedFetchOrder = globalThis.fetch
+  try {
+    globalThis.fetch = async () => new Response('{"pages":[]}', { status: 200 })
+    orderHarness = makeHarness()
+    apply(orderHarness.ctx, { autoTune: false, maxInjectTokens: 500 })
+    const orderTool = orderHarness.tools.find((c) => c.name === 'hindsight_tuner')
+    const orderExec = { agent: { session: { header: { id: 'ord', cwd: process.cwd() } } } }
+
+    const beforeText = await orderTool.execute({ action: 'status' }, orderExec)
+    const beforeJson = JSON.parse(await orderTool.execute({ action: 'status', json: true }, orderExec))
+    assert.equal(beforeJson.budget.preSteps, 0)
+    assert.equal(beforeJson.budget.injectSinceBoot, false)
+    assert.doesNotMatch(beforeText, /WARNING: pre-step ran/)
+    assert.doesNotMatch(beforeText, /another pre-step listener is wrapping it/)
+
+    await waterfall(orderHarness, 'agent/pre-step', { agent: { session: { header: { id: 'ord' } } } }, async () => ({
+      kind: 'enter',
+      messages: [human],
+    }))
+    const postBootTs = new Date(Date.now() + 2000).toISOString()
+    writeFileSync(process.env.HINDSIGHT_DIAG_FILE, `${JSON.stringify({ ts: postBootTs, harness: 'dsh', event: 'inject_ok', chars: 4000 })}\n`)
+
+    const afterJson = JSON.parse(await orderTool.execute({ action: 'status', json: true }, orderExec))
+    const afterText = await orderTool.execute({ action: 'status' }, orderExec)
+    assert.equal(afterJson.budget.preSteps, 1)
+    assert.equal(afterJson.budget.turns, 0)
+    assert.equal(afterJson.budget.injectSinceBoot, true)
+    assert.match(afterText, /order\s+WARNING: pre-step ran and DSH logged an injection, but none reached this hook/)
+    assert.match(afterText, /another pre-step listener is wrapping it/)
+  } finally {
+    globalThis.fetch = savedFetchOrder
+    if (orderHarness) for (const dispose of orderHarness.disposers) dispose()
+    flushJournal()
+    process.env.DSH_HOME = prevDsh
+    process.env.HINDSIGHT_CONFIG = prevCfg
+    process.env.HINDSIGHT_DIAG_FILE = prevDiag
+  }
+}
+
+{
+  // (5) Expanded summarizeTunerJournal tracks lifecycle/governance counts and clears
+  // active tune errors after a subsequent successful tune_requested/tune_applied.
+  flushJournal()
+  const prevDsh = process.env.DSH_HOME
+  const isoSummary = join(scratch, 'iso-journal-fields')
+  process.env.DSH_HOME = isoSummary
+  try {
+    const dir = join(isoSummary, 'storages', 'dsh-hindsight-tuner')
+    mkdirSync(dir, { recursive: true })
+    const file = join(dir, 'tuner.jsonl')
+    const t0 = new Date(Date.now() - 10_000).toISOString()
+    const t1 = new Date(Date.now() - 5_000).toISOString()
+    writeFileSync(file, [
+      { ts: t0, event: 'activated', autoTune: true, cap: 3000, recall: 2000, budgetPolicy: 'adaptive', repeatPolicy: 'skip' },
+      { ts: t1, event: 'tune_failed', error: 'EACCES: read-only config' },
+      { ts: t1, event: 'tier_selected', tier: 'deep', budget: 3000 },
+      { ts: t1, event: 'inject_reentered', tokens: 120 },
+      { ts: t1, event: 'inject_view', blocks: 4, kept: 2, omitted: 2 },
+    ].map((e) => JSON.stringify(e)).join('\n') + '\n')
+    const activeErr = summarizeTunerJournal({ windowHours: 24 })
+    assert.equal(activeErr.activated, 1)
+    assert.equal(activeErr.tuneFailed, 1)
+    assert.equal(activeErr.tuneErrorActive, true)
+    assert.equal(activeErr.lastTuneError, 'EACCES: read-only config')
+    assert.equal(activeErr.tierSelected, 1)
+    assert.equal(activeErr.reentered, 1)
+    assert.equal(activeErr.viewed, 1)
+    assert.equal(activeErr.lastActivated.budgetPolicy, 'adaptive')
+    assert.equal(activeErr.lastActivated.repeatPolicy, 'skip')
+
+    const t2 = new Date().toISOString()
+    writeFileSync(file, JSON.stringify({ ts: t2, event: 'tune_requested', changed: ['autoInject'] }) + '\n', { flag: 'a' })
+    const cleared = summarizeTunerJournal({ windowHours: 24 })
+    assert.equal(cleared.tuneRequested, 1)
+    assert.equal(cleared.tuneFailed, 1)
+    assert.equal(cleared.tuneErrorActive, false, 'later successful tune clears tuneErrorActive')
+  } finally {
+    flushJournal()
+    process.env.DSH_HOME = prevDsh
+  }
+}
+
+{
+  // (6) Async hermetic subprocess verification of scripts/verify-live.mjs --json.
+  let serverMode = '200'
+  const server = createServer((req, res) => {
+    if (req.url === '/health') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end('{"status":"ok"}')
+      return
+    }
+    if (req.url?.includes('/pages/tree')) {
+      if (serverMode === '401') {
+        res.writeHead(401, { 'content-type': 'application/json' })
+        res.end('{"detail":"Authentication failed: API key required"}')
+      } else if (serverMode === '404') {
+        res.writeHead(404, { 'content-type': 'application/json' })
+        res.end('{"detail":"Bank not found"}')
+      } else {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end('{"pages":[]}')
+      }
+      return
+    }
+    res.writeHead(404)
+    res.end()
+  })
+  await new Promise((resolveListen) => server.listen(0, '127.0.0.1', resolveListen))
+  const port = server.address().port
+  const baseUrl = `http://127.0.0.1:${port}`
+
+  function runVerify(extraEnv) {
+    return new Promise((resolveProc, rejectProc) => {
+      const env = { ...process.env, ...extraEnv }
+      for (const k of ['HINDSIGHT_API_TOKEN', 'HINDSIGHT_API_URL', 'HINDSIGHT_API_PORT', 'HINDSIGHT_AUTO_INJECT', 'HINDSIGHT_DISABLED']) {
+        delete env[k]
+      }
+      const child = spawn(process.execPath, [join(root, 'scripts', 'verify-live.mjs'), '--json'], {
+        cwd: scratch,
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let stdout = ''
+      let stderr = ''
+      child.stdout.on('data', (chunk) => { stdout += chunk })
+      child.stderr.on('data', (chunk) => { stderr += chunk })
+      child.on('error', rejectProc)
+      child.on('close', (code) => {
+        try {
+          resolveProc({ code, data: JSON.parse(stdout), stderr })
+        } catch (err) {
+          rejectProc(new Error(`verify-live invalid JSON (exit ${code}): ${err.message}\nstdout: ${stdout}\nstderr: ${stderr}`))
+        }
+      })
+    })
+  }
+
+  try {
+    const byName = (res, id) => res.data.results.find((r) => r.name === id)
+
+    // 6a: 401 server + static-guide inject_ok + autoTune=true with no state.json -> fail recall & tuner.
+    serverMode = '401'
+    const caseA = join(scratch, 'verify-a')
+    mkdirSync(join(caseA, 'dsh-home', 'storages', 'dsh-hindsight-tuner'), { recursive: true })
+    writeFileSync(join(caseA, 'coding-agent.json'), JSON.stringify({ apiUrl: baseUrl }))
+    const aBoot = new Date(Date.now() - 5000).toISOString()
+    const aInject = new Date().toISOString()
+    writeFileSync(join(caseA, 'diag.jsonl'), [
+      { ts: aBoot, harness: 'dsh', event: 'pages_failed', error: `GET ${baseUrl}/v1/default/banks/b/pages/tree -> 401` },
+      { ts: aInject, harness: 'dsh', event: 'inject_ok', chars: 6961 },
+    ].map((e) => JSON.stringify(e)).join('\n') + '\n')
+    writeFileSync(join(caseA, 'dsh-home', 'storages', 'dsh-hindsight-tuner', 'tuner.jsonl'), JSON.stringify({
+      ts: aBoot, event: 'activated', autoTune: true, cap: 3000, recall: 2000, budgetPolicy: 'adaptive',
+    }) + '\n')
+    const resA = await runVerify({
+      DSH_HOME: join(caseA, 'dsh-home'),
+      HINDSIGHT_CONFIG: join(caseA, 'coding-agent.json'),
+      HINDSIGHT_DIAG_FILE: join(caseA, 'diag.jsonl'),
+    })
+    assert.equal(resA.code, 1)
+    assert.equal(resA.data.passed, false)
+    assert.equal(byName(resA, 'bank').status, 'fail')
+    assert.equal(byName(resA, 'recall').status, 'fail')
+    assert.match(byName(resA, 'recall').detail, /static tool guide only/)
+    assert.equal(byName(resA, 'tuner').status, 'fail')
+    assert.match(byName(resA, 'tuner').detail, /auto-tune never ran/)
+
+    // 6b: 200 bank + pages_ok + inject_ok + state.json present, yet 0 governed events under adaptive -> fail tuner.
+    serverMode = '200'
+    const caseB = join(scratch, 'verify-b')
+    mkdirSync(join(caseB, 'dsh-home', 'storages', 'dsh-hindsight-tuner'), { recursive: true })
+    writeFileSync(join(caseB, 'coding-agent.json'), JSON.stringify({ apiUrl: baseUrl, apiToken: 'ok', autoInject: 'pages' }))
+    writeFileSync(join(caseB, 'diag.jsonl'), [
+      { ts: aBoot, harness: 'dsh', event: 'pages_ok', count: 2 },
+      { ts: aInject, harness: 'dsh', event: 'inject_ok', chars: 1200 },
+    ].map((e) => JSON.stringify(e)).join('\n') + '\n')
+    writeFileSync(join(caseB, 'dsh-home', 'storages', 'dsh-hindsight-tuner', 'state.json'), JSON.stringify({ autoTune: true, applied: { autoInject: { value: 'pages', had: false, previous: null } } }))
+    writeFileSync(join(caseB, 'dsh-home', 'storages', 'dsh-hindsight-tuner', 'tuner.jsonl'), [
+      { ts: aBoot, event: 'activated', autoTune: true, cap: 3000, recall: 2000, budgetPolicy: 'adaptive' },
+      { ts: aBoot, event: 'tune_applied', changed: ['autoInject'] },
+    ].map((e) => JSON.stringify(e)).join('\n') + '\n')
+    const resB = await runVerify({
+      DSH_HOME: join(caseB, 'dsh-home'),
+      HINDSIGHT_CONFIG: join(caseB, 'coding-agent.json'),
+      HINDSIGHT_DIAG_FILE: join(caseB, 'diag.jsonl'),
+    })
+    assert.equal(resB.code, 1)
+    assert.equal(byName(resB, 'recall').status, 'pass')
+    assert.equal(byName(resB, 'tuner').status, 'fail')
+    assert.match(byName(resB, 'tuner').detail, /hook order or lifecycle mismatch/)
+
+    // 6c: Healthy end-to-end (200 + pages_ok + inject_ok + tier_selected + state.json) -> pass, exit 0.
+    writeFileSync(
+      join(caseB, 'dsh-home', 'storages', 'dsh-hindsight-tuner', 'tuner.jsonl'),
+      JSON.stringify({ ts: aInject, event: 'tier_selected', tier: 'deep', budget: 3000 }) + '\n',
+      { flag: 'a' },
+    )
+    const resC = await runVerify({
+      DSH_HOME: join(caseB, 'dsh-home'),
+      HINDSIGHT_CONFIG: join(caseB, 'coding-agent.json'),
+      HINDSIGHT_DIAG_FILE: join(caseB, 'diag.jsonl'),
+    })
+    assert.equal(resC.code, 0)
+    assert.equal(resC.data.passed, true)
+    assert.equal(byName(resC, 'recall').status, 'pass')
+    assert.equal(byName(resC, 'tuner').status, 'pass')
+
+    // 6d: Cold machine (no tuner state/journal yet, 404 bank, empty diag.jsonl) -> exit 0 with notes.
+    serverMode = '404'
+    const caseD = join(scratch, 'verify-d')
+    mkdirSync(caseD, { recursive: true })
+    writeFileSync(join(caseD, 'coding-agent.json'), JSON.stringify({ apiUrl: baseUrl, apiToken: 'ok' }))
+    writeFileSync(join(caseD, 'diag.jsonl'), '')
+    const resD = await runVerify({
+      DSH_HOME: join(caseD, 'dsh-home'),
+      HINDSIGHT_CONFIG: join(caseD, 'coding-agent.json'),
+      HINDSIGHT_DIAG_FILE: join(caseD, 'diag.jsonl'),
+    })
+    assert.equal(resD.code, 0)
+    assert.equal(resD.data.passed, true)
+    assert.equal(byName(resD, 'bank').status, 'note')
+    assert.equal(byName(resD, 'recall').status, 'note')
+    assert.equal(byName(resD, 'tuner').status, 'note')
+  } finally {
+    await new Promise((resolveClose) => server.close(resolveClose))
+  }
+}
+
 // --- package contract -------------------------------------------------------
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
 assert.equal(pkg.version, '0.18.0', 'version matches this release')
@@ -1063,6 +1840,7 @@ assert.ok(pkg.files.includes('docs'), 'docs ship with the bundle')
 assert.ok(pkg.scripts?.test, 'package exposes the test command CI runs')
 
 for (const dispose of harness.disposers) dispose()
+for (const dispose of writer.disposers) dispose()
 for (const dispose of zero.disposers) dispose()
 for (const dispose of lateHarness.disposers) dispose()
 for (const dispose of tinyHarness.disposers) dispose()

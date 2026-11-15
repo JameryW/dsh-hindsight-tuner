@@ -280,6 +280,8 @@ export async function captureFingerprint({
   }
 }
 
+let tempCounter = 0
+
 /**
  * Atomically write a fingerprint file (pretty JSON, trailing newline).
  * Creates the parent directory when needed.
@@ -291,7 +293,8 @@ export function writeFingerprint(file, fingerprint) {
   validateFingerprintObject(fingerprint, 'writeFingerprint')
   const target = resolve(file)
   mkdirSync(dirname(target), { recursive: true })
-  const temp = `${target}.tmp-${process.pid}-${Date.now().toString(36)}`
+  tempCounter += 1
+  const temp = `${target}.tmp-${process.pid}-${Date.now().toString(36)}-${tempCounter}`
   try {
     writeFileSync(temp, `${JSON.stringify(fingerprint, null, 2)}\n`, 'utf8')
     renameSync(temp, target)

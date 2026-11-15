@@ -547,13 +547,16 @@ export function formatReport(report, options = {}) {
   return lines.join('\n')
 }
 
+let tempCounter = 0
+
 /** Atomically write the JSON report. */
 export function writeReport(report, file) {
   if (!report || typeof report !== 'object') throw new TypeError('writeReport requires a report object')
   if (typeof file !== 'string' || !file.trim()) throw new TypeError('writeReport requires a file path')
   const target = resolve(file)
   mkdirSync(dirname(target), { recursive: true })
-  const temp = `${target}.tmp-${process.pid}-${Date.now().toString(36)}`
+  tempCounter += 1
+  const temp = `${target}.tmp-${process.pid}-${Date.now().toString(36)}-${tempCounter}`
   try {
     writeFileSync(temp, `${JSON.stringify(report, null, 2)}\n`, 'utf8')
     renameSync(temp, target)
