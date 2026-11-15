@@ -556,6 +556,9 @@ assert.equal(adaptiveStatus.budget.policy, 'adaptive')
 assert.equal(adaptiveStatus.budget.tier.name, 'deep')
 assert.match(adaptiveStatus.budget.tier.reason, /first recall/, 'the first turn says why it is deep')
 assert.equal(adaptiveStatus.budget.tierCounts.deep, 1)
+assert.equal(adaptiveStatus.budget.session.capped, 1, 'the session, not just the process, knows it was capped')
+assert.equal(adaptiveStatus.budget.session.dropped, 0)
+assert.match(await adaptiveTool.execute({ action: 'status' }, adaptiveExec), /capped 1 · skipped 0/, 'the recall line carries per-session caps')
 assert.ok(adaptiveStatus.budget.trimmedTokens > 0, 'trimming is accounted as saved tokens')
 assert.equal(adaptiveStatus.budget.session.tier, 'deep')
 assert.match(await adaptiveTool.execute({ action: 'status' }, adaptiveExec), /adaptive 100\/200\/400 .*last deep 400/)
@@ -607,6 +610,7 @@ assert.equal(skipStatus.budget.repeatPolicy, 'skip')
 assert.equal(skipStatus.budget.repeatSkips, 1)
 assert.ok(skipStatus.budget.savedTokens > 0, 'the skipped payload is accounted as saved')
 assert.equal(skipStatus.budget.session.lastInjected, 0, 'a skipped turn injected nothing')
+assert.equal(skipStatus.budget.session.skipped, 1, 'the session counts its own skips')
 assert.match(await skipping.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status' }, skipExec), /repeat skip ≥90% · skipped 1/)
 const changedSkip = await skipTurn('changed', long.toUpperCase().repeat(3))
 assert.equal(changedSkip.messages.length, 2, 'a different recall is still injected')
@@ -733,18 +737,18 @@ assert.equal(memoryJson.memory.injected, 10)
 
 // A journal that still fails against another origin means the running process
 // predates the config: the effective config alone cannot explain it.
-writeFileSync(process.env.HINDSIGHT_DIAG_FILE, JSON.stringify({
-  ts: now,
-  event: 'pages_failed',
-  error: 'GET http://127.0.0.1:9077/v1/default/banks/coding-agent%3A%3Afixture/pages/tree -> 404 (old process)',
-}))
+writeFileSync(process.env.HINDSIGHT_DIAG_FILE, [
+  { ts: now, event: 'pages_failed', error: 'GET http://127.0.0.1:9077/v1/default/banks/coding-agent%3A%3Afixture/pages/tree -> 404 (old process)' },
+  { ts: now, event: 'retain_failed', error: 'POST http://127.0.0.1:9077/v1/default/banks/coding-agent%3A%3Amisc/memories -> 404 (old process)' },
+].map((entry) => JSON.stringify(entry)).join('\n'))
 const stale = await tool.execute({ action: 'status' }, exec)
 assert.match(stale, /process\s+newest journal failure still targets http:\/\/127\.0\.0\.1:9077/, 'stale process is named')
 assert.match(stale, /the running DSH loaded the old config; restart it/)
 assert.match(stale, /under a minute ago/, 'the stale line says how old the evidence is')
 assert.match(stale, /newest journal failure targets http:\/\/127\.0\.0\.1:9077/, 'hint explains the stale process')
 assert.match(stale, /Restart DSH/)
-assert.match(stale, /1 failures to another server \(old process\)/, 'failures against another origin are counted, not hidden')
+assert.match(stale, /2 failures to another server \(old process\)/, 'failures against another origin are counted, not hidden')
+assert.match(stale, /banks coding-agent::fixture 1, coding-agent::misc 1/, 'mixed banks in the journal are visible, not averaged away')
 
 // Only recent evidence counts: a failure from twenty minutes ago is history,
 // not proof that this process is still misconfigured.
@@ -818,7 +822,7 @@ try {
 
 // --- package contract -------------------------------------------------------
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
-assert.equal(pkg.version, '0.12.0', 'version matches this release')
+assert.equal(pkg.version, '0.13.0', 'version matches this release')
 assert.ok(pkg.engines?.node?.includes('>=22'), 'declares a Node floor the tests can rely on')
 assert.equal(pkg.license, 'MIT')
 assert.ok(pkg.files.includes('docs'), 'docs ship with the bundle')

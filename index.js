@@ -261,7 +261,19 @@ function createGovernor(settings, stats, meter) {
   function sessionOf(sessionId) {
     let session = sessions.get(sessionId)
     if (!session) {
-      session = { turns: 0, tokens: 0, last: 0, max: 0, lastRaw: '', lastCapped: false, tier: null }
+      session = {
+        turns: 0,
+        tokens: 0,
+        last: 0,
+        max: 0,
+        lastRaw: '',
+        lastCapped: false,
+        tier: null,
+        capped: 0,
+        dropped: 0,
+        skipped: 0,
+        trimmedTokens: 0,
+      }
       remember(sessions, sessionId, session)
     }
     return session
@@ -339,6 +351,7 @@ function createGovernor(settings, stats, meter) {
       after = 0
       stats.repeatSkips += 1
       stats.savedTokens += total
+      session.skipped += 1
       record({ event: 'inject_skipped', session: sessionId, reason: 'repeat', ratio: repeatRatio, saved: total })
     } else {
       if (cap && settings.budgetPolicy === 'adaptive') {
@@ -376,6 +389,9 @@ function createGovernor(settings, stats, meter) {
         stats.capped += 1
         stats.dropped += dropped
         stats.trimmedTokens += Math.max(0, total - after)
+        session.capped += 1
+        session.dropped += dropped
+        session.trimmedTokens += Math.max(0, total - after)
         stats.last = { before: total, after, at: new Date().toISOString() }
         record({ event: 'inject_capped', session: sessionId, before: total, after, dropped, mode: meter.mode })
       }
@@ -481,6 +497,8 @@ function formatActivity(activity) {
   const parts = entries.slice(0, 5).map(([event, count]) => `${event} ${count}`)
   if (activity.authFailures > 0) parts.push(`auth failures ${activity.authFailures}`)
   if (activity.foreignFailures > 0) parts.push(`${activity.foreignFailures} failures to another server (old process)`)
+  const banks = Object.entries(activity.banks ?? {}).sort((left, right) => right[1] - left[1])
+  if (banks.length > 1) parts.push(`banks ${banks.slice(0, 2).map(([bank, count]) => `${bank} ${count}`).join(', ')}`)
   if (activity.lastInject) parts.push(`last inject ~${activity.lastInject.tokens} tok`)
   return parts.length > 0 ? `24h: ${parts.join(' · ')}` : '24h: nothing recorded'
 }
@@ -669,6 +687,10 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
             injected: session.injected ?? 0,
             lastInjected: session.lastInjected ?? session.last,
             tier: session.tier ?? null,
+            capped: session.capped,
+            dropped: session.dropped,
+            skipped: session.skipped,
+            trimmedTokens: session.trimmedTokens,
           }
         : null,
     },
@@ -753,7 +775,7 @@ function formatStatus(status) {
     ...status.configIssues.map((issue) => `  invalid  ${issue.path}=${JSON.stringify(issue.value)} (${issue.message}) — the integration falls back`),
     `  applied  ${status.applied.length ? `${status.applied.length} keys: ${status.applied.join(', ')}` : 'nothing by this plugin'}`,
     recall && recall.turns > 0
-      ? `  recall   ${recall.turns} turns · last ~${recall.last}${recall.lastInjected !== recall.last ? ` → ~${recall.lastInjected}` : ''} tok · wanted max ~${recall.max} tok · avg ~${Math.round(recall.tokens / recall.turns)} tok`
+      ? `  recall   ${recall.turns} turns · last ~${recall.last}${recall.lastInjected !== recall.last ? ` → ~${recall.lastInjected}` : ''} tok · wanted max ~${recall.max} tok · avg ~${Math.round(recall.tokens / recall.turns)} tok · capped ${recall.capped} · skipped ${recall.skipped}`
       : '  recall   no Hindsight recall observed in this session yet',
     `  budget   ${status.budget.cap ? `cap ${status.budget.cap} tok/turn` : 'cap off'} · capped ${status.budget.capped} · dropped ${status.budget.dropped} · ${formatTier(status.budget)} · ${formatRepeat(status.budget)}${formatSavings(status.budget)}`,
     `  trust    ${status.budget.verifyReminder ? 'the recall opens with a verify-before-acting reminder (counted in the cap)' : 'injected as-is (verifyReminder off)'}`,

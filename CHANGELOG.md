@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.13.0
+
+- Budget accounting is per session as well as per process: the session block in
+  `status --json` (and the `recall` line) now carries how many turns this
+  session had capped, how many messages were dropped and how many recalls were
+  skipped, plus the tokens trimming removed for it. A second concurrent session
+  no longer makes the current one look capped when it is not.
+- Activity keeps per-bank evidence: when the journal's failures addressed more
+  than one bank in the window, the activity line names the top banks with counts.
+  That surfaces a routing change or another harness sharing the install instead
+  of hiding it behind a single `lastBank`.
+
 ## 0.12.0
 
 - Operational memory metrics: `status` gains a `memory` line and `status --json`

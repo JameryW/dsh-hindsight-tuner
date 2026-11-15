@@ -80,7 +80,12 @@ cross-tool banks); this bundle owns three things it does not provide:
    DSH's), and failures whose URL points at a different origin than the
    configured server are counted separately instead of being folded into the
    auth-failure total. `/hindsight suggest` proposes a cap from the journal's own
-   p95 recall size without writing anything. `status --json` (tool:
+   p95 recall size without writing anything. When the journal has addressed more
+   than one bank, the activity line names the banks and their counts, so a
+   routing change (or a second harness sharing the install) is visible instead of
+   being averaged into one number; and the `recall` line reports the current
+   session's own `capped` / `skipped` counts, not only process-wide totals.
+   `status --json` (tool:
    `json: true`) returns the same diagnosis as data — server without the token,
    effective layers, preset diff, budget accounting, probe, activity, hint — so
    a script or a user does not have to parse the text report. Token savings are
