@@ -366,8 +366,15 @@ survives upgrades):
 - The effective config is the one the integration reads: environment
   (`HINDSIGHT_*`) first, then the file, then `harnesses.dsh`, then a matching
   `paths.<directory>` section, then the `banks.<id>` section (which may also
-  rename the bank). `status` shows `layers` whenever one of those layers changes
-  a value the preset would otherwise report as correct.
+  rename the bank). A layer replaces a key instead of merging it (only `banks`
+  and `paths` merge), so a per-harness `recallOptions` replaces the file's
+  copy rather than blending it. A directory section also matches from a linked
+  worktree when it is keyed by the main checkout. `status` shows `layers`
+  whenever one of those layers changes a value the preset would otherwise
+  report as correct.
+- Environment overrides are read the way the integration reads them: a blank
+  value is skipped, a boolean is true only for `1`/`true`/`yes`/`on`, a number
+  that does not parse is dropped, and a list is taken only when non-empty.
 - `optInOnly` / `optInPaths` is evaluated against the session directory (a
   `mapPathToBank` hit counts as opted in), so a directory that will never inject
   is reported as disabled instead of healthy.

@@ -38,7 +38,7 @@ for (const name of ['HINDSIGHT_AUTO_INJECT', 'HINDSIGHT_API_URL', 'HINDSIGHT_API
 
 const { estimateTokens, truncateToBudget, trimToBudget, allocateBudget, countTokens, percentile, FALLBACK_MARGIN, overlapRatio, repetitionRatio } = await import('../lib/tokens.js')
 const { applyTuning, revertTuning, readConfigFile, getPath, autoTuneEnabled, setAutoTune, tunerState } = await import('../lib/config-file.js')
-const { bankResolution, diagPath, effectiveConfig, effectiveServer, optedOut, projectName, summarizeActivity } = await import('../lib/diagnostics.js')
+const { bankResolution, diagPath, effectiveConfig, effectiveServer, expandBankTemplate, optedOut, projectName, summarizeActivity } = await import('../lib/diagnostics.js')
 const { record, flushJournal, journalPending, summarizeTunerJournal } = await import('../lib/log.js')
 
 // --- journal buffering ------------------------------------------------------
@@ -460,11 +460,20 @@ assert.equal(envLayers.envKeys.length, 2)
 const baseOnly = effectiveConfig({ autoInject: 'pages', harnesses: { dsh: { autoInject: 'recall' } } }, { env: { HINDSIGHT_AUTO_INJECT: 'reflect' } })
 assert.equal(baseOnly.config.autoInject, 'recall', 'cumulative precedence')
 
-const mergedRecall = effectiveConfig({
+const replacedRecall = effectiveConfig({
   recallOptions: { max_tokens: 2000, mode: 'fast' },
   harnesses: { dsh: { recallOptions: { budget: 'low' } } },
 }, { env: {} })
-assert.deepEqual(mergedRecall.config.recallOptions, { max_tokens: 2000, mode: 'fast', budget: 'low' }, 'recallOptions shallow-merges across layers')
+assert.deepEqual(
+  replacedRecall.config.recallOptions,
+  { budget: 'low' },
+  'recallOptions is replaced wholesale — upstream mergeRaw deep-merges only banks and paths',
+)
+assert.deepEqual(
+  effectiveConfig({ recallOptions: { max_tokens: 2000 } }, { env: {} }).config.recallOptions,
+  { max_tokens: 2000 },
+  'a file-only recallOptions survives untouched',
+)
 
 const envTokLayers = effectiveConfig({}, { env: { HINDSIGHT_API_TOKEN: 'env-secret' } })
 assert.equal(envTokLayers.tokenSource, 'env', 'env tokenSource reported when token comes from env')
@@ -517,10 +526,84 @@ assert.equal(
 )
 assert.equal(optedOut({ optInOnly: true, optInPaths: ['~/dsh-tilde-repo'] }, tildeSub), false, '~/ expands in optInPaths')
 
+// Environment overrides follow the integration's reader: a blank value is
+// skipped, booleans accept only 1/true/yes/on, and an unparsable number is
+// dropped rather than passed through as a string.
+const strictEnv = effectiveConfig({}, {
+  env: {
+    HINDSIGHT_AUTO_SEED: 'maybe',
+    HINDSIGHT_DISABLED: 'off',
+    HINDSIGHT_INJECT_TIMEOUT_MS: ' ',
+    HINDSIGHT_PAGE_SEARCH_LIMIT: 'abc',
+    HINDSIGHT_RETAIN_TAGS: ' , ',
+    HINDSIGHT_MAX_PARALLEL_RETAINS: '3',
+  },
+})
+assert.equal(strictEnv.config.autoSeed, false, 'a boolean override only accepts 1/true/yes/on')
+assert.equal(strictEnv.config.disabled, false, 'an unrecognised boolean is false, not a string')
+assert.deepEqual(
+  strictEnv.envKeys.sort(),
+  ['autoSeed', 'disabled', 'maxParallelRetains'],
+  'blank, unparsable, and empty-list overrides are skipped',
+)
+assert.equal(strictEnv.config.maxParallelRetains, 3, 'numeric overrides arrive as numbers')
+
+// Section overrides are stripped of the keys the integration reserves for the
+// top-level bank resolution.
+const stripped = effectiveConfig({
+  paths: { [mapRoot]: { bankId: 'coding-agent::ignored', bankIdTemplate: 'ignored-{project}', autoInject: 'recall' } },
+  banks: { 'coding-agent::repo': { bankId: 'coding-agent::ignored-too', bankIdTemplate: 'ignored', observationScopes: 'per_source' } },
+}, { env: {}, cwd: join(mapRoot, 'sub'), bank: 'coding-agent::repo' })
+assert.equal(stripped.config.bankId, undefined, 'bankId is not inherited from a section')
+assert.equal(stripped.config.bankIdTemplate, undefined, 'bankIdTemplate is not inherited from a section')
+assert.equal(stripped.config.autoInject, 'recall', 'the rest of the section still applies')
+
+// Endpoint resolution mirrors resolveConfig's whitelist and `||` fallbacks.
+const fallbackMode = effectiveServer({ serverMode: 'local', apiPort: 0, apiToken: '' }, {})
+assert.equal(fallbackMode.mode, 'cloud', 'an unknown serverMode falls back to cloud')
+assert.equal(fallbackMode.apiUrl, 'https://api.hindsight.vectorize.io')
+assert.equal(fallbackMode.tokenSet, false)
+assert.equal(fallbackMode.token, undefined, 'an empty token resolves to undefined')
+const zeroPortDaemon = effectiveServer({ serverMode: 'daemon', apiPort: 0 }, {})
+assert.equal(zeroPortDaemon.apiUrl, 'http://127.0.0.1:9077', 'apiPort 0 falls back to 9077 (upstream uses ||)')
+
+// Template resolution: the placeholders and fallbacks documented upstream.
+assert.equal(expandBankTemplate('{channel}/{user}', { env: {} }), 'default/anonymous', 'channel and user default when the env is unset')
+assert.equal(
+  expandBankTemplate('{channel}/{user}', { env: { HINDSIGHT_CHANNEL_ID: 'team', HINDSIGHT_USER_ID: 'jamer' } }),
+  'team/jamer',
+  'channel and user come from the env when set',
+)
+assert.equal(expandBankTemplate('{project}/{harness}', { cwd: join(mapRoot, 'sub') }), 'sub/dsh', 'project is the basename and harness is dsh')
+assert.equal(expandBankTemplate('{nope}', {}), 'unknown', 'an unknown placeholder substitutes unknown')
+assert.equal(bankResolution({ dynamicBankId: false }, 'repo', '/tmp/repo').bank, 'coding', 'a static bank with none configured falls back to coding')
+
 // Bare .git repository strips .git suffix for projectName.
 const bareRepo = join(scratch, 'my-bare-project.git')
 execFileSync('git', ['init', '--bare', '-q', bareRepo], { stdio: 'ignore', windowsHide: true })
 assert.deepEqual(projectName(bareRepo), { name: 'my-bare-project', source: 'git' }, 'bare repo strips .git suffix')
+
+// A `paths` section keyed by the main checkout also applies inside a linked
+// worktree, because the integration builds lookupDirectories from the git
+// common dir rather than the worktree path.
+const wtMain = join(scratch, 'wt-main')
+execFileSync('git', ['init', '-q', wtMain], { stdio: 'ignore', windowsHide: true })
+writeFileSync(join(wtMain, 'tracked.txt'), 'worktree probe\n')
+const gitAuthor = ['-c', 'user.name=Tuner Smoke', '-c', 'user.email=tuner@example.invalid']
+execFileSync('git', ['-C', wtMain, ...gitAuthor, 'add', 'tracked.txt'], { stdio: 'ignore', windowsHide: true })
+execFileSync('git', ['-C', wtMain, ...gitAuthor, 'commit', '-q', '-m', 'init'], { stdio: 'ignore', windowsHide: true })
+const wtLinked = join(scratch, 'wt-linked')
+execFileSync('git', ['-C', wtMain, 'worktree', 'add', '-q', wtLinked], { stdio: 'ignore', windowsHide: true })
+const wtConfig = { paths: { [wtMain]: { pageSearchLimit: 21 } }, mapPathToBank: { [wtMain]: 'coding-agent::worktree' } }
+const fromLinked = effectiveConfig(wtConfig, { env: {}, cwd: wtLinked })
+assert.equal(fromLinked.config.pageSearchLimit, 21, 'a paths section keyed by the main checkout applies inside a linked worktree')
+assert.deepEqual(fromLinked.sections, [`paths.${wtMain}`])
+assert.equal(bankResolution(wtConfig, 'wt-linked', wtLinked).bank, 'coding-agent::worktree', 'mapPathToBank matches the main checkout from a linked worktree')
+assert.equal(
+  effectiveConfig({ ...wtConfig, resolveWorktrees: false }, { env: {}, cwd: wtLinked }).config.pageSearchLimit,
+  undefined,
+  'resolveWorktrees: false keeps the section local',
+)
 
 // --- plugin surface: hooks, tool, command ----------------------------------
 writeFileSync(process.env.HINDSIGHT_CONFIG, JSON.stringify({
