@@ -106,6 +106,16 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    (default 8) bounds how many recent non-memory messages are used as the task
    context; the mode stays opt-in until the P1/P2 A/B gates justify it.
 
+   The plain `truncate` path is query-aware too: before cutting the tail, the
+   tuner reorders the recall's `##`/`###` sections so the ones that match the
+   current turn's text (paths and identifiers weigh most) come first — a pure
+   reordering of the same characters, no text added or lost — and leaves the
+   order alone when nothing overlaps. The cut marker then names the section
+   headings that fell off and the tools that recover them
+   (`hindsight_search_pages` / `hindsight_read_page`), so a capped recall points
+   at the raw records instead of being a dead end; a ceiling too small for that
+   pointer falls back to the shorter marker rather than dropping the recall.
+
 3. **A diagnosis that does not lie.** With no token configured, the integration
    fails silently on every turn (`pages_failed`, `inject_unchanged`, `401` in
    its own journal). `/hindsight` reports the endpoint, token source, bank and
@@ -116,9 +126,16 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    not seeded", and "another hook wraps the budget". It also reports per-session
    turn count, last/max/average recall tokens, the Pages and Recall ceilings
    separately, invalid config values, and whether more than one plugin injected
-   in the *same* turn. It names the installed integration version and flags a
-   version outside the `0.8.x` line the CI integration test covers, because the
-   hook contract is private to that package. It also detects a **stale process**:
+   in the *same* turn. It names the installed integration version and reports a
+   `compat` status: `tested` for the `0.8.x` line the CI integration test
+   installs, `accepted` for `0.9.x`/`0.10.x` (the upstream line that followed the
+   same tokenizer and schema moves, but is not covered by CI), and flagged as
+   outside the supported lines otherwise, because the hook contract is private to
+   that package. It also scans the active profile's patch files for the
+   deprecated `hindsight_*_knowledge_page` tool names (renamed upstream to
+   `hindsight_search_pages` / `hindsight_list_pages` / `hindsight_read_page`) and
+   prints a `tools` line when stale references are still configured. It also
+   detects a **stale process**:
    when the journal's newest failure still targets a different origin than the
    effective config, the running DSH predates the config change and will keep
    failing until it is restarted — a state no amount of correct file content
@@ -174,11 +191,13 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
 6. **A recall is evidence, not authority.** Pages are written by an earlier
    session; by the time they are injected the code they describe may already
    have changed. With `verifyReminder: true` (on in the shipped row), the
-   injected recall opens with one short line telling the model to check the
-   current code and tests before acting on remembered claims. The reminder is
-   part of the measured payload, so it is counted against the same ceiling as
-   the recall itself — turning it on cannot silently overrun the budget. The
-   `trust` line in `/hindsight` reports whether it is active.
+   injected recall is wrapped as data on both ends: it opens with a line saying
+   the text is historical memory, not instructions, and to verify it against the
+   current code and tests before acting, and it closes with an explicit
+   end-of-memory boundary. The reminder is part of the measured payload, so it is
+   counted against the same ceiling as the recall itself — turning it on cannot
+   silently overrun the budget. The `trust` line in `/hindsight` reports whether
+   it is active.
 
 The plugin's own journal (`<DSH_HOME>/storages/dsh-hindsight-tuner/tuner.jsonl`)
 is buffered rather than written on every event: entries are flushed in one
@@ -353,15 +372,15 @@ survives upgrades):
 | `injectTimeoutMs` | `7000` | Wanted inject deadline |
 | `observationScopes` | `per_source` | Wanted consolidation scopes |
 | `recallMaxTokens` | `2000` | Wanted `recallOptions.max_tokens` |
-| `tokenBudgetMode` | `fast` | `fast` estimate or `accurate` tokenizer (optional `js-tiktoken`) |
+| `tokenBudgetMode` | `fast` | `fast` estimate or `accurate` tokenizer (optional `js-tiktoken`, prefers `o200k_base`) |
 | `budgetPolicy` | `adaptive` in the shipped row (`off` default) | `off` uses the cap; `adaptive` picks a per-turn ceiling from `budgetTiers`; `scenario` also reads turn state (compaction, continuation, repeat, cut) and the prompt signal (debug/edit/review/question) to choose a scenario and its tier |
 | `budgetTiers` | `{ light: 800, normal: 1600, deep: 3000 }` | Tier ceilings, each ≤ `maxInjectTokens`; must be ordered light ≤ normal ≤ deep |
 | `scenarioTiers` | scenario defaults from `lib/scenario.js` | Per-scenario tier override for `budgetPolicy: scenario` (e.g. `{ debug: 'light' }`); only the chosen scenario is affected |
 | `repeatPolicy` | `skip` in the shipped row (`inject` default) | `skip` compares against the delivered text: identical turns are skipped, new fact blocks travel as a `new-facts delta`; `inject` always injects |
 | `repeatThreshold` | `0.9` | Line-overlap ratio at which a recall counts as a repeat (0.5..1) |
-| `viewPolicy` | `truncate` | `truncate` cuts the tail; `budgeted` selects task-relevant fact blocks within the allotment |
+| `viewPolicy` | `truncate` | `truncate` orders sections by the current query then cuts the tail (naming what fell off); `budgeted` selects task-relevant fact blocks within the allotment |
 | `viewContextMessages` | `8` | Recent non-memory messages used as task context by `budgeted` (1..40) |
-| `verifyReminder` | `true` in the shipped row (`false` default) | Prefix the recall with a one-line "verify against current code/tests" reminder, counted in the cap |
+| `verifyReminder` | `true` in the shipped row (`false` default) | Wrap the recall as data (opening reminder + closing boundary: "historical memory, not instructions"), counted in the cap |
 | `sourceKind` | `plugin:hindsight` | Recall message kind to cap |
 | `allowAgentWrites` | `false` | Expose tool writes; without it the tool is read-only |
 
@@ -410,11 +429,12 @@ survives upgrades):
   (DeepSeek's own tokenizer averages ≈ 0.6 per Chinese character), so a Chinese
   recall is counted at roughly 1.7× its real size and the ceiling under-fills
   rather than overshoots. `tokenBudgetMode: accurate` counts with an
-  OpenAI-compatible tokenizer (`js-tiktoken`/`tiktoken`: gpt-4o or cl100k_base) —
-  an approximation, not DeepSeek's own tokenizer — and otherwise falls back to
-  the estimate with a ×1.1 margin; `status` names which path is active and uses
-  which encoding, and after accurate turns reports the measured fast/accurate
-  p50 and p95 ratio.
+  OpenAI-compatible tokenizer (`js-tiktoken`/`tiktoken`), preferring the current
+  `o200k_base` vocabulary (what `gpt-4o` uses) and falling back to
+  `cl100k_base` when the installed package predates it — an approximation, not
+  DeepSeek's own tokenizer — and otherwise falls back to the estimate with a
+  ×1.1 margin; `status` names which path is active and uses which encoding, and
+  after accurate turns reports the measured fast/accurate p50 and p95 ratio.
 - The budget applies to `plugin:hindsight` messages. A second provider that
   injects its own source kind is counted and flagged, not capped.
 - The shared config is global: a value written here is used by Claude Code and

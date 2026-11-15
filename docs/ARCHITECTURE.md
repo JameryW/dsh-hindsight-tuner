@@ -66,13 +66,13 @@ governance bugs were fixed would have measured noise.
 | --- | --- | --- |
 | Hard per-turn cap | outermost `agent/pre-step`, re-registered on `agents` mount and `agent/created` / `agent/session-start` | shipped |
 | Budget across messages | water-filling (`allocateBudget`), no hidden floor | shipped |
-| Over-budget payload | structure-aware trim (headings/fences preserved) | shipped |
+| Over-budget payload | query-aware section order, then structure-aware trim that names the dropped sections and the tools that recover them | shipped |
 | Over-budget selection | Budgeted View: block ranking against the task text, provenance footer, measured result | shipped, opt-in |
 | Repeat safety | compare against delivered text; identical turns skipped; new blocks sent as a `new-facts delta`; history never removed | shipped |
 | Compaction safety | detect a shadowed injection from session events; re-inject the delivered text, labelled and counted | shipped |
 | Adaptive spend | per-turn tier from recent activity, with reasons in status | shipped |
-| Diagnosis | endpoint/token/bank/routing/effective config/probe/journal | shipped |
-| Evaluation | A/B harness: isolated worktrees, frozen bank, attempts-to-success, task-level statistics | shipped |
+| Diagnosis | endpoint/token/bank/routing/effective config/probe/journal, compatible integration lines, deprecated tool names | shipped |
+| Evaluation | A/B harness: isolated worktrees, frozen bank, attempts-to-success, task-level statistics, paired memory benefit/tax | shipped |
 
 Configuration stays opt-in at the plugin boundary for anything that changes
 model-visible text in a new way: the schema defaults are `budgetPolicy: off`,
@@ -83,7 +83,10 @@ measured policy is switched on (`budgetPolicy: adaptive`, `repeatPolicy: skip`,
 reminder labels existing text rather than adding a new model-visible claim; a row
 is a deliberate deployment choice, not a hidden plugin default. Budgeted View
 (`viewPolicy: budgeted`) and the scenario policy stay opt-in until their A/B gates
-are answered.
+are answered. The later additions keep the same rule: query-aware section ordering
+only reorders the recall's own characters, and the verify reminder wraps the text
+as untrusted data without adding a claim, so both are on in the shipped row; the
+recoverable truncation pointer only changes the cut marker.
 
 ## 4. Evidence gates
 
