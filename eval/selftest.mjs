@@ -38,6 +38,8 @@ import {
   ZERO_PRICES,
   assertComplete,
   costOfRow,
+  formatMemoryValue,
+  memoryValue,
   mulberry32,
   pairedComparison,
   summarizeArm,
@@ -838,6 +840,46 @@ function statsChecks() {
     equal(summary.durationP95Ms, 60, 'p95 duration')
   })
 
+  check('memoryValue splits benefit and tax against the no-memory baseline', () => {
+    const rows = [
+      makeRow({ taskId: 't1', arm: 'A0', passed: true }),
+      makeRow({ taskId: 't2', arm: 'A0', passed: true }),
+      makeRow({ taskId: 't3', arm: 'A0', passed: false }),
+      makeRow({ taskId: 't1', arm: 'A3', passed: true }),
+      makeRow({ taskId: 't2', arm: 'A3', passed: false }),
+      makeRow({ taskId: 't3', arm: 'A3', passed: true }),
+    ]
+    const value = memoryValue(rows, { baseline: 'A0' })
+    equal(value.baseline, 'A0', 'baseline')
+    equal(value.tasks, 3, 'paired tasks')
+    equal(value.arms.length, 1, 'one treatment arm')
+    const [arm] = value.arms
+    equal(arm.arm, 'A3', 'arm')
+    equal(arm.tasks, 3, 'arm tasks')
+    approx(arm.benefit, 1 / 3, 1e-4, 'benefit')
+    approx(arm.tax, 1 / 3, 1e-4, 'tax')
+    approx(arm.netValue, 0, 1e-4, 'net value')
+    deepEqual(arm.improvedTaskIds, ['t3'], 'improved tasks')
+    deepEqual(arm.regressedTaskIds, ['t2'], 'regressed tasks')
+  })
+
+  check('memoryValue auto-detects R0/A0, skips missing baselines and formats', () => {
+    const rows = [
+      makeRow({ taskId: 't1', arm: 'R0', passed: false }),
+      makeRow({ taskId: 't1', arm: 'A3', passed: true }),
+    ]
+    const auto = memoryValue(rows)
+    equal(auto.baseline, 'R0', 'auto baseline')
+    approx(auto.arms[0].benefit, 1, 1e-9, 'full benefit')
+    approx(auto.arms[0].tax, 0, 1e-9, 'no tax')
+    matches(formatMemoryValue(auto), /memory value vs R0/, 'formatted block names the baseline')
+    const none = memoryValue([makeRow({ taskId: 't1', arm: 'A3', passed: true })])
+    equal(none.baseline, null, 'no baseline found')
+    deepEqual(none.arms, [], 'no treatment arms without a baseline')
+    equal(formatMemoryValue(none), null, 'no block without a baseline')
+    throws(() => memoryValue(rows, { baseline: 'A9' }), 'not among the rows', 'unknown baseline rejected')
+  })
+
   check('assertComplete accepts a complete experiment including timeout rows', () => {
     const tasks = [
       { id: 't1', maxAttempts: 3 },
@@ -1041,6 +1083,29 @@ async function harnessChecks() {
     includes(text, 'completeness: ok', 'completeness')
     includes(text, 'att/success', 'attempts metric label')
     includes(text, 'cost/solved', 'cost metric label')
+  })
+
+  await checkAsync('evaluate and formatReport surface memory value for a no-memory baseline', async () => {
+    const matrix = await evaluate({
+      tasks: [
+        { id: 't1', prompt: 'x', maxAttempts: 1 },
+        { id: 't2', prompt: 'x', maxAttempts: 1 },
+      ],
+      arms: [
+        { name: 'A0', env: { HINDSIGHT_AUTO_INJECT: 'none' } },
+        { name: 'A3', env: { HINDSIGHT_AUTO_INJECT: 'pages' } },
+      ],
+      runTask: async ({ task, arm }) => ({ passed: arm.name === 'A3' ? true : task.id === 't1', tokens: 5 }),
+    })
+    equal(matrix.memory.baseline, 'A0', 'baseline detected from the arm matrix')
+    const [memoryArm] = matrix.memory.arms
+    equal(memoryArm.arm, 'A3', 'treatment arm')
+    approx(memoryArm.benefit, 0.5, 1e-9, 'benefit: t2 solved only with memory')
+    approx(memoryArm.tax, 0, 1e-9, 'no regression')
+    approx(memoryArm.netValue, 0.5, 1e-9, 'net value')
+    deepEqual(memoryArm.improvedTaskIds, ['t2'], 'improved task')
+    matches(formatReport(matrix), /memory value vs A0/, 'report prints the memory block')
+    equal(report.memory?.baseline ?? null, null, 'the A/B report has no no-memory baseline')
   })
 
   check('parsePrimary validates and normalizes arm names', () => {

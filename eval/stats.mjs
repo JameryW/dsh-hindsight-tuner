@@ -690,6 +690,109 @@ export function pairedComparison(rowsA, rowsB, options = {}) {
   }
 }
 
+/**
+ * Memory benefit / tax / net value against a no-memory baseline, paired by task.
+ *
+ * A heavier memory system can lose to plain retrieval: it buys solved tasks
+ * (benefit) but can also break tasks the model already solved without it (tax,
+ * negative transfer). Success rates are per task across that arm's repeats, and
+ * only tasks present in both arms are compared.
+ *
+ *   benefit  = mean over tasks of max(0, rate_memory - rate_baseline)
+ *   tax      = mean over tasks of max(0, rate_baseline - rate_memory)
+ *   netValue = benefit - tax
+ *
+ * `regressedTaskIds` names the exact tasks the memory arm made worse, which is
+ * the actionable list: inspect those before adopting the arm.
+ */
+export function memoryValue(rows, options = {}) {
+  if (!Array.isArray(rows)) throw new TypeError('memoryValue requires an array of attempt rows')
+  rows.forEach((row) => assertRowShape(row, 'memoryValue'))
+  const armNames = [...new Set(rows.map((row) => row.arm))]
+  if (armNames.length === 0) throw new TypeError('memoryValue requires at least one row')
+
+  // Defaults follow the shipped arm matrix: R0 (bare baseline) then A0 (memory
+  // disabled but the harness present). A caller can name any other arm.
+  const requested = options.baseline ?? null
+  const baseline = requested ?? (armNames.includes('R0') ? 'R0' : armNames.includes('A0') ? 'A0' : null)
+  if (baseline === null) {
+    return { baseline: null, tasks: 0, arms: [], reason: 'no no-memory baseline arm found (looked for R0/A0)' }
+  }
+  if (!armNames.includes(baseline)) {
+    throw new TypeError(`memoryValue: baseline arm ${JSON.stringify(baseline)} is not among the rows (${armNames.join(', ')})`)
+  }
+
+  const runs = groupRuns(rows)
+  const rateFor = (arm) => {
+    const byTask = new Map()
+    for (const run of runs) {
+      if (run.arm !== arm) continue
+      const entry = byTask.get(run.taskId) ?? { solved: 0, runs: 0 }
+      entry.runs += 1
+      if (run.rows.some((row) => row.passed === true)) entry.solved += 1
+      byTask.set(run.taskId, entry)
+    }
+    return new Map(
+      [...byTask].map(([taskId, entry]) => [taskId, entry.runs > 0 ? entry.solved / entry.runs : null]),
+    )
+  }
+
+  const base = rateFor(baseline)
+  const arms = []
+  for (const arm of armNames) {
+    if (arm === baseline) continue
+    const mine = rateFor(arm)
+    const improvedTaskIds = []
+    const regressedTaskIds = []
+    let benefitSum = 0
+    let taxSum = 0
+    let tasks = 0
+    for (const [taskId, baseRate] of base) {
+      const armRate = mine.get(taskId)
+      if (baseRate === null || armRate === null || armRate === undefined) continue
+      tasks += 1
+      const delta = armRate - baseRate
+      if (delta > 0) {
+        benefitSum += delta
+        improvedTaskIds.push(taskId)
+      } else if (delta < 0) {
+        taxSum += -delta
+        regressedTaskIds.push(taskId)
+      }
+    }
+    if (tasks === 0) continue
+    const benefit = round(benefitSum / tasks, 4)
+    const tax = round(taxSum / tasks, 4)
+    arms.push({
+      arm,
+      tasks,
+      benefit,
+      tax,
+      netValue: round(benefit - tax, 4),
+      improvedTaskIds: improvedTaskIds.sort(),
+      // Tasks where Tax > 0: the ones to read before trusting the arm.
+      regressedTaskIds: regressedTaskIds.sort(),
+    })
+  }
+  arms.sort((left, right) => right.netValue - left.netValue || left.arm.localeCompare(right.arm))
+  return { baseline, tasks: base.size, arms }
+}
+
+/** One compact block for `formatReport`; null when there is no baseline. */
+export function formatMemoryValue(value) {
+  if (!value || !Array.isArray(value.arms) || value.arms.length === 0) return null
+  const lines = [`memory value vs ${value.baseline} — mean per-task success-rate change (0..1)`]
+  const header = `${'arm'.padEnd(14)}${'benefit'.padStart(9)}${'tax'.padStart(9)}${'net'.padStart(9)}  regressed`
+  lines.push(header)
+  for (const arm of value.arms) {
+    const regressed = arm.regressedTaskIds.length > 0 ? arm.regressedTaskIds.join(', ') : '-'
+    lines.push(
+      `${String(arm.arm).padEnd(14)}${formatNumber(arm.benefit, 2).padStart(9)}${formatNumber(arm.tax, 2).padStart(9)}${formatNumber(arm.netValue, 2).padStart(9)}  ${regressed}`,
+    )
+  }
+  return lines.join('\n')
+}
+
 function formatNumber(value, digits = 2) {
   if (value === null || value === undefined || !Number.isFinite(Number(value))) return 'n/a'
   return Number(value).toFixed(digits)

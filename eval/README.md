@@ -168,6 +168,14 @@ first pass. Attempt rows carry `passed`, `tokens`, `usage`, `durationMs`,
 - **Tokens / tokens per success** – mean total tokens per run, and total tokens
   divided by solved runs.
 - **Duration p50/p95** – percentiles over per-run summed attempt durations.
+- **Memory Benefit / Tax / NetValue** – paired against the no-memory baseline
+  (auto-detected as `R0`, else `A0` in the shipped arm list). For every task present in both arms, `rate(t)` is the fraction
+  of that task's runs that passed; `Benefit` is the mean of `max(0, rate − rate_base)`,
+  `Tax` the mean of `max(0, rate_base − rate)`, and `NetValue = Benefit − Tax`
+  (all in success-rate units, 0..1). `regressedTaskIds` lists the tasks where the
+  arm solved less than the baseline, so a positive net value cannot hide a
+  regressed task; a metric report is emitted as `report.memory` and printed as a
+  `memory value vs <baseline>` block.
 - **Memory Precision (manual audit)** – of the memory statements actually
   injected into the agent context, the fraction that are relevant and correct
   for the task. This is a human audit: sample injected memories (e.g. 20 per

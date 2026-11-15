@@ -15,8 +15,10 @@ import { dirname, resolve } from 'node:path'
 import {
   assertComplete,
   costOfRow,
+  formatMemoryValue,
   formatStatsReport,
   normalizePrices,
+  memoryValue,
   pairedComparison,
   percentile,
   summarizeArm,
@@ -364,6 +366,14 @@ export async function evaluate(options = {}) {
     repeats,
     maxAttempts: maxAttemptsDefault,
   })
+  // Paired memory value against the no-memory baseline, when the matrix has
+  // one. Rows may be empty on a dry run; the helper handles that.
+  let memory = null
+  try {
+    memory = rows.length > 0 ? memoryValue(rows, { baseline: options.memoryBaseline ?? null }) : null
+  } catch {
+    memory = null
+  }
 
   return {
     generatedAt,
@@ -374,6 +384,7 @@ export async function evaluate(options = {}) {
     runs,
     metrics,
     completeness,
+    memory,
     primary: primarySpec,
     prices: priceTable,
   }
@@ -505,6 +516,12 @@ export function formatReport(report, options = {}) {
         )
       }
     }
+  }
+
+  const memoryBlock = formatMemoryValue(report.memory)
+  if (memoryBlock) {
+    lines.push('')
+    lines.push(memoryBlock)
   }
 
   const failedRuns = report.runs.filter((run) => !run.passed)
