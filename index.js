@@ -46,6 +46,7 @@ import {
   installedBundles,
   optedOut,
   probeServer,
+  profileRoots,
   projectName,
   summarizeActivity,
 } from './lib/diagnostics.js'
@@ -246,15 +247,15 @@ function integrationManifest(path) {
   }
 }
 
+/**
+ * The installed Hindsight integration, if this profile ships it. Profile roots
+ * come from `profileRoots()`, which reads the environment and — because the
+ * desktop host exports none of those variables to plugin code — the host's
+ * `argv` and the profiles under DSH_HOME as well.
+ */
 function findIntegration() {
-  const roots = new Set()
-  if (process.env.DSH_PROFILE_DIR) roots.add(process.env.DSH_PROFILE_DIR)
-  if (process.env.DSH_HOME && process.env.DSH_PROFILE) {
-    roots.add(join(process.env.DSH_HOME, 'profiles', process.env.DSH_PROFILE))
-  }
-  if (process.env.DSH_INSTALL_DIR) roots.add(process.env.DSH_INSTALL_DIR)
-
-  const key = [...roots].join('|')
+  const roots = profileRoots()
+  const key = roots.join('|')
   if (integrationMemo?.key === key) return integrationMemo.value
 
   let value = { installed: false, path: null, version: null }
@@ -1116,6 +1117,7 @@ function hintFor(status) {
 async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessionId = null, { skipProbe = false } = {}) {
   const file = readConfigFile()
   const integration = findIntegration()
+  const bundles = installedBundles()
   const project = projectName(cwd)
   const baseLayers = effectiveConfig(file.config, { cwd })
   const resolution = bankResolution(baseLayers.config, project.name, cwd)
@@ -1164,7 +1166,9 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
     bankSource: resolution.source,
     bankBase: resolution.base ?? null,
     project,
-    bundles: installedBundles().bundles,
+    bundles: bundles.bundles,
+    bundleProfile: bundles.profile,
+    bundleRoots: bundles.roots,
     sources: { ...stats.sources },
     stackTurns: stats.stackTurns,
     lastStack: stats.lastStack,
@@ -1337,7 +1341,7 @@ function formatStatus(status) {
     `  bank     ${status.bank} (${status.bankSource})${status.bankBase ? ` renamed from ${status.bankBase}` : ''}${status.project.source === 'git' ? '' : '  (named from the directory; not shared with a git worktree bank)'}`,
     status.bundles.length > 0
       ? `  bundles  ${status.bundles.map((bundle) => `${bundle.name} ${bundle.version}${bundle.enabled ? '' : ' (disabled)'}`).join(' · ')}`
-      : '  bundles  no memory bundles detected in this profile',
+      : `  bundles  no memory bundles detected in this profile${status.bundleProfile ? '' : ` (no profile found; looked in ${status.bundleRoots.length > 0 ? status.bundleRoots.join(', ') : 'no profile path'})`}`,
     ...(status.compat ? [`  compat   ${formatCompat(status.compat)}`] : []),
     `  config   ${status.file.path} (${describeKind(status.file.kind)}${status.file.error ? `: ${status.file.error}` : ''})`,
     `  auto     ${status.autoTune ? 'tune on the first session of a new process' : 'off (persisted; /hindsight enable turns it back on)'}`,

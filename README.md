@@ -368,8 +368,12 @@ survives upgrades):
 ## Limits
 
 - It needs `@vectorize-io/hindsight-coding-agents` for memory itself. The plugin
-  checks whether that package resolves from the profile; when it does not,
-  `status` says `memory layer not installed` and changes nothing on the model path.
+  locates the profile from `DSH_PROFILE_DIR`/`DSH_PROFILE` when the launcher sets
+  them, then from the desktop host's own `argv` (plugin code runs in the host
+  process, which receives the active profile as a positional argument instead of
+  the shell facts), and finally from the profiles under `DSH_HOME` when neither
+  names one. When the package does not resolve there, `status` says
+  `memory layer not installed` and changes nothing on the model path.
 - The bank line uses the session's working directory, so it names the same
   `coding-agent::{gitProject}` bank the integration uses — including the
   directory-name fallback when the directory is not a git work tree. An explicit

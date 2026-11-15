@@ -38,7 +38,7 @@ for (const name of ['HINDSIGHT_AUTO_INJECT', 'HINDSIGHT_API_URL', 'HINDSIGHT_API
 
 const { estimateTokens, truncateToBudget, trimToBudget, allocateBudget, countTokens, percentile, FALLBACK_MARGIN, overlapRatio, repetitionRatio } = await import('../lib/tokens.js')
 const { applyTuning, revertTuning, readConfigFile, getPath, autoTuneEnabled, setAutoTune, sweepStaleTemps, tunerState } = await import('../lib/config-file.js')
-const { bankResolution, diagPath, effectiveConfig, effectiveServer, expandBankTemplate, optedOut, projectName, summarizeActivity } = await import('../lib/diagnostics.js')
+const { bankResolution, diagPath, effectiveConfig, effectiveServer, expandBankTemplate, installedBundles, isProfileRoot, optedOut, profileRoots, projectName, summarizeActivity } = await import('../lib/diagnostics.js')
 const { record, flushJournal, journalPending, summarizeTunerJournal } = await import('../lib/log.js')
 
 // --- journal buffering ------------------------------------------------------
@@ -1732,6 +1732,67 @@ try {
   assert.match(await tool.execute({ action: 'probe' }, exec), /not installed/)
 } finally {
   process.env.DSH_PROFILE_DIR = savedProfileDir
+}
+
+// --- profile discovery: desktop host argv, and the DSH_HOME fallback --------
+{
+  // The desktop host runs plugin code in its own process and passes the active
+  // profile as a positional argument instead of exporting DSH_PROFILE_DIR; a
+  // directory is only a profile when its package.json declares dsh.profile.
+  const argvProfile = join(scratch, 'argv-profile')
+  const argvIntegration = join(argvProfile, 'node_modules', '@vectorize-io', 'hindsight-coding-agents')
+  mkdirSync(argvIntegration, { recursive: true })
+  writeFileSync(join(argvIntegration, 'package.json'), '{"name":"@vectorize-io/hindsight-coding-agents","version":"0.8.7"}')
+  writeFileSync(join(argvProfile, 'package.json'), JSON.stringify({
+    name: 'dsh-profile-argv',
+    dependencies: { '@vectorize-io/hindsight-coding-agents': '0.8.7' },
+    dsh: { profile: { bundles: ['@vectorize-io/hindsight-coding-agents', '@jameryw/dsh-hindsight-tuner'] } },
+  }, null, 2))
+  const decoy = join(scratch, 'decoy-bundle-root')
+  mkdirSync(decoy, { recursive: true })
+  writeFileSync(join(decoy, 'package.json'), '{"name":"@deepseek-ai/dsh"}')
+
+  assert.equal(isProfileRoot(argvProfile), true)
+  assert.equal(isProfileRoot(decoy), false, 'a bundle root is not a profile')
+  assert.deepEqual(profileRoots({}, ['node', decoy, argvProfile]), [resolve(argvProfile)], 'argv names the profile, the decoy is skipped')
+  const discovered = installedBundles({}, ['node', decoy, argvProfile])
+  assert.equal(discovered.profile, resolve(argvProfile))
+  assert.equal(discovered.bundles[0]?.name, '@vectorize-io/hindsight-coding-agents')
+  assert.equal(discovered.bundles[0]?.version, '0.8.7')
+
+  // Neither env nor argv naming a profile: the profile that lists this plugin
+  // wins over a sibling, so a status cannot report another profile's bundles.
+  const fallbackHome = join(scratch, 'fallback-home')
+  const sibling = join(fallbackHome, 'profiles', 'sibling')
+  const loader = join(fallbackHome, 'profiles', 'loader')
+  for (const directory of [sibling, loader]) mkdirSync(directory, { recursive: true })
+  writeFileSync(join(sibling, 'package.json'), JSON.stringify({ name: 'dsh-profile-sibling', dsh: { profile: { bundles: [] } } }))
+  writeFileSync(join(loader, 'package.json'), JSON.stringify({ name: 'dsh-profile-loader', dsh: { profile: { bundles: ['@jameryw/dsh-hindsight-tuner'] } } }))
+  assert.deepEqual(profileRoots({ DSH_HOME: fallbackHome }, ['node']), [resolve(loader)], 'the profile that loads the tuner wins')
+
+  // Status itself must find the integration through argv when the environment
+  // does not name a profile — the live desktop host's shape.
+  const savedProfile = process.env.DSH_PROFILE_DIR
+  const savedHome = process.env.DSH_HOME
+  const savedArgv = process.argv.slice()
+  const realStatusFetch = globalThis.fetch
+  globalThis.fetch = async () => {
+    throw new Error('offline probe')
+  }
+  delete process.env.DSH_PROFILE_DIR
+  process.env.DSH_HOME = join(scratch, 'empty-home')
+  process.argv.push(argvProfile)
+  try {
+    const discoveredStatus = await tool.execute({ action: 'status' }, exec)
+    assert.doesNotMatch(discoveredStatus, /memory layer not installed/)
+    assert.match(discoveredStatus, /bundles\s+@vectorize-io\/hindsight-coding-agents 0\.8\.7/)
+  } finally {
+    process.argv.length = 0
+    process.argv.push(...savedArgv)
+    process.env.DSH_PROFILE_DIR = savedProfile
+    process.env.DSH_HOME = savedHome
+    globalThis.fetch = realStatusFetch
+  }
 }
 
 // --- DSH 0.2.x lifecycle, deferred agents mount, wrapped-hook status, & verify-live ---
