@@ -792,8 +792,15 @@ function formatStatus(status) {
     lines.push('  order    outermost hook installed (prepend); confirmed on the first recall')
   }
 
-  const pages = status.effective.pageSearchLimit
-  lines.push(`  pages    pageSearchLimit=${pages ?? 'unset'}${status.effective.recallMaxTokens != null ? ` · recall max_tokens=${status.effective.recallMaxTokens}` : ''}  (two separate ceilings)`)
+  const pageLimit = status.effective.pageSearchLimit
+  const observedPages = status.activity?.pages
+  const pageParts = [`pageSearchLimit=${pageLimit ?? 'unset'}`]
+  if (status.effective.recallMaxTokens != null) pageParts.push(`recall max_tokens=${status.effective.recallMaxTokens}`)
+  if (observedPages?.events > 0) {
+    pageParts.push(`journal ${observedPages.events} injections, max ${observedPages.max} pages`)
+    if (pageLimit != null && observedPages.max >= pageLimit) pageParts.push('the limit binds')
+  }
+  lines.push(`  pages    ${pageParts.join(' · ')}  (two separate ceilings)`)
 
   const sources = Object.entries(status.sources ?? {})
   lines.push(sources.length > 0
@@ -1054,6 +1061,13 @@ export function apply(ctx, rawConfig) {
     }
     lines.push(`  cap      maxInjectTokens: ${cap}  (1.25× the p95, clamped 512..8000; current ${status.budget.cap})`)
     lines.push(`  recall   recallOptions.max_tokens: ${recall}  (Pages and Recall are separate ceilings; do not make recall larger than the cap by accident)`)
+    const observedPages = status.activity?.pages
+    if (observedPages?.events > 0) {
+      const limit = status.effective.pageSearchLimit
+      const wanted = Math.max(3, Math.min(20, observedPages.max + 2))
+      const state = limit == null ? 'unset' : observedPages.max >= limit ? 'the limit binds' : 'not binding'
+      lines.push(`  pages    pageSearchLimit: ${wanted}  (journal max ${observedPages.max} pages per injection; currently ${limit ?? 'unset'}, ${state})`)
+    }
     if (p50 && p95) {
       const light = Math.min(p95, Math.max(128, Math.ceil(p50 * 0.9)))
       const normal = Math.min(p95, Math.max(light, Math.ceil((p50 + p95) / 2)))

@@ -136,12 +136,74 @@ and how many server calls failed (`pages_failed` + `retain_failed` +
 delivered and whether the budget is doing anything — not whether it *helped*.
 
 Task-success measurement cannot live here honestly: the plugin never sees whether
-a task passed, so a self-reported "Memory Precision@K" would be a guess. A real
-A/B of memory policies needs an external harness that runs the same task set
-under arms (no memory / pages / recall / tuned tiers) and scores the outcomes,
-then compares Task Success Rate, stale-memory errors, tokens per successful task
-and p95 recall latency. The plugin makes that harness possible by exposing the
-budget, freshness and savings as JSON; it does not pretend to be the harness.
+a task passed, so a self-reported "Memory Precision@K" would be a guess. That is
+why the repository ships the external harness described next.
+
+The Pages budget is reported separately from the Recall budget, because they are
+different knobs: `recallOptions.max_tokens` cuts a synthesis, while
+`pageSearchLimit` counts pages. When the journal contains `inject_pages`
+entries, `status` shows `journal N injections, max M pages` and marks
+`the limit binds` when the configured `pageSearchLimit` equals the observed
+maximum; `suggest` then proposes a limit from the observed maximum instead of a
+round number.
+
+## A/B evaluation
+
+`eval/` is a small, dependency-free harness that runs the same task set once per
+arm and scores the outcome. It is not part of the plugin's hot path and it never
+calls a model by itself — you point it at an agent command.
+
+```sh
+# exercise the whole pipeline without credentials: fake runner, real report
+node eval/ab.mjs --tasks eval/tasks.example.json --dry-run
+
+# a real run: one isolated checkout per task, agent on stdin, check command as truth
+node eval/ab.mjs --tasks eval/tasks.json --report eval/report.json \
+  --agent-command '["claude","-p","--output-format","json"]' --repeats 3
+```
+
+A task is `{ id, prompt, cwd, check }`:
+
+```json
+{
+  "id": "fix-failing-test",
+  "prompt": "Make `node --test` pass without weakening the assertions.",
+  "cwd": "C:/scratch/memory-eval/fix-failing-test",
+  "check": "node --test"
+}
+```
+
+The agent receives `prompt` on stdin; `check` is run in the same directory after
+the agent exits, and its exit code decides success. Each arm is a name plus
+environment overrides, so arms stay data: the defaults are `no-memory`
+(`HINDSIGHT_AUTO_INJECT=none`), `pages`, and `recall`. Pass `--arms` to define
+your own (for example a tuned-tier arm that also sets `HINDSIGHT_PAGE_SEARCH_LIMIT`).
+
+`eval/report.json` contains every run row plus per-arm metrics: success rate
+(passed / runs), mean tokens and tokens per success when the agent reports usage,
+and p50/p95 wall time. Failed rows stay listed individually. The headline
+remains Task Success Rate — the other columns explain its cost.
+
+The check command is the limit of this design: tasks are only measurable when
+"I did it correctly" is executable (`node --test`, a linter, a golden file). A
+task whose success is a judgement call needs its own rubric, which this harness
+does not invent.
+
+## Verifying a restart
+
+The running DSH process keeps the configuration it loaded; editing the file does
+not reach it. `scripts/verify-live.mjs` checks the machine from the outside:
+
+```sh
+node scripts/verify-live.mjs          # PASS/NOTE/FAIL lines, exit 1 on failure
+node scripts/verify-live.mjs --json   # same result as JSON
+```
+
+It resolves the effective server and bank for the current directory, calls
+`/health` and the bank's page tree, then reads the integration journal to catch
+the fingerprint of a stale process (recent failures against an origin that is
+not the configured one). An unseeded bank is reported as NOTE rather than FAIL,
+because Hindsight creates it on the first real session.
 
 ## Install
 
@@ -264,6 +326,8 @@ survives upgrades):
 ```sh
 node test/smoke.mjs        # hermetic unit/behaviour tests
 node test/integration.mjs  # real @vectorize-io/hindsight-coding-agents hooks
+node eval/selftest.mjs     # A/B harness orchestration, with a fake runner
+node scripts/verify-live.mjs  # this machine, after a restart (not part of npm test)
 ```
 
 The smoke test is hermetic: it points `HINDSIGHT_CONFIG` and `DSH_HOME` at a

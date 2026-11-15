@@ -720,14 +720,20 @@ assert.match(suggestion, /Pages and Recall are separate ceilings/)
 
 // The suggestion is fitted to the journal's own injections, not a fixed guess.
 const now = new Date().toISOString()
-const injectionJournal = [1200, 1800, 2400, 3000, 3600, 4200, 4800, 5400, 6000, 6600]
-  .map((chars) => JSON.stringify({ ts: now, event: 'inject_ok', chars }))
+const injectionJournal = [
+  ...[1200, 1800, 2400, 3000, 3600, 4200, 4800, 5400, 6000, 6600].map((chars) => ({ ts: now, event: 'inject_ok', chars })),
+  ...[3, 5, 4].map((count) => ({ ts: now, event: 'inject_pages', count })),
+]
+  .map((entry) => JSON.stringify(entry))
   .join('\n')
 writeFileSync(process.env.HINDSIGHT_DIAG_FILE, injectionJournal)
 const measured = await tool.execute({ action: 'suggest' }, exec)
 assert.match(measured, /observed recall ~\d+ tok p50 · ~\d+ tok p95 \(10 injections, char-based estimate\)/)
 assert.match(measured, /maxInjectTokens: 2475/, 'cap follows the p95, clamped')
 assert.match(measured, /tiers\s+light \d+ \/ normal \d+ \/ deep 2475/, 'tiers follow the same distribution')
+assert.match(measured, /pages\s+pageSearchLimit: 7\s+\(journal max 5 pages per injection; currently unset, unset\)/, 'the Pages budget is suggested from the journal, not guessed')
+const pagesStatus = await tool.execute({ action: 'status' }, exec)
+assert.match(pagesStatus, /pages\s+pageSearchLimit=unset · recall max_tokens=2500 · journal 3 injections, max 5 pages/, 'status separates the Pages and Recall budgets')
 assert.match(measured, /recallOptions\.max_tokens: 2000/)
 const memoryStatus = await tool.execute({ action: 'status' }, exec)
 assert.match(memoryStatus, /memory\s+24h: 100% of recalls were fresh \(10 injected \/ 0 unchanged\) · 0 server errors/, 'the memory line reports observable freshness, not a task-success claim')
@@ -822,7 +828,7 @@ try {
 
 // --- package contract -------------------------------------------------------
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
-assert.equal(pkg.version, '0.13.0', 'version matches this release')
+assert.equal(pkg.version, '0.14.0', 'version matches this release')
 assert.ok(pkg.engines?.node?.includes('>=22'), 'declares a Node floor the tests can rely on')
 assert.equal(pkg.license, 'MIT')
 assert.ok(pkg.files.includes('docs'), 'docs ship with the bundle')

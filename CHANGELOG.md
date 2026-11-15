@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.14.0
+
+- Pages and Recall are reported as the two separate budgets they are: `status`
+  adds the observed journal traffic (`journal N injections, max M pages`) and
+  says `the limit binds` when the configured `pageSearchLimit` is what capped
+  the injections. `suggest` derives a `pageSearchLimit` from the observed
+  maximum instead of proposing a round number, and leaves the value alone when
+  the journal has no `inject_pages` evidence.
+- External A/B harness (`eval/`): `eval/harness.mjs` runs a task set once per
+  arm, keeps every run row and reports Task Success Rate, tokens per success
+  and p50/p95 wall time; `eval/ab.mjs` drives a real agent command with a
+  verifiable check as ground truth, and `--dry-run` exercises the pipeline with
+  a fake runner so CI needs no credentials. `eval/selftest.mjs` is part of
+  `npm test`.
+- Post-restart verification (`scripts/verify-live.mjs`): resolves the effective
+  server and bank for the current directory, calls `/health` and the bank's page
+  tree, and reads the integration journal to distinguish a stale process
+  (recent failures against another origin) from a healthy one. An unseeded bank
+  is a NOTE, not a failure. `npm run verify` runs it.
+
 ## 0.13.0
 
 - Budget accounting is per session as well as per process: the session block in

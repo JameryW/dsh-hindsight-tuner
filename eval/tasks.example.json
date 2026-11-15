@@ -1,0 +1,16 @@
+{
+  "tasks": [
+    {
+      "id": "fix-failing-test",
+      "prompt": "The test suite in this repository fails. Find the cause and make `node --test` pass without weakening the assertions.",
+      "cwd": "C:/scratch/memory-eval/fix-failing-test",
+      "check": "node --test"
+    },
+    {
+      "id": "implement-export",
+      "prompt": "Implement the `toCsv(rows)` export described in README.md and make `node --test` pass.",
+      "cwd": "C:/scratch/memory-eval/implement-export",
+      "check": "node --test"
+    }
+  ]
+}

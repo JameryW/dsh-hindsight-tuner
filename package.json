@@ -1,6 +1,6 @@
 {
   "name": "@jameryw/dsh-hindsight-tuner",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "private": true,
   "type": "module",
   "description": "Token-budgeted tuning and diagnostics for Hindsight project memory in DeepSeek Harness",
@@ -9,7 +9,9 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node test/smoke.mjs && node test/integration.mjs"
+    "test": "node test/smoke.mjs && node test/integration.mjs && node eval/selftest.mjs",
+    "eval": "node eval/ab.mjs",
+    "verify": "node scripts/verify-live.mjs"
   },
   "exports": {
     ".": "./index.js",
@@ -26,7 +28,9 @@
     "docs",
     "icon.svg",
     "README.md",
-    "test"
+    "test",
+    "eval",
+    "scripts"
   ],
   "dsh": {
     "bundle": {
