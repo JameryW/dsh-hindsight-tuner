@@ -67,8 +67,17 @@ assert.match(fallback.reason, /no task signal/)
 // --- overrides ---------------------------------------------------------------
 const overridden = chooseScenario({ promptText: 'Fix the failing test — error', overrides: { debug: 'light' } })
 assert.equal(overridden.tier, 'light', 'a validated override replaces the default tier')
+// Passing an override for a scenario does not select that scenario, and it must
+// not rewrite the shared default table: selection is still driven by the turn
+// state and prompt, so snapshot the table around the unrelated overrides.
+const defaultsBefore = { ...DEFAULT_SCENARIO_TIERS }
 const already = chooseScenario({ overrides: { debug: 'normal' } })
-assert.equal(already.tier, 'normal', 'the default table is untouched by an unrelated override')
+assert.equal(already.scenario, 'default', 'an override for a scenario does not select it')
+assert.equal(already.tier, 'normal')
+const unrelated = chooseScenario({ promptText: 'How does this work?', overrides: { debug: 'deep' } })
+assert.equal(unrelated.scenario, 'question', 'an override for another scenario leaves classification alone')
+assert.equal(unrelated.tier, 'light', 'and leaves that scenario on its own default tier')
+assert.deepEqual(DEFAULT_SCENARIO_TIERS, defaultsBefore, 'an override lookup never rewrites the shared default table')
 const junk = chooseScenario({ promptText: 'Fix the failing test — error', overrides: { debug: 'huge' } })
 assert.equal(junk.tier, 'normal', 'an invalid override is ignored here (validation reports it)')
 const repeatOverride = chooseScenario({ repetition: 0.9, overrides: { repeat: 'deep' } })

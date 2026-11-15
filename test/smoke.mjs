@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync, existsSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+
+import { waitFor } from './wait.mjs'
 
 const root = resolve(import.meta.dirname, '..')
 const scratch = mkdtempSync(join(tmpdir(), 'dsh-hindsight-tuner-'))
@@ -190,6 +192,16 @@ for (const emojiCap of [10, 15, 25, 41]) {
   assert.equal(emojiCut.isWellFormed(), true, `emoji cut at cap ${emojiCap} preserves valid surrogate pairs`)
 }
 
+// A fallback cut that lands inside an unterminated fence closes the fence: the
+// marker must never end up rendered as the last line of a code block.
+const openFenceText = `\`\`\`js\r\n${Array.from({ length: 40 }, (_, index) => `const cut${index} = ${index} // long enough to cut through`).join('\r\n')}\r\n\`\`\`\r\n`
+for (const fenceFallbackCap of [8, 12, 20]) {
+  const fenceFallbackCut = truncateToBudget(openFenceText, fenceFallbackCap, 'M')
+  const fenceLines = fenceFallbackCut.split('\n').filter((line) => /^\s*(`{3,}|~{3,})\s*$/.test(line))
+  assert.equal(fenceLines.length % 2, 0, `fence fallback at cap ${fenceFallbackCap} leaves no open fence`)
+  assert.ok(estimateTokens(fenceFallbackCut) <= fenceFallbackCap, `fence fallback at cap ${fenceFallbackCap} holds the cap`)
+}
+
 // Repetition ratio superset asymmetry, CJK weight, and bare fences.
 const supersetBase = ['- line one is long enough', '- line two is long enough', '- line three is long enough'].join('\n')
 assert.ok(repetitionRatio(supersetBase, `${supersetBase}\n- brand new fourth line here`) < 1, 'superset scores below 1')
@@ -290,6 +302,15 @@ assert.deepEqual(
   [],
   'valid expanded config rules pass cleanly',
 )
+assert.deepEqual(
+  validateConfig({
+    surveyRefreshCommits: 0,
+    injectTimeoutMs: 200000,
+    recallOptions: { max_tokens: 100000 },
+  }),
+  [],
+  'values the integration honours are not reported as invalid (0 commits, long timeout, large recall)',
+)
 
 // --- shared config tuning ---------------------------------------------------
 const preset = [
@@ -314,6 +335,18 @@ assert.equal(written.kind, 'ok')
 assert.equal(written.config.autoInject, 'pages')
 assert.equal(written.config.injectTimeoutMs, 7000)
 assert.equal(written.config.recallOptions.max_tokens, 3000)
+
+// A lock naming a dead process is reclaimed instead of blocking every later
+// write, and a lock naming a live one is waited for rather than deleted.
+const configLock = `${process.env.HINDSIGHT_CONFIG}.lock`
+writeFileSync(configLock, '999999:dead-owner')
+const afterDeadLock = applyTuning({ preset: [['injectTimeoutMs', 7000]] })
+assert.equal(afterDeadLock.changed.length, 0, 'a dead-owner lock is reclaimed and the write still runs')
+assert.equal(existsSync(configLock), false, 'the reclaimed lock is removed after the write')
+
+writeFileSync(configLock, `${process.pid}:held-by-this-process`)
+assert.throws(() => applyTuning({ preset }), /another process is editing/, 'a live lock is not deleted')
+unlinkSync(configLock)
 
 // Existing user values win unless overwrite is requested.
 const userFile = JSON.parse(JSON.stringify(written.config))
@@ -548,13 +581,19 @@ apply(harness.ctx, { autoTune: true, maxInjectTokens: 600, recallMaxTokens: 2500
 
 const tool = harness.tools.find((candidate) => candidate.name === 'hindsight_tuner')
 assert.ok(tool, 'registers the tool')
+// The schema is the permission boundary: a read-only profile must not offer a
+// mutating action at all, or a schema-validating host would pass the model's
+// request through. README documents this exact list, so pin it.
+assert.deepEqual(tool.parameters.properties.action.enum, ['status', 'probe', 'suggest'], 'the default tool schema only offers read actions')
 assert.ok(harness.commands.some((command) => command.name === 'hindsight'), 'registers the command')
 assert.ok(harness.handlers.get('agent/pre-step')[0].prepend, 'registers as an outermost hook')
 
 const sessionStart = harness.handlers.get('agent/session-start')
 assert.equal(sessionStart.length, 1)
+// Auto-tune fills the config inside the handler; poll the file instead of
+// sleeping, so the test follows a future async write without guessing a delay.
 sessionStart[0].handler({ agent: { session: { header: { origin: 'main' } } } })
-await new Promise((done) => setTimeout(done, 100))
+await waitFor(() => readConfigFile().config.autoInject === 'pages', { label: 'session-start auto-tune write' })
 
 const tuned = readConfigFile()
 assert.equal(tuned.config.autoInject, 'pages', 'session start fills missing keys')
@@ -579,7 +618,6 @@ lateHarness.ctx.on('agent/pre-step', async (payload, next) => {
   return { ...decision, messages: [...decision.messages, { ...recallMessage, id: 'late-recall' }] }
 }, { prepend: true })
 lateHarness.handlers.get('agent/session-start')[0].handler({ agent: { session: { header: { origin: 'main' } } } })
-await new Promise((done) => setTimeout(done, 50))
 
 const wrapped = await waterfall(lateHarness, 'agent/pre-step', { agent: { session: { header: { id: 'ordered' } } } }, async () => ({
   kind: 'enter',
@@ -1007,6 +1045,77 @@ const repeatStatus = await scenarioStatus()
 assert.equal(repeatStatus.budget.lastScenario.scenario, 'repeat')
 assert.equal(repeatStatus.budget.tier.name, 'light')
 
+// after-cut is a one-turn rule, not a permanent downgrade: the adaptive policy
+// hides the cut from the next turn with a cooldown, and the scenario policy must
+// do the same. A recall that is always larger than the light ceiling would
+// otherwise keep lastCapped true and pin the session at light forever.
+const cutHarness = makeHarness()
+apply(cutHarness.ctx, {
+  autoTune: false,
+  maxInjectTokens: 500,
+  budgetPolicy: 'scenario',
+  budgetTiers: { light: 100, normal: 200, deep: 400 },
+})
+const cutTurn = (messages, extra = {}) => waterfall(
+  cutHarness,
+  'agent/pre-step',
+  { agent: { session: { header: { id: 'scenario-cut' } } }, ...extra },
+  async () => ({ kind: 'enter', messages }),
+)
+const cutStatus = async () => JSON.parse(await cutHarness.tools
+  .find((candidate) => candidate.name === 'hindsight_tuner')
+  .execute({ action: 'status', json: true }, { agent: { session: { header: { id: 'scenario-cut', cwd: process.cwd() } } } }))
+// Each turn gets its own lines, so the ratio stays at 0% and only the cut state
+// decides the tier (verbatim shared lines would read as a repeat instead).
+const cutRecall = (tag) => adaptiveRecall(`cut-${tag}`, Array.from({ length: 60 }, (_, i) => `- ${tag} note ${i}: ${tag} owns this line and no other turn repeats it`).join('\n'))
+
+// Turn 1 is deep but the recall is larger, so it is cut and the session is marked.
+await cutTurn([human, cutRecall('alpha')])
+const cutFirstStatus = await cutStatus()
+assert.equal(cutFirstStatus.budget.lastScenario.scenario, 'first-turn')
+assert.equal(cutFirstStatus.budget.tier.name, 'deep')
+
+// Turn 2: the debugging prompt would normally pick normal, but the previous recall
+// had to be cut, and after-cut ranks above the task signal.
+const afterCut = await cutTurn([debugPrompt, cutRecall('beta')], { step: 1 })
+assert.ok(estimateTokens(injectedText(afterCut)) <= 100, 'after-cut drops the next recall to the light ceiling')
+assert.equal((await cutStatus()).budget.lastScenario.scenario, 'after-cut')
+
+// Turn 3: the cooldown expired, so the task signal decides again.
+const recovered = await cutTurn([debugPrompt, cutRecall('gamma')], { step: 1 })
+const recoveredTokens = estimateTokens(injectedText(recovered))
+assert.ok(recoveredTokens > 100 && recoveredTokens <= 200, 'a single cut does not pin the session to the light ceiling')
+const recoveredStatus = await cutStatus()
+assert.equal(recoveredStatus.budget.lastScenario.scenario, 'debug', 'the prompt signal is used again after the cooldown')
+assert.equal(recoveredStatus.budget.tier.name, 'normal')
+
+// A bug inside the governor must not fail the host turn: the decision passes
+// through unchanged and the killed pre-step is counted and shown in status.
+const guardHarness = makeHarness()
+apply(guardHarness.ctx, { autoTune: false, maxInjectTokens: 500 })
+const guardExec = { agent: { session: { header: { id: 'guard', cwd: process.cwd() } } } }
+const guardStatus = (json = true) => guardHarness.tools
+  .find((candidate) => candidate.name === 'hindsight_tuner')
+  .execute({ action: 'status', json }, guardExec)
+// Iterating the messages throws: that is what an unexpected governor bug looks
+// like from onPreStep's point of view, and it is the one error the guard exists for.
+const poisoned = new Proxy([human, adaptiveRecall('guard', conventions)], {
+  get(target, key, receiver) {
+    if (key === Symbol.iterator) throw new Error('simulated governor bug')
+    return Reflect.get(target, key, receiver)
+  },
+})
+const guardResult = await waterfall(
+  guardHarness,
+  'agent/pre-step',
+  { agent: { session: { header: { id: 'guard' } } } },
+  async () => ({ kind: 'enter', messages: poisoned }),
+)
+assert.equal(guardResult.messages, poisoned, 'a governor bug passes the host decision through unchanged')
+const guardJson = JSON.parse(await guardStatus())
+assert.equal(guardJson.budget.prestepErrors, 1, 'the killed pre-step is counted')
+assert.match(await guardStatus(false), /WARNING: 1 pre-step\(s\) failed inside the plugin/, 'status warns about the pass-through')
+
 // Overrides are reported and applied to exactly one scenario.
 const overrideHarness = makeHarness()
 apply(overrideHarness.ctx, {
@@ -1023,6 +1132,21 @@ assert.equal(overrideStatus.budget.scenarioTiers.debug, 'light')
 assert.equal(overrideStatus.budget.tier.name, 'light', 'the override replaces the default tier')
 assert.match(await overrideHarness.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status' }, scenarioExec), /overrides debug=light/)
 for (const dispose of overrideHarness.disposers) dispose()
+
+// Spelling is normalized: a hand-written mixed-case override is applied instead of
+// being reported as a typo the applied table ignores.
+const caseHarness = makeHarness()
+apply(caseHarness.ctx, {
+  autoTune: false,
+  maxInjectTokens: 500,
+  budgetPolicy: 'scenario',
+  budgetTiers: { light: 100, normal: 200, deep: 400 },
+  scenarioTiers: { Debug: 'Light' },
+})
+const caseStatus = await scenarioStatus(caseHarness)
+assert.equal(caseStatus.settingsIssues.some((issue) => issue.field === 'scenarioTiers'), false, 'mixed-case tier and scenario are not validation errors')
+assert.equal(caseStatus.budget.scenarioTiers.debug, 'light', 'a mixed-case override is applied, not dropped')
+for (const dispose of caseHarness.disposers) dispose()
 
 // Compaction recovery outranks the task kind: the memory the new recall repeats
 // is no longer in context, so it is worth the deep ceiling again.
@@ -1319,6 +1443,18 @@ const punctActivity = summarizeActivity({ harness: 'dsh', expectedOrigin: 'http:
 assert.equal(punctActivity.lastEndpoint, 'https://api.example:8443')
 assert.equal(punctActivity.lastBank, 'coding-agent::sub')
 
+// The character-to-token ratio is answered by the caller: CJK recall is about one
+// token per character, so reporting it with the English 0.3 baseline understates
+// the size threefold.
+writeFileSync(process.env.HINDSIGHT_DIAG_FILE, JSON.stringify({ ts: now, event: 'inject_ok', chars: 900 }))
+const latinSized = summarizeActivity({ lines: 5, harness: 'dsh', tokenRatio: 0.3 })
+const cjkSized = summarizeActivity({ lines: 5, harness: 'dsh', tokenRatio: 1 })
+assert.deepEqual(
+  [latinSized.lastInject.tokens, cjkSized.lastInject.tokens],
+  [270, 900],
+  'lastInject tokens follow the measured char ratio, not a fixed 0.3',
+)
+
 // 550 foreign-harness lines after a DSH event still preserve the DSH failure in the tail scan.
 const flooded = [
   JSON.stringify({ ts: now, event: 'pages_failed', error: 'GET http://127.0.0.1:9077/v1/default/banks/coding-agent%3A%3Adsh/pages/tree -> 500' }),
@@ -1378,10 +1514,24 @@ try {
     'summarizeTunerJournal reads >256KB multi-byte tail and aggregates capped, skipped, and delta savings',
   )
 
+  // The active journal rotates to `.1` at ~1 MB; a 24h summary must not reset.
+  renameSync(join(isoTunerDir, 'tuner.jsonl'), join(isoTunerDir, 'tuner.jsonl.1'))
+  writeFileSync(
+    join(isoTunerDir, 'tuner.jsonl'),
+    `${JSON.stringify({ ts: freshTs, event: 'inject_capped', before: 400, after: 250 })}\n`,
+    'utf8',
+  )
+  const rotatedSummary = summarizeTunerJournal({ windowHours: 24 })
+  assert.deepEqual(
+    { capped: rotatedSummary.capped, trimmedTokens: rotatedSummary.trimmedTokens },
+    { capped: 2, trimmedTokens: 450 },
+    'summarizeTunerJournal keeps counting in the rotated segment',
+  )
+
   const crossProc = makeHarness()
   apply(crossProc.ctx, { autoTune: false, maxInjectTokens: 500 })
   const crossStatusText = await crossProc.tools.find((c) => c.name === 'hindsight_tuner').execute({ action: 'status' }, exec)
-  assert.match(crossStatusText, /history\s+24h across processes: 1 capped · 1 skipped · saved ~530 tok/, 'formatStatus prints cross-process 24h history line')
+  assert.match(crossStatusText, /history\s+24h across processes: 2 capped · 1 skipped · saved ~680 tok/, 'formatStatus prints cross-process 24h history line')
   for (const dispose of crossProc.disposers) dispose()
 } finally {
   flushJournal()
@@ -1457,13 +1607,14 @@ try {
     const createdHandlers = createdHarness.handlers.get('agent/created') ?? []
     assert.equal(createdHandlers.length, 1, 'registers agent/created lifecycle listener')
 
+    // The subagent guard returns before ensureTuned is called, so there is no
+    // pending write to wait for: asserting immediately is the stronger check.
     createdHandlers[0].handler({ agent: { session: { header: { id: 'sub-1', origin: 'subagent' } } }, source: 'subagent' })
-    await new Promise((done) => setTimeout(done, 30))
     assert.equal(readConfigFile().config.autoInject, undefined, 'subagent agent/created does not trigger auto-tune')
     assert.equal(tunerState().exists, false, 'subagent does not create tuner state.json')
 
     createdHandlers[0].handler({ agent: { session: { header: { id: 'main-1', origin: 'main' } } }, source: 'startup' })
-    await new Promise((done) => setTimeout(done, 30))
+    await waitFor(() => readConfigFile().config.autoInject === 'pages', { label: 'agent/created auto-tune write' })
     assert.equal(readConfigFile().config.autoInject, 'pages', 'main agent/created auto-tunes coding-agent.json')
     assert.equal(tunerState().exists, true, 'auto-tune writes state.json')
     assert.equal(summarizeTunerJournal({ windowHours: 24 }).tuneApplied, 1, 'records tune_applied in tuner journal')
@@ -1568,14 +1719,14 @@ try {
       kind: 'enter',
       messages: [human],
     }))
-    await new Promise((done) => setTimeout(done, 20))
+    // onBeforeStep skips subagents before ensureTuned, so nothing is pending.
     assert.equal(readConfigFile().config.autoInject, undefined, 'subagent pre-step does not auto-tune')
 
     await waterfall(fallbackHarness, 'agent/pre-step', { agent: { session: { header: { id: 'main-pre', origin: 'main' } } } }, async () => ({
       kind: 'enter',
       messages: [human],
     }))
-    await new Promise((done) => setTimeout(done, 20))
+    await waitFor(() => readConfigFile().config.autoInject === 'pages', { label: 'pre-step auto-tune fallback write' })
     assert.equal(readConfigFile().config.autoInject, 'pages', 'first non-subagent pre-step falls back to auto-tuning')
     assert.equal(tunerState().exists, true)
   } finally {

@@ -329,17 +329,41 @@ export function disposeWorktree(handle) {
 }
 
 /**
- * Reset a worktree between attempts: discard tracked edits and remove untracked
- * files/directories (the exact `git checkout -- . && git clean -fd` contract).
+ * Reset a worktree between attempts: return it to its recorded base commit and
+ * remove untracked plus ignored files
+ * (`git reset --hard <baseSha> && git clean -fdx`).
+ *
+ * The earlier `git checkout -- . && git clean -fd` contract could not honour
+ * `--reset-between-attempts`: staged edits, commits the agent created and
+ * ignored build artifacts all survived, so attempt 2 started from attempt 1's
+ * state. Resetting to the recorded base SHA is the only reset that is actually
+ * independent of what the previous attempt did.
  */
 export function resetWorktree(handle) {
-  const path = handle && handle.path
+  if (!handle || typeof handle !== 'object') {
+    throw new TypeError('resetWorktree requires a worktree handle')
+  }
+  const { path, baseSha } = handle
   if (typeof path !== 'string' || !path) {
     throw new TypeError('resetWorktree requires a worktree handle with a path')
   }
-  runGit(['checkout', '--', '.'], { cwd: path })
-  runGit(['clean', '-fd'], { cwd: path })
-  return { ok: true, path }
+  if (typeof baseSha !== 'string' || !/^[0-9a-f]{40,64}$/i.test(baseSha)) {
+    throw new WorktreeError(`worktree handle has no valid baseSha (got ${JSON.stringify(baseSha)})`, {
+      path,
+    })
+  }
+  // Fail with the same detail verifyWorktree gives when the path is gone or no
+  // longer a git work tree, instead of a raw `git reset --hard` failure.
+  const head = runGit(['rev-parse', '--verify', 'HEAD^{commit}'], { cwd: path, allowFailure: true })
+  if (!head.ok) {
+    throw new WorktreeError(
+      `worktree at ${path} is not a readable git work tree: ${firstLine(head.stderr) || 'git rev-parse failed'}`,
+      { path, baseSha },
+    )
+  }
+  runGit(['reset', '--hard', baseSha], { cwd: path })
+  runGit(['clean', '-fdx'], { cwd: path })
+  return { ok: true, path, baseSha }
 }
 
 /**

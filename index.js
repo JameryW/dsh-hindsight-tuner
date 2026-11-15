@@ -89,9 +89,13 @@ export const name = PLUGIN
 function normalizeScenarioTiers(raw) {
   const tiers = { ...DEFAULT_SCENARIO_TIERS }
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-    for (const scenario of SCENARIO_NAMES) {
-      const value = typeof raw[scenario] === 'string' ? raw[scenario].toLowerCase() : null
-      if (SCENARIO_TIER_NAMES.includes(value)) tiers[scenario] = value
+    // Keys and tiers are matched case-insensitively so a hand-written
+    // `{ Debug: 'Deep' }` means the same as the lower-case form the validator
+    // accepts (validation runs on the raw value; this is the applied one).
+    for (const [name, value] of Object.entries(raw)) {
+      const scenario = String(name).toLowerCase()
+      const tier = typeof value === 'string' ? value.toLowerCase() : null
+      if (SCENARIO_NAMES.includes(scenario) && SCENARIO_TIER_NAMES.includes(tier)) tiers[scenario] = tier
     }
   }
   return tiers
@@ -193,12 +197,13 @@ function textOf(message) {
  * falls through to the continuation scenario instead of guessing from the tool
  * output.
  */
-function claimPrompt(messages, sourceKind, limit = 4000) {
+function claimPrompt(messages, limit = 4000) {
   const parts = []
   for (let index = messages.length - 1; index >= 0 && parts.length < 2; index -= 1) {
     const message = messages[index]
+    // The claimed batch can also carry memory this plugin injected, which is
+    // not part of what the user asked; only real user prompts classify the task.
     if (message?.source?.kind !== 'user') continue
-    if (message?.source?.kind === sourceKind) continue
     const text = textOf(message)
     if (text) parts.unshift(text)
   }
@@ -460,6 +465,13 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
         seenIds: new Set(),
       }
       remember(sessions, sessionId, session)
+    } else {
+      // Touch on every use. `remember` is an LRU, and only re-inserting on
+      // creation made it evict by creation order instead: the long-lived main
+      // session was the first key, so a burst of short subagent sessions would
+      // push out exactly the state (turns, repeat protection, re-entry text)
+      // that must survive.
+      remember(sessions, sessionId, session)
     }
     return session
   }
@@ -557,6 +569,32 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
     if (typeof onBeforeStep === 'function') onBeforeStep(payload)
     const decision = await next()
     if (!decision || decision.kind !== 'enter' || !Array.isArray(decision.messages)) return decision
+    try {
+      // `await` matters: govern is async, so without it a rejection would escape
+      // the try block and reject the whole hook instead of passing through.
+      return await govern(payload, decision)
+    } catch (error) {
+      // A memory lane must never break the host's turn: report the bug and let
+      // the step continue without memory rather than failing the agent.
+      stats.prestepErrors += 1
+      try {
+        record({
+          event: 'prestep_error',
+          session: payload?.agent?.session?.header?.id ?? null,
+          error: `${error?.name ?? 'Error'}: ${error?.message ?? error}`,
+        })
+      } catch {
+        // The pass-through matters more than the journal line.
+      }
+      return decision
+    }
+  }
+
+  /**
+   * Govern one entering step. Anything unexpected throws to the caller, which
+   * turns it into a pass-through; memory content itself never throws.
+   */
+  async function govern(payload, decision) {
     stats.preSteps += 1
 
     const agentSession = payload?.agent?.session
@@ -565,7 +603,13 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
     const session = sessionOf(sessionId)
     const logState = lastInjectionState(agentSession, settings.sourceKind)
     const shadowed = logState?.shadowed ?? null
-    const hadInjection = session.lastInjected > 0 && Boolean(session.lastInjectedText)
+    // Re-entry depends on delivery history, not on the last turn's counter: a
+    // turn whose recall was dropped as a duplicate delivers nothing
+    // (`lastInjected = 0`) but the text the model actually received is still the
+    // one a later compaction has to restore. Gating on `lastInjected` as well
+    // would switch compaction recovery off for the rest of the session after one
+    // skipped duplicate turn.
+    const hadInjection = Boolean(session.lastInjectedText)
 
     const candidates = []
     let measuredChars = 0
@@ -737,8 +781,12 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
           step: payload?.step,
           shadowed,
           repetition: repeatRatio,
-          lastCapped: session.lastCapped,
-          promptText: claimPrompt(decision.messages, settings.sourceKind),
+          // One cut must not pin the rest of the session to `light`: like the
+          // adaptive ladder, after-cut applies to a single turn. Without this a
+          // recall that is always larger than the light ceiling keeps lastCapped
+          // true and every later turn would stay at the smallest tier.
+          lastCapped: session.lastCapped && (session.cutCooldowns ?? 0) === 0,
+          promptText: claimPrompt(decision.messages),
           overrides: settings.scenarioTiers,
         })
         tier = {
@@ -746,6 +794,9 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
           ceiling: settings.budgetTiers[scenario.tier],
           reason: scenario.reason,
           scenario: scenario.scenario,
+          // Set the cooldown on the after-cut turn itself, so the next turn
+          // steps back up instead of repeating the same light ceiling forever.
+          cooldown: scenario.scenario === 'after-cut',
         }
         session.scenario = scenario.scenario
         stats.scenarios[scenario.scenario] = (stats.scenarios[scenario.scenario] ?? 0) + 1
@@ -1021,7 +1072,7 @@ function hintFor(status) {
       : 'Hindsight is disabled in the shared config (disabled: true); clear that key to turn memory back on.'
   }
   if (status.configIssues.length > 0) {
-    return 'The shared config contains values the integration does not accept; it silently falls back for those keys. Fix the invalid lines above (or run /hindsight tune) before trusting this report.'
+    return 'The shared config contains values the integration does not accept: it silently falls back for enums and types, and uses out-of-range numbers as they are. Fix the invalid lines above (or run /hindsight tune) before trusting this report.'
   }
   if (status.settingsIssues.length > 0) {
     return 'This bundle has invalid settings, so they were not written. Fix the row in cordis.patch.yml, then run /hindsight tune.'
@@ -1081,9 +1132,15 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
   const session = governor.session(sessionId)
   const ratios = stats.ratios ?? []
   const expectedOrigin = originOf(server.apiUrl)
-  const activity = summarizeActivity({ expectedOrigin, harness: 'dsh' })
-  const history = summarizeTunerJournal({ windowHours: 24 })
   const charRatio = stats.totalChars > 0 ? Math.round((stats.totalTokens / stats.totalChars) * 100) / 100 : null
+  // The journal stores characters; hand it a measured ratio only when this process
+  // is CJK-dense, otherwise its English 0.3 baseline is the better fit.
+  const activity = summarizeActivity({
+    expectedOrigin,
+    harness: 'dsh',
+    tokenRatio: charRatio > 0.45 ? charRatio : null,
+  })
+  const history = summarizeTunerJournal({ windowHours: 24 })
   const lastInjectAt = activity.lastInject?.ts ? Date.parse(activity.lastInject.ts) : Number.NaN
   const injectSinceBoot = Number.isFinite(lastInjectAt) && Number.isFinite(stats.activatedAt) && lastInjectAt >= stats.activatedAt
   const status = {
@@ -1176,6 +1233,9 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
       charRatio,
       lastRepeat: stats.lastRepeat,
       preSteps: stats.preSteps,
+      // Non-zero means the governor itself failed somewhere and stepped aside;
+      // memory was skipped for that turn rather than the agent turn failing.
+      prestepErrors: stats.prestepErrors,
       injectSinceBoot,
       turns: stats.turns,
       seen: stats.seen,
@@ -1305,6 +1365,9 @@ function formatStatus(status) {
     lines.push('  order    WARNING: pre-step ran and DSH logged an injection, but none reached this hook (another listener wrapped it)')
   } else {
     lines.push('  order    outermost hook installed (prepend); confirmed on the first recall')
+  }
+  if (status.budget.prestepErrors > 0) {
+    lines.push(`  errors   WARNING: ${status.budget.prestepErrors} pre-step(s) failed inside the plugin and continued without memory (journal: prestep_error)`)
   }
 
   const pageLimit = status.effective.pageSearchLimit
@@ -1495,6 +1558,9 @@ export function apply(ctx, rawConfig) {
   const stats = {
     activatedAt: Date.now(),
     preSteps: 0,
+    // A pre-step that throws is caught and passed through (see onPreStep), so it
+    // is counted here and surfaced in status instead of failing the host turn.
+    prestepErrors: 0,
     turns: 0,
     seen: 0,
     lastTurnTokens: 0,
@@ -1648,9 +1714,12 @@ export function apply(ctx, rawConfig) {
    * `allowAgentWrites: true` into the bundle config; everyone else uses
    * /hindsight tune or /hindsight revert.
    */
-  function mayWrite(options) {
+  function mayWrite(action, options) {
     if (!options.viaTool) return true
-    if (options.dryRun === true) return true
+    // A preview of tune/revert writes nothing, so it is safe without agent-write
+    // permission. enable/disable ignore `dryRun` and always persist state.json,
+    // so passing the flag must not authorize them.
+    if (options.dryRun === true && (action === 'tune' || action === 'revert')) return true
     return settings.allowAgentWrites
   }
 
@@ -1658,9 +1727,13 @@ export function apply(ctx, rawConfig) {
 
   function formatSuggestion(status) {
     const chars = status.activity.injectSizes ?? []
-    // The upstream journal records characters, not tokens; use its own 0.3
-    // chars/token ratio and label the result as derived.
-    const seen = chars.map((size) => Math.ceil(size * 0.3))
+    // The upstream journal records characters, not tokens. Scale them with the
+    // ratio this process measured only when it is clearly CJK-dense (~1 token per
+    // character): the 0.3 English baseline stays for prose, and the measured mix
+    // of a mixed workspace is not applied to injections it did not describe.
+    const measuredRatio = status.budget.charRatio
+    const charRatio = measuredRatio > 0.45 ? measuredRatio : 0.3
+    const seen = chars.map((size) => Math.ceil(size * charRatio))
     const p50 = percentile(seen, 50)
     const p95 = percentile(seen, 95)
     const observed = p95 ?? status.budget.maxTurnTokens ?? 0
@@ -1675,12 +1748,8 @@ export function apply(ctx, rawConfig) {
       lines.push('  no recall measured yet: the suggestion starts from the 2000-token default')
     }
     lines.push(`  cap      maxInjectTokens: ${cap}  (1.25× the p95, clamped 512..8000; current ${status.budget.cap})`)
-    if (status.budget.charRatio && status.budget.charRatio > 0.4 && p95 && chars.length > 0) {
-      const cjkP95 = percentile(chars.map((size) => Math.ceil(size * status.budget.charRatio)), 95)
-      const cjkCap = Math.max(512, Math.min(8000, Math.ceil(cjkP95 * 1.25)))
-      if (cjkCap > cap) {
-        lines.push(`  density  observed recalls in this process average ~${status.budget.charRatio} tok/char (vs 0.3 baseline); ~${cjkCap} maxInjectTokens fits CJK density`)
-      }
+    if (measuredRatio > 0.45) {
+      lines.push(`  density  scaled with ~${measuredRatio} tok/char measured in this process (English prose is ~0.3); the cap above already accounts for it`)
     }
     lines.push(`  recall   recallOptions.max_tokens: ${recall}  (Pages and Recall are separate ceilings; do not make recall larger than the cap by accident)`)
     const observedPages = status.activity?.pages
@@ -1711,7 +1780,7 @@ export function apply(ctx, rawConfig) {
   async function runAction(action, options = {}) {
     const cwd = options.cwd ?? process.cwd()
     const writes = ['tune', 'revert', 'enable', 'disable']
-    if (writes.includes(action) && !mayWrite(options)) return refusal
+    if (writes.includes(action) && !mayWrite(action, options)) return refusal
 
     if (action === 'tune') {
       const dryRun = options.dryRun === true
@@ -1747,15 +1816,19 @@ export function apply(ctx, rawConfig) {
     }
     if (action === 'disable') {
       setAutoTune(false)
+      // The persisted flag and the in-memory gate must agree, or status says
+      // "on" while every ensureTuned() for the rest of this process skips.
+      settings.autoTune = false
       tuning = Promise.resolve({ skipped: true, reason: 'auto-tune disabled' })
       record({ event: 'autotune_disabled' })
       return 'Auto-tune disabled for this profile. Existing config keys are untouched; /hindsight enable restores automatic tuning.'
     }
     if (action === 'enable') {
       setAutoTune(true)
+      settings.autoTune = true
       tuning = null
       record({ event: 'autotune_enabled' })
-      return 'Auto-tune enabled. The lean profile will be applied on the next session start; /hindsight tune applies it now.'
+      return 'Auto-tune enabled. It applies from this turn on; /hindsight tune applies the lean profile right away.'
     }
     if (action === 'probe') {
       const integration = findIntegration()
@@ -1818,6 +1891,12 @@ export function apply(ctx, rawConfig) {
         }
         if (args?.json === true && action !== 'status') {
           return 'hindsight_tuner: json is only valid with status.'
+        }
+        // The tool schema cannot be the only guard: a caller that reaches
+        // `execute` directly must be refused the same combinations the command
+        // handler refuses, and `dryRun` only means something on tune/revert.
+        if (args?.dryRun === true && !['tune', 'revert'].includes(action)) {
+          return 'hindsight_tuner: dryRun is only valid with tune or revert.'
         }
         try {
           return await runAction(action, {

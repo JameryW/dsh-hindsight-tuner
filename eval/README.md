@@ -18,7 +18,7 @@ What changed from the old per-arm aggregate harness:
 
 ```bash
 # 1. offline proof that the tooling itself works (no network, no agents)
-node eval/selftest.mjs          # prints: eval selftest: 50 checks passed
+node eval/selftest.mjs          # prints: eval selftest: 61 checks passed
 
 # 2. inspect the plan without spending anything (your own task file, see below)
 node eval/ab.mjs --tasks my-tasks.json --arms A3,A1 --primary A3:A1 --dry-run
@@ -34,9 +34,9 @@ node eval/ab.mjs --tasks tasks.json --arms A3,A1 --primary A3:A1 --repeats 5 \
 
 Useful flags: `--attempts N` (default 3, per-task `maxAttempts` wins),
 `--timeout ms` (default 600000), `--no-isolate`, `--keep-worktrees`,
-`--reset-between-attempts`, `--worktree-root <dir>`, `--prices <file>`,
-`--bootstraps N` (default 4000), `--seed N` (default 20260101), `--json`.
-Run `node eval/ab.mjs --help` for the complete list.
+`--reset-between-attempts`, `--allow-unmet-requires`, `--worktree-root <dir>`,
+`--prices <file>`, `--bootstraps N` (default 4000), `--seed N` (default
+20260101), `--json`. Run `node eval/ab.mjs --help` for the complete list.
 
 `--dry-run` prints the matrix (tasks, arms + env, repeats, attempts, worktree
 roots, bank/fingerprint actions) and exits 0 without spawning agents or touching
@@ -90,16 +90,22 @@ For a task whose `cwd` is inside a git repository and isolation is enabled
 2. creates a **detached** worktree in a unique temp directory
    (`<os.tmpdir()>/dsh-hindsight-eval-worktrees/...` by default;
    `--worktree-root` overrides the parent);
-3. reuses that worktree for every attempt of the run (optionally
-   `git checkout -- . && git clean -fd` between attempts with
-   `--reset-between-attempts`);
+3. reuses that worktree for every attempt of the run (`git reset --hard
+   <baseSha> && git clean -fdx` between attempts with
+   `--reset-between-attempts`, so committed and ignored state from earlier
+   attempts cannot leak into later ones);
 4. removes it with `git worktree remove --force` + `git worktree prune`
    (`--keep-worktrees` keeps it for inspection).
 
-The base SHA of every worktree is recorded in `report.worktrees[]`, so a result
+A task whose `cwd` is a subdirectory of the repository runs in the matching
+subdirectory of the worktree, not at its root.
+
+The base SHA of every worktree is recorded in `report.worktrees[]` together with
+the task's repository-relative `rel` offset and the resolved `cwd`, so a result
 can be reproduced from that commit. The main checkout is never written to.
-Non-git `task.cwd` directories run in place (`--no-isolate` does the same
-everywhere), and that is visible in the report.
+Only isolated runs appear there: non-git `task.cwd` directories run in place
+(`--no-isolate` does the same everywhere) and are visible in the report only
+through their rows, the experiment's `isolate` flag and the dry-run plan.
 
 ## Arm matrix and gates
 
@@ -122,7 +128,11 @@ treatment; positive success favours it). Set it before the run; do not choose a
 comparison after seeing the data.
 
 Some arms cannot be expressed by environment variables alone and list this in
-`requires`:
+`requires`. Selecting such an arm **fails fast with the missing setup** unless
+`--allow-unmet-requires` is passed, because the harness cannot verify that the
+setup was done; the flag only records the operator's assertion and warns on
+stderr. The same gate applies to `--dry-run` (the plan itself is what the flag
+unlocks); a plan lists every arm's `hint`/`requires`.
 
 - **A3-V** needs the DSH plugin profile setting `settings.viewPolicy=budgeted`
   (lib/view.js) pinned before the run; `HINDSIGHT_PAGE_SEARCH_LIMIT` only covers
@@ -242,7 +252,7 @@ Record with every reported result:
 {
   "generatedAt": "2026-...",
   "repeats": 5,
-  "arms": [{ "name": "A3", "env": { ... } }],
+  "arms": [{ "name": "A3", "env": { ... }, "hint": "...", "requires": [] }],
   "tasks": [{ "id": "...", "prompt": "...", "cwd": "...", "check": {...} }],
   "rows": [ /* one row per attempt: taskId, arm, repeat, attempt, passed, tokens,
                usage, durationMs, cost, failureSignature, error */ ],
@@ -253,8 +263,10 @@ Record with every reported result:
   "primary": "A3:A1",
   "prices": { ... } ,
   "bank": { "apiUrl", "bankId", "verified", "fingerprint", "capturedAt", ... },
-  "worktrees": [{ "taskId", "arm", "repeat", "path", "repo", "baseSha" }],
-  "experiment": { "startedAt", "finishedAt", "agent", "timeoutMs", "seed", ... },
+  "worktrees": [{ "taskId", "arm", "repeat", "path", "repo", "baseSha",
+                  "rel", "cwd" }],
+  "experiment": { "startedAt", "finishedAt", "agent", "timeoutMs", "seed",
+                  "allowUnmetRequires", "armRequires", ... },
   "cleanupErrors": []
 }
 ```
@@ -306,10 +318,13 @@ solved/runs matrix.
 ## Selftest
 
 `node eval/selftest.mjs` runs entirely offline: it creates a throwaway git
-repository (three commits), asserts worktree creation/isolation/drift/dispose,
-starts local `node:http` fake banks to exercise fingerprint capture (including
-URL encoding and legacy fallback), drift detection and frozen verification,
-checks completeness/cost/bootstrap statistics against synthetic rows, drives the
-harness attempts loop with fake runners, and runs the real CLI twice with
-`--dry-run` (text and JSON plans). It finishes in a few seconds, requires no
-network or real agent, and exits non-zero with per-check details on failure.
+repository (three commits), asserts worktree creation/isolation/drift/dispose and
+that `--reset-between-attempts` discards committed, staged, untracked and ignored
+state, starts local `node:http` fake banks to exercise fingerprint capture
+(including URL encoding and legacy fallback), drift detection and frozen
+verification, checks completeness/cost/bootstrap statistics against synthetic
+rows, drives the harness attempts loop with fake runners, and runs the real CLI
+several times with `--dry-run` (text and JSON plans, unmet-requires refusal,
+report warning) plus one end-to-end run against a temporary repository with a
+fake agent. It finishes in a few seconds, requires no network or real agent, and
+exits non-zero with per-check details on failure.

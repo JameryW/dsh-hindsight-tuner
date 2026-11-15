@@ -8,37 +8,60 @@
  * receive. That is the only test that proves the budget wraps the real
  * integration rather than a rehearsal of it.
  *
- * The package is optional: when it is not installed the test reports a skip
- * instead of failing, so a cloner without memory installed can still run it.
+ * The package is optional for a local run: when it is not installed the test
+ * prints `integration: skipped` and exits 0, so a cloner without memory can
+ * still run the other suites. CI and `HINDSIGHT_INTEGRATION_REQUIRED=1` make it
+ * a hard failure instead, so the composition proof cannot silently disappear.
  */
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { existsSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
+
+import { waitFor } from './wait.mjs'
 
 const root = resolve(import.meta.dirname, '..')
 const scratch = mkdtempSync(join(tmpdir(), 'dsh-hindsight-integration-'))
 process.on('exit', () => rmSync(scratch, { recursive: true, force: true }))
 
+// Resolve the real installation *before* the environment is isolated below: on
+// a developer machine the integration lives in a real profile, not in this
+// checkout. Hard-coding the `desktop` profile name made this test silently skip
+// everywhere else; scan the profiles that actually exist instead, in sorted
+// order so the choice does not depend on directory order.
+const PACKAGE = ['node_modules', '@vectorize-io', 'hindsight-coding-agents']
+const realDshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
+const candidates = [
+  process.env.HINDSIGHT_INTEGRATION_DIR,
+  process.env.DSH_PROFILE_DIR ? join(process.env.DSH_PROFILE_DIR, ...PACKAGE) : null,
+  join(root, ...PACKAGE),
+]
+const profilesRoot = join(realDshHome, 'profiles')
+if (existsSync(profilesRoot)) {
+  for (const profile of readdirSync(profilesRoot).sort()) candidates.push(join(profilesRoot, profile, ...PACKAGE))
+}
+const searched = candidates.filter(Boolean)
+const packageDir = searched.find((candidate) => existsSync(join(candidate, 'dist', 'dsh.js')))
+if (!packageDir) {
+  const install = 'npm install --no-save --no-package-lock --no-audit --no-fund @vectorize-io/hindsight-coding-agents@0.8.7'
+  const list = searched.map((candidate) => `  ${candidate}`).join('\n')
+  if (process.env.CI || process.env.HINDSIGHT_INTEGRATION_REQUIRED) {
+    console.error('integration: FAILED — @vectorize-io/hindsight-coding-agents is required but was not found')
+    console.error(`searched:\n${list}`)
+    console.error(`install it with:\n  ${install}\nor point HINDSIGHT_INTEGRATION_DIR at a copy that has dist/dsh.js.`)
+    process.exit(1)
+  }
+  console.log('integration: skipped (install @vectorize-io/hindsight-coding-agents to run this test)')
+  console.log(`searched:\n${list}`)
+  console.log(`install it with:\n  ${install}`)
+  process.exit(0)
+}
+
 process.env.DSH_HOME = join(scratch, 'dsh-home')
 process.env.HINDSIGHT_CONFIG = join(scratch, 'coding-agent.json')
 process.env.HINDSIGHT_DIAG_FILE = join(scratch, 'diag.jsonl')
 writeFileSync(process.env.HINDSIGHT_CONFIG, JSON.stringify({ observationScopes: 'shared' }, null, 2))
-
-// The tuner looks for the integration in the profile; give it the same tree we
-// load from so status and the hook see a consistent installation.
-const candidates = [
-  process.env.HINDSIGHT_INTEGRATION_DIR,
-  join(root, 'node_modules', '@vectorize-io', 'hindsight-coding-agents'),
-  join(homedir(), '.dsh', 'profiles', 'desktop', 'node_modules', '@vectorize-io', 'hindsight-coding-agents'),
-].filter(Boolean)
-const packageDir = candidates.find((candidate) => existsSync(join(candidate, 'dist', 'dsh.js')))
-if (!packageDir) {
-  console.log('integration: skipped (install @vectorize-io/hindsight-coding-agents to run this test)')
-  process.exit(0)
-}
 
 const fakeProfile = join(scratch, 'profile')
 mkdirSync(join(fakeProfile, 'node_modules', '@vectorize-io'), { recursive: true })
@@ -92,6 +115,19 @@ function waterfall(harness, event, payload, inner) {
   return run(0)
 }
 
+const SOURCE_KIND = 'plugin:hindsight'
+
+// The ceiling checks below are only meaningful if the message exists: a missing
+// injection reads as `''`, and `estimateTokens('') === 0` passes every upper
+// bound. Assert one non-empty payload first, then measure it.
+function injectedText(messages, label) {
+  const found = messages.filter((message) => message?.source?.kind === SOURCE_KIND)
+  assert.equal(found.length, 1, `${label}: the real integration injected exactly one memory message`)
+  const joined = found[0].content.map((block) => block.text ?? '').join('\n')
+  assert.ok(joined.trim().length > 0, `${label}: the injected recall has text`)
+  return joined
+}
+
 const cap = 500
 const memoryLines = Array.from({ length: 260 }, (_, index) => `memory line ${index}: 这是一条项目记忆 with detail about the repo and its decisions.`)
 const bulk = memoryLines.join('\n')
@@ -140,9 +176,7 @@ const decision = await waterfall(harness, 'agent/pre-step', { agent, signal: { a
   messages: [human],
 }))
 
-const injected = decision.messages.filter((message) => message?.source?.kind === 'plugin:hindsight')
-assert.equal(injected.length, 1, 'the real integration injected one memory message')
-const text = injected[0].content.map((block) => block.text ?? '').join('\n')
+const text = injectedText(decision.messages, 'first turn')
 const tokens = estimateTokens(text)
 assert.ok(tokens <= cap, `the final payload the model receives is within the ceiling: ${tokens} <= ${cap}`)
 assert.match(text, /dsh-hindsight-tuner: cut from/, 'the tuner, not the integration, performed the cut')
@@ -153,7 +187,7 @@ const second = await waterfall(harness, 'agent/pre-step', { agent, signal: { abo
   kind: 'enter',
   messages: [human],
 }))
-const secondText = second.messages.find((message) => message?.source?.kind === 'plugin:hindsight')?.content[0]?.text ?? ''
+const secondText = injectedText(second.messages, 'second turn')
 assert.ok(estimateTokens(secondText) <= cap, 'repeat turns stay within the same ceiling')
 
 // With the cap off the real payload passes through unchanged, proving the
@@ -165,7 +199,7 @@ const untouched = await waterfall(openHarness, 'agent/pre-step', { agent, signal
   kind: 'enter',
   messages: [human],
 }))
-const untouchedText = untouched.messages.find((message) => message?.source?.kind === 'plugin:hindsight')?.content[0]?.text ?? ''
+const untouchedText = injectedText(untouched.messages, 'cap-off turn')
 assert.equal(untouchedText, injection, 'cap off leaves the integration payload alone')
 
 for (const dispose of [...harness.disposers, ...openHarness.disposers]) dispose()
@@ -215,7 +249,9 @@ const modernAgent = {
 for (const entry of [...(modernHarness.handlers.get('agent/created') ?? [])]) {
   entry.handler({ agent: modernAgent, source: 'startup' })
 }
-await new Promise((done) => setTimeout(done, 50))
+await waitFor(() => JSON.parse(readFileSync(process.env.HINDSIGHT_CONFIG, 'utf8')).autoInject === 'pages', {
+  label: 'agent/created auto-tune write',
+})
 const tunedFile = JSON.parse(readFileSync(process.env.HINDSIGHT_CONFIG, 'utf8'))
 assert.equal(tunedFile.autoInject, 'pages', 'agent/created auto-tunes coding-agent.json in DSH 0.2.x')
 
@@ -223,8 +259,21 @@ const step1Decision = await waterfall(modernHarness, 'agent/pre-step', { agent: 
   kind: 'enter',
   messages: [human],
 }))
-const step1Text = step1Decision.messages.find((message) => message?.source?.kind === 'plugin:hindsight')?.content[0]?.text ?? ''
+const step1Text = injectedText(step1Decision.messages, 'modern turn 1')
 assert.ok(estimateTokens(step1Text) <= cap && estimateTokens(step1Text) > 250, 'turn 1 (step: 1) wraps deferred agents hook and gets deep tier')
+
+// That recall was cut, and the documented precedence puts `after-cut` above the
+// prompt signal, so the very next turn would be a light after-cut turn. Send one
+// small recall that fits the light tier: the cut state clears (the after-cut
+// cooldown steps the turn after it back up), so the assertions below test the
+// step handling and the task signal rather than the after-cut rule.
+injection = Array.from({ length: 4 }, (_, i) => `settle line ${i}: a short memory item that fits the light tier.`).join('\n')
+const settle = await waterfall(modernHarness, 'agent/pre-step', { agent: modernAgent, step: 1, signal: { aborted: false } }, async () => ({
+  kind: 'enter',
+  messages: [human],
+}))
+const settleText = injectedText(settle.messages, 'settle turn')
+assert.ok(estimateTokens(settleText) <= 120, 'the settle turn is an after-cut light turn and was not cut again')
 
 injection = Array.from({ length: 220 }, (_, i) => `debug turn line ${i}: fresh memory item for modern DSH scenario check.`).join('\n')
 const debugPrompt = { id: 'human-debug', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'do the thing: fix the failing error' }] }
@@ -232,7 +281,7 @@ const step1Debug = await waterfall(modernHarness, 'agent/pre-step', { agent: mod
   kind: 'enter',
   messages: [debugPrompt],
 }))
-const step1DebugText = step1Debug.messages.find((message) => message?.source?.kind === 'plugin:hindsight')?.content[0]?.text ?? ''
+const step1DebugText = injectedText(step1Debug.messages, 'debug turn')
 assert.ok(estimateTokens(step1DebugText) <= 250 && estimateTokens(step1DebugText) > 120, 'turn 2 (step: 1) picks debug/normal rather than continuation/light')
 
 injection = Array.from({ length: 220 }, (_, i) => `continuation turn line ${i}: unique content for step 2 light ceiling check.`).join('\n')
@@ -240,7 +289,7 @@ const step2Decision = await waterfall(modernHarness, 'agent/pre-step', { agent: 
   kind: 'enter',
   messages: [debugPrompt],
 }))
-const step2Text = step2Decision.messages.find((message) => message?.source?.kind === 'plugin:hindsight')?.content[0]?.text ?? ''
+const step2Text = injectedText(step2Decision.messages, 'step 2')
 assert.ok(estimateTokens(step2Text) <= 120, 'step 2 triggers continuation/light tier')
 
 for (const dispose of modernHarness.disposers) dispose()

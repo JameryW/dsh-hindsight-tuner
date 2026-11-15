@@ -13,9 +13,9 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { configPath } from '../lib/config-file.js'
 import { ENV_KEYS } from '../lib/diagnostics.js'
@@ -64,6 +64,8 @@ Required:
 Experiment:
   --arms <csv|file>           Arms: comma-separated names from eval/arms.example.json,
                               a JSON arms file, or an inline JSON array (default arms: A0,A2,A3)
+  --allow-unmet-requires      Run arms whose declared "requires" setup is not verified
+                              (default: refuse so a gated arm cannot run silently unconfigured)
   --repeats N                 Repetitions per (arm, task) (default ${DEFAULT_REPEATS})
   --attempts N                Max attempts per run when a task fails (default ${DEFAULT_ATTEMPTS})
   --primary A:B               Preregistered comparison: A is treatment, B is baseline
@@ -78,7 +80,7 @@ Isolation:
   --no-isolate                Do not create git worktrees; run in task.cwd
   --worktree-root <dir>       Parent directory for worktrees (default: os.tmpdir())
   --keep-worktrees            Keep worktrees after the experiment
-  --reset-between-attempts    git checkout -- . && git clean -fd before attempts 2..N
+  --reset-between-attempts    git reset --hard <baseSha> && git clean -fdx before attempts 2..N
   --no-reset-between-attempts Disable the reset (default)
 
 Bank reproducibility:
@@ -102,6 +104,7 @@ const BOOLEAN_FLAGS = new Set([
   '--reset-between-attempts',
   '--no-reset-between-attempts',
   '--no-isolate',
+  '--allow-unmet-requires',
   '--help',
   '-h',
 ])
@@ -232,7 +235,20 @@ function defaultOptions() {
     json: false,
     keepWorktrees: false,
     resetBetweenAttempts: false,
+    allowUnmetRequires: false,
   }
+}
+
+/**
+ * True when a token is a flag this parser knows. Used to tell a missing value
+ * (`--report --dry-run`) from a legitimate value that happens to start with
+ * `--` (`--report --odd.json`).
+ */
+function isKnownFlag(value) {
+  const text = String(value)
+  const equalsIndex = text.indexOf('=')
+  const name = equalsIndex > 0 ? text.slice(0, equalsIndex) : text
+  return BOOLEAN_FLAGS.has(name) || VALUE_FLAGS.has(name)
 }
 
 /** Parse CLI argv (without `node eval/ab.mjs`). Throws on invalid usage. */
@@ -262,6 +278,9 @@ export function parseArgs(argv = []) {
         case '--no-isolate':
           options.isolate = false
           break
+        case '--allow-unmet-requires':
+          options.allowUnmetRequires = true
+          break
         default:
           options.help = true
           break
@@ -269,13 +288,26 @@ export function parseArgs(argv = []) {
       index += 1
       continue
     }
-    if (VALUE_FLAGS.has(token)) {
-      const value = argv[index + 1]
-      if (value === undefined || String(value).startsWith('--')) {
-        throw new Error(`${token} requires a value`)
+    const equalsIndex = token.startsWith('--') ? token.indexOf('=') : -1
+    const flag = equalsIndex > 0 ? token.slice(0, equalsIndex) : token
+    if (VALUE_FLAGS.has(flag)) {
+      let value
+      if (equalsIndex > 0) {
+        value = token.slice(equalsIndex + 1)
+        // `--flag=` is an ambiguous empty value; an empty string is never a
+        // useful path/count, and silently accepting it hides a shell mistake.
+        if (!value) throw new Error(`${flag} requires a value`)
+        index += 1
+      } else {
+        value = argv[index + 1]
+        // Only undefined or a known flag means the value is missing: a path can
+        // legitimately start with `--` (e.g. `--report --odd.json`).
+        if (value === undefined || isKnownFlag(value)) {
+          throw new Error(`${flag} requires a value`)
+        }
+        index += 2
       }
-      index += 2
-      switch (token) {
+      switch (flag) {
         case '--tasks':
           options.tasks = String(value)
           break
@@ -283,10 +315,10 @@ export function parseArgs(argv = []) {
           options.report = String(value)
           break
         case '--repeats':
-          options.repeats = parseInteger(value, token, { min: 1 })
+          options.repeats = parseInteger(value, flag, { min: 1 })
           break
         case '--timeout':
-          options.timeoutMs = parseInteger(value, token, { min: 1 })
+          options.timeoutMs = parseInteger(value, flag, { min: 1 })
           break
         case '--arms':
           options.arms = String(value)
@@ -296,7 +328,7 @@ export function parseArgs(argv = []) {
           options.agentRaw = String(value)
           break
         case '--attempts':
-          options.attempts = parseInteger(value, token, { min: 1 })
+          options.attempts = parseInteger(value, flag, { min: 1 })
           break
         case '--worktree-root':
           options.worktreeRoot = String(value)
@@ -320,10 +352,10 @@ export function parseArgs(argv = []) {
           options.primary = parsePrimary(String(value))
           break
         case '--bootstraps':
-          options.bootstraps = parseInteger(value, token, { min: 1 })
+          options.bootstraps = parseInteger(value, flag, { min: 1 })
           break
         case '--seed':
-          options.seed = parseInteger(value, token, { min: Number.MIN_SAFE_INTEGER })
+          options.seed = parseInteger(value, flag, { min: Number.MIN_SAFE_INTEGER })
           break
         case '--prices':
           options.prices = String(value)
@@ -336,9 +368,6 @@ export function parseArgs(argv = []) {
     throw new Error(`unknown argument: ${token}`)
   }
   if (!options.help && !options.tasks) throw new Error('--tasks <file> is required')
-  if (options.report && options.dryRun) {
-    // Accepted but not written; the dry-run plan states this explicitly.
-  }
   return options
 }
 
@@ -499,10 +528,13 @@ function exampleArms() {
  * Returns {arms, source}.
  */
 export function resolveArms(spec) {
-  if (spec === null || spec === undefined || spec === '') {
+  if (spec === null || spec === undefined) {
     return { arms: DEFAULT_ARMS.map((arm) => ({ ...arm })), source: { kind: 'default' } }
   }
   const text = String(spec).trim()
+  // An explicitly empty value (`--arms ""`, or whitespace) must not silently run
+  // the default matrix: report the mistake instead of measuring other arms.
+  if (!text) throw new Error('--arms requires a non-empty value')
   if (text.startsWith('[')) {
     let parsed
     try {
@@ -563,6 +595,27 @@ function detectRepo(tasks) {
   return { repo: cwdRepo || process.cwd(), taskId: null, source: cwdRepo ? 'cwd' : 'cwd-nonrepo' }
 }
 
+function isOutsidePath(relPath) {
+  return relPath === '..' || relPath.startsWith(`..${sep}`) || isAbsolute(relPath)
+}
+
+/**
+ * Path of `dir` inside `repoRoot` ('' for the repository root), or null when it
+ * is outside. Git can report the canonical toplevel while the caller typed a
+ * different spelling (symlinked cwd, Windows 8.3 short name), so an apparent
+ * escape is retried on real paths before it is rejected.
+ */
+function relativeToRepo(repoRoot, dir) {
+  let relPath = relative(repoRoot, dir)
+  if (!isOutsidePath(relPath)) return relPath
+  try {
+    relPath = relative(realpathSync.native(repoRoot), realpathSync.native(dir))
+  } catch {
+    return null
+  }
+  return isOutsidePath(relPath) ? null : relPath
+}
+
 function buildEnvForRun(task, arm, attempt) {
   const env = { ...process.env }
   for (const source of [task.env, arm.env]) {
@@ -598,18 +651,75 @@ function killTree(child) {
 }
 
 /**
+ * Capture the newest MAX_CAPTURE_BYTES bytes of one stream.
+ *
+ * The old cap compared a decoded string's `.length`, which counts UTF-16 code
+ * units: multi-byte output (agent transcripts are not ASCII) could exceed the
+ * byte budget by 2-3x. Raw chunks are capped by byte length and decoded once,
+ * after the process finished.
+ */
+function byteTail() {
+  const chunks = []
+  let bytes = 0
+  const push = (chunk) => {
+    chunks.push(chunk)
+    bytes += chunk.length
+    while (bytes > MAX_CAPTURE_BYTES) {
+      const overflow = bytes - MAX_CAPTURE_BYTES
+      const head = chunks[0]
+      if (head.length <= overflow) {
+        chunks.shift()
+        bytes -= head.length
+      } else {
+        chunks[0] = head.subarray(overflow)
+        bytes -= overflow
+      }
+    }
+  }
+  const toString = () => (chunks.length > 0 ? Buffer.concat(chunks).toString('utf8') : '')
+  return { push, toString }
+}
+
+function spawnErrorMessage(error, command) {
+  if (error && error.code === 'ENOENT') return `command not found: ${command}`
+  return error && error.message ? error.message : String(error)
+}
+
+/**
+ * Whether Windows can resolve `command` at all. Node's spawn only appends
+ * `.exe` (CreateProcess), so a `.cmd` shim such as the default `claude`
+ * launcher looks missing; `where.exe` searches PATHEXT, which tells a shim
+ * apart from a genuinely absent command. Only consulted after an ENOENT.
+ */
+function resolvesOnWindows(command) {
+  try {
+    const result = spawnSync('where.exe', [command], { stdio: 'ignore', windowsHide: true })
+    return result.status === 0
+  } catch {
+    return false
+  }
+}
+
+/**
  * Spawn one process with prompt on stdin, capture capped stdout/stderr, and
  * settle exactly once on close/error/timeout. Never rejects.
+ *
+ * On Windows a bare command such as the `claude` default is often a `.cmd` shim,
+ * which CreateProcess cannot start: the first spawn fails with ENOENT and one
+ * retry through the command shell is what makes the default agent work. A
+ * command that `where.exe` cannot find is not retried, so it still reports
+ * `command not found` instead of a confusing shell exit code.
  */
 function runProcess(command, args, { cwd, env, stdin = null, timeoutMs } = {}) {
   return new Promise((resolveProcess) => {
     const startedAt = Date.now()
-    let stdout = ''
-    let stderr = ''
+    const stdoutCapture = byteTail()
+    const stderrCapture = byteTail()
     let settled = false
     let timedOut = false
     let timeoutHandle = null
-    let child
+    let child = null
+    let retriedThroughShell = false
     const finish = (result) => {
       if (settled) return
       settled = true
@@ -618,56 +728,58 @@ function runProcess(command, args, { cwd, env, stdin = null, timeoutMs } = {}) {
       resolveProcess({
         command,
         args,
-        stdout,
-        stderr,
+        stdout: stdoutCapture.toString(),
+        stderr: stderrCapture.toString(),
         durationMs,
         timedOut,
         ...result,
       })
     }
-    try {
-      child = spawn(command, args, {
-        cwd,
-        env,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: true,
+    const start = (shell) => {
+      let current
+      try {
+        current = spawn(command, args, {
+          cwd,
+          env,
+          shell,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          windowsHide: true,
+        })
+      } catch (error) {
+        finish({ error: spawnErrorMessage(error, command), exitCode: null, signal: null })
+        return
+      }
+      child = current
+      current.stdout.on('data', (chunk) => stdoutCapture.push(chunk))
+      current.stderr.on('data', (chunk) => stderrCapture.push(chunk))
+      current.on('error', (error) => {
+        // A stale failed spawn must not settle the run once a retry is active.
+        if (current !== child) return
+        if (process.platform === 'win32' && !retriedThroughShell && error && error.code === 'ENOENT') {
+          retriedThroughShell = true
+          if (resolvesOnWindows(command)) {
+            start(true)
+            return
+          }
+        }
+        finish({ error: spawnErrorMessage(error, command), exitCode: null, signal: null })
       })
-    } catch (error) {
-      finish({ error: error && error.message ? error.message : String(error), exitCode: null, signal: null })
-      return
+      current.on('close', (code, signal) => {
+        if (current !== child) return
+        finish({ error: null, exitCode: code, signal })
+      })
+      current.stdin.on('error', () => {
+        // EPIPE: the agent exited without reading stdin. The exit code decides.
+      })
+      if (timeoutHandle) clearTimeout(timeoutHandle)
+      timeoutHandle = setTimeout(() => {
+        timedOut = true
+        killTree(current)
+      }, timeoutMs)
+      if (stdin === null || stdin === undefined) current.stdin.end()
+      else current.stdin.end(stdin)
     }
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString('utf8')
-      if (stdout.length > MAX_CAPTURE_BYTES) stdout = stdout.slice(-MAX_CAPTURE_BYTES)
-    })
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString('utf8')
-      if (stderr.length > MAX_CAPTURE_BYTES) stderr = stderr.slice(-MAX_CAPTURE_BYTES)
-    })
-    child.on('error', (error) => {
-      finish({
-        error:
-          error && error.code === 'ENOENT'
-            ? `command not found: ${command}`
-            : error && error.message
-              ? error.message
-              : String(error),
-        exitCode: null,
-        signal: null,
-      })
-    })
-    child.on('close', (code, signal) => {
-      finish({ error: null, exitCode: code, signal })
-    })
-    child.stdin.on('error', () => {
-      // EPIPE: the agent exited without reading stdin. The exit code decides.
-    })
-    timeoutHandle = setTimeout(() => {
-      timedOut = true
-      killTree(child)
-    }, timeoutMs)
-    if (stdin === null || stdin === undefined) child.stdin.end()
-    else child.stdin.end(stdin)
+    start(false)
   })
 }
 
@@ -778,7 +890,10 @@ function prepareIsolatedConfigKeys(baseEnv, overrideEnv) {
 /** Create the per-run agent + check runner, isolating HINDSIGHT_CONFIG keys overridden by arm/task env. */
 export function createRunner(options) {
   return async function runTask({ task, arm, attempt, worktree }) {
-    const cwd = worktree ? worktree.path : resolve(task.cwd)
+    // A task may point at a subdirectory of its repository; the worktree is a
+    // fresh checkout of the whole repo, so run relative to the recorded offset
+    // instead of dropping the subdirectory.
+    const cwd = worktree ? join(worktree.path, worktree.rel ?? '') : resolve(task.cwd)
     if (options.resetBetweenAttempts && attempt > 1 && worktree) {
       resetWorktree(worktree)
     }
@@ -889,11 +1004,20 @@ function createWorktreeHooks(options, state) {
         throw new Error(`task ${task.id}: cannot inspect git repository at ${task.cwd}: ${error.message}`)
       }
       if (!repo) return { worktree: null, isolated: false, repo: null }
+      const rel = relativeToRepo(repo, resolve(task.cwd))
+      if (rel === null) {
+        throw new Error(
+          `task ${task.id}: cwd ${resolve(task.cwd)} is outside the detected git repository ${repo}`,
+        )
+      }
       const handle = createWorktree({
         repo,
         root,
         name: `${task.id}-${arm.name}-r${repeat + 1}`,
       })
+      // Carry the task's offset inside the repo so the runner can start in the
+      // matching subdirectory of the worktree rather than its root.
+      handle.rel = rel
       try {
         verifyWorktree(handle)
       } catch (error) {
@@ -912,6 +1036,8 @@ function createWorktreeHooks(options, state) {
         path: handle.path,
         repo: handle.repo,
         baseSha: handle.baseSha,
+        rel: rel || null,
+        cwd: join(handle.path, rel),
       })
       return { worktree: handle, isolated: true, repo: handle.repo }
     },
@@ -1002,11 +1128,16 @@ function buildPlan(options, tasks, armsResult, resolved, repoInfo) {
   }
   const taskPlans = tasks.map((task) => {
     let repo = null
-    if (options.isolate) repo = repoRootOf(task.cwd)
+    let cwdRel = null
+    if (options.isolate) {
+      repo = repoRootOf(task.cwd)
+      if (repo) cwdRel = relativeToRepo(repo, resolve(task.cwd))
+    }
     return {
       id: task.id,
       cwd: resolve(task.cwd),
       cwdExists: existsSync(task.cwd),
+      cwdRel: cwdRel || null,
       maxAttempts: task.maxAttempts ?? options.attempts,
       isolated: Boolean(options.isolate && repo),
       repo,
@@ -1029,7 +1160,15 @@ function buildPlan(options, tasks, armsResult, resolved, repoInfo) {
   return {
     tasksFile: resolve(options.tasks),
     armsSource: armsResult.source,
-    arms: armList.map((arm) => ({ name: arm.name, label: arm.label ?? null, env: arm.env ?? {} })),
+    arms: armList.map((arm) => ({
+      name: arm.name,
+      label: arm.label ?? null,
+      env: arm.env ?? {},
+      // Arm gates are declared in the arms file; carry them into the plan so a
+      // dry run shows setup that environment variables alone cannot express.
+      hint: arm.hint ?? null,
+      requires: Array.isArray(arm.requires) ? arm.requires : [],
+    })),
     tasks: taskPlans,
     repeats: options.repeats,
     attemptsDefault: options.attempts,
@@ -1058,7 +1197,7 @@ function printPlan(plan, options) {
   for (const task of plan.tasks) {
     lines.push(
       `    - ${task.id}  cwd=${task.cwd}  maxAttempts=${task.maxAttempts}` +
-        `  ${task.isolated ? `isolate (repo ${task.repo})` : 'no worktree (shared cwd)'}` +
+        `  ${task.isolated ? `isolate (repo ${task.repo}${task.cwdRel ? `, subdir ${task.cwdRel}` : ''})` : 'no worktree (shared cwd)'}` +
         (task.cwdExists === false ? '  [cwd missing: runs will fail until the fixture exists]' : ''),
     )
   }
@@ -1067,7 +1206,11 @@ function printPlan(plan, options) {
     const env = Object.entries(arm.env)
       .map(([key, value]) => `${key}=${String(value)}`)
       .join(' ')
-    lines.push(`    - ${arm.name}${arm.label ? ` (${arm.label})` : ''}${env ? `  env: ${env}` : ''}`)
+    lines.push(
+      `    - ${arm.name}${arm.label ? ` (${arm.label})` : ''}${env ? `  env: ${env}` : ''}` +
+        (arm.hint ? `  hint: ${arm.hint}` : '') +
+        (arm.requires.length > 0 ? `  requires: ${arm.requires.join('; ')}` : ''),
+    )
   }
   lines.push(`  repeats: ${plan.repeats} · attempts: ${plan.attemptsDefault} default (per-task overrides shown above)`)
   lines.push(
@@ -1126,10 +1269,27 @@ export async function main(argv = process.argv.slice(2)) {
   const tasks = readTasks(options.tasks)
   const armsResult = resolveArms(options.arms)
   const armNames = armsResult.arms.map((arm) => arm.name)
+  const gatedArms = armsResult.arms.filter((arm) => Array.isArray(arm.requires) && arm.requires.length > 0)
+  if (gatedArms.length > 0) {
+    const detail = gatedArms.map((arm) => `${arm.name}: ${arm.requires.join('; ')}`).join('\n')
+    if (!options.allowUnmetRequires) {
+      throw new Error(
+        'selected arm(s) declare setup the harness cannot verify from environment variables ' +
+          '(do that setup, then pass --allow-unmet-requires):\n' +
+          detail,
+      )
+    }
+    process.stderr.write(`eval: warning: running arm(s) whose declared requires are not verified:\n${detail}\n`)
+  }
   const primary = options.primary ? parsePrimary(options.primary, armNames) : null
   const repoInfo = detectRepo(tasks)
 
   if (options.dryRun) {
+    if (options.report) {
+      process.stderr.write(
+        `eval: warning: --dry-run does not write the report (${resolve(options.report)}); drop --dry-run to write it\n`,
+      )
+    }
     const plan = buildPlan(
       options,
       tasks,
@@ -1196,6 +1356,11 @@ export async function main(argv = process.argv.slice(2)) {
       worktreeRoot: options.worktreeRoot ? resolve(options.worktreeRoot) : null,
       keepWorktrees: options.keepWorktrees,
       resetBetweenAttempts: options.resetBetweenAttempts,
+      allowUnmetRequires: options.allowUnmetRequires,
+      armRequires: gatedArms.map((arm) => ({ arm: arm.name, requires: arm.requires })),
+      armHints: armsResult.arms
+        .filter((arm) => typeof arm.hint === 'string' && arm.hint.trim() !== '')
+        .map((arm) => ({ arm: arm.name, hint: arm.hint.trim() })),
       seed: options.seed,
       bootstraps: options.bootstraps,
       alpha: 0.05,

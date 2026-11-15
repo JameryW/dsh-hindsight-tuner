@@ -74,9 +74,16 @@ governance bugs were fixed would have measured noise.
 | Diagnosis | endpoint/token/bank/routing/effective config/probe/journal | shipped |
 | Evaluation | A/B harness: isolated worktrees, frozen bank, attempts-to-success, task-level statistics | shipped |
 
-Configuration stays opt-in for anything that changes model-visible text in a new
-way: `viewPolicy: budgeted` and `repeatPolicy: skip` are validated settings, not
-defaults smuggled into a release.
+Configuration stays opt-in at the plugin boundary for anything that changes
+model-visible text in a new way: the schema defaults are `budgetPolicy: off`,
+`repeatPolicy: inject`, `viewPolicy: truncate` and `verifyReminder: false`, so a
+bare `apply()` reproduces the 0.x behaviour. The shipped bundle row is where the
+measured policy is switched on (`budgetPolicy: adaptive`, `repeatPolicy: skip`,
+`verifyReminder: true`), because skipping a duplicate removes text and the
+reminder labels existing text rather than adding a new model-visible claim; a row
+is a deliberate deployment choice, not a hidden plugin default. Budgeted View
+(`viewPolicy: budgeted`) and the scenario policy stay opt-in until their A/B gates
+are answered.
 
 ## 4. Evidence gates
 

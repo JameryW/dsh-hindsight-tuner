@@ -181,8 +181,6 @@ async function main() {
             fail('recall', `${injected} inject_ok event(s) in journal, but server recall/pages failed (static tool guide only, no project memory) · ${diagPath()}`)
           } else if (bankStatus === 404 && realRecallOk === 0) {
             note('recall', `${injected} inject_ok event(s) recorded, but bank is not seeded yet (static guide only) · ${diagPath()}`)
-          } else if (realRecallOk === 0 && !bankSeeded) {
-            note('recall', `${injected} inject_ok event(s) recorded, awaiting seeded bank confirmation · ${diagPath()}`)
           } else {
             pass('recall', `${injected} successful recall(s) from the DSH harness in the window · ${diagPath()}`)
           }
@@ -197,7 +195,10 @@ async function main() {
         const tuner = summarizeTunerJournal({ windowHours: 24 })
         const state = tunerState()
         const governed = tuner.tierSelected + tuner.capped + tuner.skipped + tuner.deltas + tuner.reentered + tuner.viewed
-        const tuneRan = tuner.tuneApplied > 0 || tuner.tuneRequested > 0 || tuner.tuneSkipped > 0 || state.exists
+        // state.json only proves a tuner profile exists; it can be edited or
+        // written by an earlier session, so it must not stand in for tune
+        // activity inside the journal window (that masked "auto-tune never ran").
+        const tuneRan = tuner.tuneApplied > 0 || tuner.tuneRequested > 0 || tuner.tuneSkipped > 0
         const activatedAt = tuner.lastActivated?.ts ? Date.parse(tuner.lastActivated.ts) : Number.NaN
         const injectSinceActivated = injected > 0 && (!Number.isFinite(activatedAt) || (Number.isFinite(lastInjectAt) && lastInjectAt >= activatedAt))
         const expectsTierEvents = tuner.lastActivated?.cap !== 0
@@ -208,7 +209,10 @@ async function main() {
         } else if (!tuner.exists && !state.exists) {
           note('tuner', `no tuner state or journal yet · ${tuner.path} (open a DSH session with dsh-hindsight-tuner enabled)`)
         } else if (tuner.activated > 0 && tuner.lastActivated?.autoTune === true && !tuneRan && injectSinceActivated) {
-          fail('tuner', `plugin activated with autoTune=true, but auto-tune never ran (${injected} DSH inject_ok, 0 tune events, no ${state.path})`)
+          const stateNote = state.exists
+            ? `only ${state.path} exists, no tune events`
+            : `no ${state.path}`
+          fail('tuner', `plugin activated with autoTune=true, but auto-tune never ran (${injected} DSH inject_ok, 0 tune events, ${stateNote})`)
         } else if (tuner.activated > 0 && expectsTierEvents && injectSinceActivated && governed === 0) {
           fail('tuner', `plugin activated (budgetPolicy=${tuner.lastActivated.budgetPolicy}), DSH injected after activation, but 0 governed events reached tuner (hook order or lifecycle mismatch)`)
         } else if (governed > 0 || tuneRan) {

@@ -47,9 +47,13 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    800/1600/3000, never above `maxInjectTokens`), with a reason the status
    prints: the first recall of a session takes `deep` because nothing is in
    context yet; a recall that mostly repeats what is already in context (repeat
-   ratio ≥60% of its own lines) or follows a turn that had to be cut takes
-   `light`, because the model already has that text; otherwise the smallest tier
-   the recall fits is used.
+   ratio ≥60% of its own lines), or the turn right after one that had to be cut,
+   takes `light`, because the model already has that text; a recall that overlaps
+   the previous one by 30–60% takes `normal`, because only part of it is new;
+   otherwise the smallest tier the recall fits is used.
+   A cut is a one-turn cooldown, not a permanent downgrade: the turn after the
+   light one is a single step back up through `normal`, so a recall larger than
+   the light ceiling does not keep the session pinned at `light`.
    The tier is a ceiling, not a target, and `status` shows the table, the last
    choice with its reason and the per-tier counts (`status --json` carries the
    same as data). `budgetPolicy: off` keeps the single hard ceiling.
@@ -58,13 +62,17 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    turn itself. It keeps the same `budgetTiers` table but picks the scenario
    first: memory re-injected after a compaction and the first recall of a
    session take `deep`; a tool-continuation step, a recall that repeats what is
-   already in context, and a turn after one that had to be cut take `light`; a
+   already in context, and the first turn after one that had to be cut take
+   `light` (the same one-turn cooldown as the adaptive policy); a
    prompt that reads like debugging, editing or review takes `normal`, while a
    question takes `light`; anything else uses the `default` tier. `scenarioTiers`
    maps any scenario to a different tier per workspace (for example
    `{ debug: 'light' }`), and the choice, its reason and its budget appear on the
    `budget` line, in `status --json`, and as a `scenario` field on the journal's
-   `tier_selected` record. Defaults stay `off`/`adaptive`; this policy is
+   `tier_selected` record. The `continuation` scenario only appears when the host
+   asks for memory on a tool-continuation step; the shipped Hindsight integration
+   injects on the step that carries the user prompt, so those steps normally have
+   no recall to budget. Defaults stay `off`/`adaptive`; this policy is
    evidence-gated and waits for the P2 `A3`-vs-`A3-T`-vs-`A3-V` comparison before
    it can become a default.
 
@@ -144,11 +152,15 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    tool saving the JSON is not blocked, which is why the rename guard exists.
 
 5. **Writes the model cannot authorize itself.** The `hindsight_tuner` tool is
-   read-only by default (`status`, `probe`, `suggest`, and `dryRun` previews).
-   `tune`, `revert`, `enable` and `disable` are exposed to the tool only when the
-   profile row sets `allowAgentWrites: true`; there is no `confirm` flag, because
-   a flag the model fills in is not a permission boundary. The user-typed
-   `/hindsight tune` / `/hindsight revert` command is the intended write path.
+   read-only by default: its schema offers only `status`, `probe` and `suggest`,
+   and `tune`, `revert`, `enable` and `disable` are added to the schema only when
+   the profile row sets `allowAgentWrites: true`. There is no `confirm` flag,
+   because a flag the model fills in is not a permission boundary. A `dryRun`
+   preview never writes, but it previews `tune` or `revert`, and those actions are
+   absent from the read-only schema: tool `dryRun` previews require agent-write
+   mode too. In a read-only profile the preview path is the user-typed
+   `/hindsight tune --dry-run` / `/hindsight revert --dry-run` command, which is
+   also the intended write path.
 
 6. **A recall is evidence, not authority.** Pages are written by an earlier
    session; by the time they are injected the code they describe may already
@@ -166,12 +178,12 @@ normal process exit — diagnostics never sit on the model's critical path.
 
 ## Measuring memory
 
-What the plugin can observe from inside the loop is reported as `memory` in
-`status --json` and as one line in `/hindsight`: over the last 24 hours, how many
-recalls were fresh (`inject_ok`) versus unchanged (`inject_unchanged`), the
-resulting freshness percentage, how many pages were consolidated (`pages_ok`),
-and how many server calls failed (`pages_failed` + `retain_failed` +
-`reflect_failed`). Together with the budget accounting (`trimmedTokens`,
+What the plugin can observe from inside the loop is reported as the `memory`
+object in `status --json` (raw counters, including `pagesOk`) and as one line in
+`/hindsight`: over the last 24 hours, the freshness percentage, how many recalls
+were fresh (`inject_ok`) versus unchanged (`inject_unchanged`), and how many
+server calls failed (`pages_failed` + `retain_failed` + `reflect_failed`).
+Together with the budget accounting (`trimmedTokens`,
 `savedTokens`, per-tier counts) that is enough to see whether memory is being
 delivered and whether the budget is doing anything — not whether it *helped*.
 
@@ -189,8 +201,9 @@ The Pages budget is reported separately from the Recall budget, because they are
 different knobs: `recallOptions.max_tokens` cuts a synthesis, while
 `pageSearchLimit` counts pages. When the journal contains `inject_pages`
 entries, `status` shows `journal N injections, max M pages` and marks
-`the limit binds` when the configured `pageSearchLimit` equals the observed
-maximum; `suggest` then proposes a limit from the observed maximum instead of a
+`the limit binds` when the observed maximum reaches or exceeds the configured
+`pageSearchLimit` (a page count above the limit is the same signal as one exactly
+at it); `suggest` then proposes a limit from the observed maximum instead of a
 round number.
 
 ## A/B evaluation
@@ -283,11 +296,14 @@ the next DSH restart; the profile keeps its own copy of the row config.
 - `/hindsight enable` / `/hindsight disable` — turn the persistent auto-tune
   opt-out back on or off. `disable` leaves existing keys untouched.
 
-The same operations are exposed to the agent as the `hindsight_tuner` tool
-(`status`, `probe`, `suggest`; plus `tune`, `revert`, `enable`, `disable` when the
-row sets `allowAgentWrites: true`), and both call the same implementation. A
-tool call cannot escalate itself: `dryRun` previews are always allowed, writes
-are not.
+The same operations are exposed to the agent as the `hindsight_tuner` tool, and
+both call the same implementation. Its schema lists `status`, `probe` and
+`suggest` by default and adds `tune`, `revert`, `enable` and `disable` only when
+the row sets `allowAgentWrites: true`, so a read-only profile cannot even offer
+the write actions to a model. A tool call cannot escalate itself: a `dryRun`
+preview never writes, and without agent writes enabled the write actions are
+absent from the schema, while the shared guard refuses a real write even if a
+host dispatches one anyway.
 
 ## Coexistence
 
@@ -379,6 +395,7 @@ survives upgrades):
 ## Development
 
 ```sh
+node test/scenario.mjs     # scenario selection and tier-precedence unit tests
 node test/view.mjs         # pure selection/token-helper unit tests
 node test/smoke.mjs        # hermetic unit/behaviour tests
 node test/integration.mjs  # real @vectorize-io/hindsight-coding-agents hooks
@@ -386,12 +403,14 @@ node eval/selftest.mjs     # A/B harness orchestration, with a fake runner
 node scripts/verify-live.mjs  # this machine, after a restart (not part of npm test)
 ```
 
-`npm test` runs the first four. The smoke test is hermetic: it points
+`npm test` runs the first five. The smoke test is hermetic: it points
 `HINDSIGHT_CONFIG` and `DSH_HOME` at a
 scratch directory, so it never reads or writes your real memory config. The
 integration test loads the shipped Hindsight `dist/dsh.js`, registers its real
 `agent/pre-step` hook after the tuner, and asserts the payload the model would
-receive is inside the ceiling; it skips (exit 0) when the package is not
-installed, and CI installs it so every job runs it for real. The eval self-test
+receive is inside the ceiling. A local run prints `integration: skipped` and
+exits 0 when the package is not installed; `HINDSIGHT_INTEGRATION_REQUIRED=1`
+(which CI sets) turns that skip into a hard failure, so every CI job proves the
+composition for real instead of reporting a green skip. The eval self-test
 is offline too (fake agent, fake bank, throwaway git repos) and exercises the
 worktree/bank/stats modules as well as the CLI dry-run path.

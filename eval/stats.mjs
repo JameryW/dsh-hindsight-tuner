@@ -147,15 +147,18 @@ export function costOfRow(row, prices = ZERO_PRICES) {
   }
 
   let cost
-  if (usage) {
+  if (usage && totalUsageTokens(usage) > 0) {
     cost =
       (usage.input / 1_000_000) * priceTable.inputPerMTok +
       (usage.output / 1_000_000) * priceTable.outputPerMTok +
       (usage.cacheRead / 1_000_000) * priceTable.cacheReadPerMTok +
       (usage.cacheWrite / 1_000_000) * priceTable.cacheWritePerMTok
   } else {
-    // Only a total token count is known: price it at the uncached input rate.
-    cost = (rowTokens / 1_000_000) * priceTable.inputPerMTok
+    // Only a total token count is known (or the usage fields are all zero while
+    // a positive token count was reported): price it at the uncached input rate.
+    // An all-zero usage object is not enough information to price a row, and
+    // the weighted branch would silently return 0 USD.
+    cost = ((rowTokens ?? totalTokens) / 1_000_000) * priceTable.inputPerMTok
   }
   return round(cost, 6)
 }

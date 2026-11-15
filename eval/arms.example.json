@@ -8,7 +8,8 @@
     "tunerSettings below documents the DSH plugin settings that must be pinned before the run (plugin profile config / lib/config-file.js). autoTune drift invalidates the arm; pin the values and record them with the report.",
     "HINDSIGHT_EVAL_HINT is an eval-only convention: the agent command wrapper may read it to append the matching hint text to the prompt. It is metadata for the runner, not a plugin option.",
     "P3 compares two bank states. Run each bank as its own experiment with its own frozen fingerprint, or set per-arm HINDSIGHT_BANK_ID inside arm.env (then the single fingerprint covers only the primary bank).",
-    "Tasks must not depend on wall-clock time, network access or unseeded randomness; keep checks deterministic (see eval/README.md)."
+    "Tasks must not depend on wall-clock time, network access or unseeded randomness; keep checks deterministic (see eval/README.md).",
+    "Arms with a non-empty `requires` are refused by the CLI unless `--allow-unmet-requires` is passed: the harness cannot verify that the listed setup was done, so the operator must assert it (the run then warns on stderr and records armRequires in the report). The same gate applies to --dry-run; the plan lists every arm's hint/requires."
   ],
   "gates": [
     {

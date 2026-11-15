@@ -48,6 +48,7 @@ import {
   createWorktree,
   disposeWorktree,
   repoRootOf,
+  resetWorktree,
   verifyWorktree,
   withWorktree,
 } from './worktree.mjs'
@@ -489,6 +490,42 @@ async function worktreeChecks(repoDir, head, previous, worktreeRoot) {
     equal(gitWorktreeCount(repoDir), 1, 'only the main worktree remains registered')
   })
 
+  check('resetWorktree discards committed/staged edits and ignored artifacts', () => {
+    const handle = createWorktree({ repo: repoDir, root: worktreeRoot, name: 'reset' })
+    try {
+      // Simulate what an agent attempt can leave behind: an edit committed in
+      // the worktree, a staged-but-uncommitted edit, an untracked file and an
+      // ignored build artifact. All four must be gone before attempt 2.
+      writeFileSync(join(handle.path, 'tracked.txt'), 'attempt-one\n', 'utf8')
+      git(handle.path, ['add', 'tracked.txt'])
+      git(handle.path, ['commit', '-q', '-m', 'attempt one edit', '--no-gpg-sign'])
+      writeFileSync(join(handle.path, 'second.txt'), 'staged-edit\n', 'utf8')
+      git(handle.path, ['add', 'second.txt'])
+      writeFileSync(join(handle.path, 'untracked.txt'), 'junk\n', 'utf8')
+      writeFileSync(join(handle.path, '.gitignore'), '*.log\n', 'utf8')
+      writeFileSync(join(handle.path, 'artifact.log'), 'ignored-artifact\n', 'utf8')
+      equal(git(handle.path, ['status', '--porcelain']).trim().length > 0, true, 'dirty before reset')
+
+      const outcome = resetWorktree(handle)
+      equal(outcome.ok, true, 'resetWorktree.ok')
+      equalPath(outcome.path, handle.path, 'resetWorktree path')
+      equal(readText(join(handle.path, 'tracked.txt')), 'three\n', 'committed edit discarded')
+      equal(readText(join(handle.path, 'second.txt')), 'two\n', 'staged edit discarded')
+      equal(git(handle.path, ['rev-parse', 'HEAD']).trim(), handle.baseSha, 'HEAD back at the base commit')
+      equal(git(handle.path, ['status', '--porcelain']).trim(), '', 'worktree is clean after reset')
+      equal(existsSync(join(handle.path, 'untracked.txt')), false, 'untracked file removed')
+      equal(existsSync(join(handle.path, 'artifact.log')), false, 'ignored artifact removed')
+    } finally {
+      if (!handle.disposed) disposeWorktree(handle)
+    }
+  })
+
+  check('resetWorktree rejects handles without a path or baseSha', () => {
+    throws(() => resetWorktree(null), 'requires a worktree handle', 'null handle')
+    throws(() => resetWorktree({}), 'with a path', 'missing path')
+    throws(() => resetWorktree({ path: repoDir }), 'no valid baseSha', 'missing baseSha')
+  })
+
   await checkAsync('withWorktree disposes even when the callback throws', async () => {
     let inside = null
     const error = await throwsAsync(
@@ -748,6 +785,18 @@ function statsChecks() {
   check('costOfRow prices token-only rows at the input rate', () => {
     const prices = { inputPerMTok: 5, outputPerMTok: 99, cacheReadPerMTok: 1, cacheWritePerMTok: 1 }
     approx(costOfRow(makeRow({ tokens: 2_000_000, usage: null }), prices), 10, 1e-9, 'token-only cost')
+  })
+
+  check('costOfRow prices positive tokens reported with all-zero usage', () => {
+    const prices = { inputPerMTok: 5, outputPerMTok: 99, cacheReadPerMTok: 1, cacheWritePerMTok: 1 }
+    const row = makeRow({
+      tokens: 2_000_000,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    })
+    // The all-zero usage object used to take the weighted branch and price the
+    // row at 0 USD, hiding real spend.
+    approx(costOfRow(row, prices), 10, 1e-9, 'zero usage cost priced at the input rate')
+    equal(costOfRow(row, ZERO_PRICES), 2_000_000, 'zero-price proxy still follows the token count')
   })
 
   check('summarizeArm computes attempt-aware metrics', () => {
@@ -1089,6 +1138,7 @@ async function abChecks(repoDir, tempRoot) {
     equal(parsed.isolate, true, 'isolation on by default')
     equal(parsed.keepWorktrees, false, 'keepWorktrees default')
     equal(parsed.resetBetweenAttempts, false, 'reset default')
+    equal(parsed.allowUnmetRequires, false, 'allowUnmetRequires default')
     equal(parsed.json, false, 'json default')
     equal(parsed.dryRun, false, 'dryRun default')
     deepEqual(parsed.agent, ['claude', '-p', '--output-format', 'json'], 'agent default')
@@ -1134,6 +1184,7 @@ async function abChecks(repoDir, tempRoot) {
       '--json',
       '--keep-worktrees',
       '--reset-between-attempts',
+      '--allow-unmet-requires',
       '--dry-run',
     ])
     equal(parsed.repeats, 2, 'repeats')
@@ -1155,6 +1206,7 @@ async function abChecks(repoDir, tempRoot) {
     equal(parsed.json, true, 'json')
     equal(parsed.keepWorktrees, true, 'keep worktrees')
     equal(parsed.resetBetweenAttempts, true, 'reset between attempts')
+    equal(parsed.allowUnmetRequires, true, 'allow unmet requires')
     equal(parsed.dryRun, true, 'dry-run')
 
     const disabled = parseArgs([
@@ -1176,6 +1228,23 @@ async function abChecks(repoDir, tempRoot) {
       () => parseArgs(['--tasks', 't.json', '--agent-command', '[1,2]']),
       'non-empty strings',
       'bad agent JSON',
+    )
+  })
+
+  check('parseArgs accepts flag-like values and --flag=value forms', () => {
+    // A report file named like a flag is a legitimate path; only known flags
+    // are refused as values.
+    const spaced = parseArgs(['--tasks', 't.json', '--report', '--odd.json'])
+    equal(spaced.report, '--odd.json', 'flag-like path is a value')
+    const inline = parseArgs(['--tasks=t.json', '--repeats=2', '--no-isolate'])
+    equal(inline.tasks, 't.json', 'inline tasks')
+    equal(inline.repeats, 2, 'inline repeats')
+    equal(inline.isolate, false, 'inline form does not disturb boolean flags')
+    throws(() => parseArgs(['--tasks', 't.json', '--report=']), 'requires a value', 'empty inline value')
+    throws(
+      () => parseArgs(['--tasks', 't.json', '--report', '--json']),
+      'requires a value',
+      'known flag is not accepted as a value',
     )
   })
 
@@ -1300,6 +1369,10 @@ async function abChecks(repoDir, tempRoot) {
     equal(fromFile.source.kind, 'file', 'file source')
 
     throws(() => resolveArms('NOPE'), 'unknown arm', 'unknown CSV name')
+    // An explicitly empty --arms value used to silently select the default
+    // arms, which hid a typo in whatever produced the empty string.
+    throws(() => resolveArms(''), 'non-empty', 'explicitly empty arm spec')
+    equal(resolveArms(null).source.kind, 'default', 'null keeps the default arms')
   })
 
   check('readPrices normalizes a price file', () => {
@@ -1488,6 +1561,140 @@ async function abChecks(repoDir, tempRoot) {
       if (prevCfg === undefined) delete process.env.HINDSIGHT_CONFIG
       else process.env.HINDSIGHT_CONFIG = prevCfg
     }
+  })
+
+  await checkAsync('createRunner keeps the command-not-found guidance for a missing agent', async () => {
+    // On Windows this also exercises the ENOENT retry path: where.exe cannot
+    // find the command, so it must not be retried through the shell and the
+    // original guidance message must survive.
+    const runner = createRunner({
+      agent: ['dsh-eval-missing-command-xyz'],
+      timeoutMs: 10_000,
+      resetBetweenAttempts: false,
+    })
+    const result = await runner({
+      task: {
+        id: 'missing',
+        prompt: 'x',
+        cwd: repoDir,
+        check: { command: process.execPath, args: ['-e', 'process.exit(0)'] },
+      },
+      arm: { name: 'A0', env: {} },
+      attempt: 1,
+      worktree: null,
+    })
+    equal(result.passed, false, 'run failed')
+    equal(result.failureSignature, 'spawn-error', 'spawn error signature')
+    includes(result.error, 'command not found', 'guidance message preserved')
+  })
+
+  // A task may point at a subdirectory of its repository; the isolated
+  // worktree is a checkout of the whole repo, so the runner must cd into the
+  // matching subdirectory instead of silently running at the worktree root.
+  const subRepo = join(tempRoot, 'subdir-repo')
+  makeGitRepo(subRepo)
+  mkdirSync(join(subRepo, 'sub', 'pkg'), { recursive: true })
+  writeFileSync(join(subRepo, 'sub', 'pkg', 'keep.txt'), 'keep\n', 'utf8')
+  git(subRepo, ['add', '.'])
+  git(subRepo, ['commit', '-q', '-m', 'add sub pkg', '--no-gpg-sign'])
+  const subCwdFile = join(tempRoot, 'subdir-agent-cwd.json')
+  const subTasksFile = join(tempRoot, 'subtasks.json')
+  writeFileSync(
+    subTasksFile,
+    JSON.stringify({
+      tasks: [
+        {
+          id: 'sub',
+          prompt: 'report cwd',
+          cwd: join(subRepo, 'sub', 'pkg'),
+          env: { OUT_FILE: subCwdFile },
+          check: ['node', '-e', 'process.exit(0)'],
+          maxAttempts: 1,
+        },
+      ],
+    }),
+    'utf8',
+  )
+  const cwdAgentScript = join(tempRoot, 'cwd-agent.mjs')
+  writeFileSync(
+    cwdAgentScript,
+    [
+      "import { writeFileSync } from 'node:fs'",
+      'writeFileSync(process.env.OUT_FILE, JSON.stringify({ cwd: process.cwd() }))',
+    ].join('\n'),
+    'utf8',
+  )
+  const subRun = await runAbCli([
+    '--tasks',
+    subTasksFile,
+    '--arms',
+    'A0',
+    '--agent-command',
+    JSON.stringify([process.execPath, cwdAgentScript]),
+    '--timeout',
+    '60000',
+    '--json',
+    '--worktree-root',
+    join(tempRoot, 'subdir-worktrees'),
+  ])
+  check('ab runs a subdirectory task inside the matching worktree subdirectory', () => {
+    equal(subRun.status, 0, `exit code (stderr: ${subRun.stderr.trim()})`)
+    const report = JSON.parse(subRun.stdout)
+    equal(report.worktrees.length, 1, 'one isolated worktree recorded')
+    equalPath(report.worktrees[0].rel, join('sub', 'pkg'), 'relative subdirectory recorded')
+    equalPath(
+      report.worktrees[0].cwd,
+      join(report.worktrees[0].path, 'sub', 'pkg'),
+      'worktree subdirectory recorded',
+    )
+    const seen = JSON.parse(readFileSync(subCwdFile, 'utf8'))
+    equalPath(seen.cwd, report.worktrees[0].cwd, 'agent started in the task subdirectory')
+  })
+
+  const gatedArmsFile = join(tempRoot, 'gated-arms.json')
+  writeFileSync(
+    gatedArmsFile,
+    JSON.stringify({
+      arms: [{ name: 'G', hint: 'manual-setup', requires: ['seed the bank'], env: {} }],
+    }),
+    'utf8',
+  )
+  const gatedRefused = await runAbCli(['--tasks', tasksFile, '--arms', gatedArmsFile, '--dry-run'])
+  const gatedAllowed = await runAbCli([
+    '--tasks',
+    tasksFile,
+    '--arms',
+    gatedArmsFile,
+    '--dry-run',
+    '--allow-unmet-requires',
+    '--json',
+  ])
+  check('ab refuses arms with declared requires unless --allow-unmet-requires', () => {
+    equal(gatedRefused.status, 1, 'refused without the flag')
+    includes(gatedRefused.stderr, '--allow-unmet-requires', 'error names the override')
+    includes(gatedRefused.stderr, 'G: seed the bank', 'error names the arm and its setup')
+    equal(gatedAllowed.status, 0, `allowed with the flag (stderr: ${gatedAllowed.stderr.trim()})`)
+    includes(gatedAllowed.stderr, 'requires are not verified', 'allowed run warns')
+    const plan = JSON.parse(gatedAllowed.stdout)
+    equal(plan.arms[0].hint, 'manual-setup', 'plan carries the arm hint')
+    deepEqual(plan.arms[0].requires, ['seed the bank'], 'plan carries the declared setup')
+  })
+
+  const dryRunReport = join(tempRoot, 'dry-run-report.json')
+  const dryRunWithReport = await runAbCli([
+    '--tasks',
+    tasksFile,
+    '--arms',
+    'A0',
+    '--dry-run',
+    '--report',
+    dryRunReport,
+  ])
+  check('ab --dry-run --report warns that nothing is written', () => {
+    equal(dryRunWithReport.status, 0, `exit code (stderr: ${dryRunWithReport.stderr.trim()})`)
+    includes(dryRunWithReport.stderr, 'does not write the report', 'warning printed')
+    includes(dryRunWithReport.stdout, 'report: ', 'plan still shows the report file')
+    equal(existsSync(dryRunReport), false, 'no report file written')
   })
 
   const textRun = await runAbCli(['--tasks', tasksFile, '--arms', 'A0', '--dry-run'])
