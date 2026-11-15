@@ -2147,6 +2147,14 @@ try {
       HINDSIGHT_CONFIG: join(caseD, 'coding-agent.json'),
       HINDSIGHT_DIAG_FILE: join(caseD, 'diag.jsonl'),
     })
+    // Report the failing checks instead of only the exit code: a transient
+    // network or journal-read failure is otherwise invisible in CI.
+    const failedChecks = (resE.data?.results ?? []).filter((r) => r.status === 'fail')
+    assert.deepEqual(
+      failedChecks,
+      [],
+      `unseeded bank must be a note, not a failure (exit ${resE.code}, stderr: ${resE.stderr})`,
+    )
     assert.equal(resE.code, 0, 'an unseeded bank with a static-guide injection is a note, not a failure')
     assert.equal(byName(resE, 'recall').status, 'note')
     assert.match(byName(resE, 'recall').detail, /bank is not seeded yet \(static guide only\)/)
