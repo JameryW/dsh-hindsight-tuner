@@ -120,7 +120,15 @@ async function main() {
           bankStatus = tree.status
           if (tree.status === 200) {
             bankSeeded = true
-            pass('bank', `${bank} (${resolution.source}) is seeded`)
+            // A reachable bank can still be empty: the daemon creates the bank on
+            // the first probe and only sessions that retain memories fill it. An
+            // empty tree is reported as a note, not "seeded", so a machine that
+            // has never memorised anything is not mistaken for a working memory.
+            if (/^\{"pages":\s*\[\s*\]/.test(tree.body.trim())) {
+              note('bank', `${bank} (${resolution.source}) exists but has no pages yet — sessions will fill it as they retain memory`)
+            } else {
+              pass('bank', `${bank} (${resolution.source}) is seeded`)
+            }
           } else if (tree.status === 404) {
             note('bank', `${bank} (${resolution.source}) is not seeded yet — run one DSH session, then re-run this script`)
           } else {

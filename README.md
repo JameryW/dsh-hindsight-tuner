@@ -271,8 +271,11 @@ and checks the tuner's own state and journal (`state.json` and `tuner.jsonl`) to
 confirm auto-tuning and `agent/pre-step` governance actually ran. An unseeded
 bank is reported as NOTE rather than FAIL: the first page fetch 404s and the
 integration injects its static guide, which is the expected cold state before a
-session seeds the bank. A `401`/`403` is never explained that way — it stays a
-failure, because the process is talking to the wrong server or without a token.
+session seeds the bank. A bank that answers but holds no pages is a NOTE too —
+reachable is not the same as populated, and the script says so instead of
+calling an empty memory "seeded". A `401`/`403` is never explained that way — it
+stays a failure, because the process is talking to the wrong server or without a
+token.
 
 ## Install
 

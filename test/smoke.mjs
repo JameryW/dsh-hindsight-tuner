@@ -2069,6 +2069,16 @@ try {
     assert.equal(byName(resC, 'recall').status, 'pass')
     assert.equal(byName(resC, 'tuner').status, 'pass')
 
+    // 6c2: A reachable but empty bank is a note ("no pages yet"), not a PASS
+    // that would call an empty memory "seeded".
+    const resF = await runVerify({
+      DSH_HOME: join(caseB, 'dsh-home'),
+      HINDSIGHT_CONFIG: join(caseB, 'coding-agent.json'),
+      HINDSIGHT_DIAG_FILE: join(caseB, 'diag.jsonl'),
+    })
+    assert.equal(byName(resF, 'bank').status, 'note')
+    assert.match(byName(resF, 'bank').detail, /exists but has no pages yet/)
+
     // 6d: Cold machine (no tuner state/journal yet, 404 bank, empty diag.jsonl) -> exit 0 with notes.
     serverMode = '404'
     const caseD = join(scratch, 'verify-d')
