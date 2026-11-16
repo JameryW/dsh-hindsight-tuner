@@ -74,6 +74,21 @@ even when every task failed**.
 - `env` (optional) is merged into the agent and check environments. Precedence:
   `process.env` < `task.env` < `arm.env` < eval-pinned
   `HINDSIGHT_HARNESS=eval`, `HINDSIGHT_ARM=<arm>`, `HINDSIGHT_ATTEMPT=<n>`.
+- `asOf` (required when any selected arm uses memory): the ISO instant when the
+  task's history was frozen. A future cutoff is refused, and when `baseSha` is
+  also given, a starting commit created after the cutoff is refused — the
+  starting tree could already contain the fix.
+- `set` (optional, `screening` or `confirmation`): the two sets must not reuse
+  the same checkout and prompt, so the confirmation set is not chosen by the
+  tasks it confirms.
+- `exclude` (optional): commit or PR references that must stay out of the task's
+  history; naming the starting commit there is refused.
+- `baseSha` (optional): the expected pre-fix base commit, checked against
+  `asOf` and `exclude` when both are present.
+
+Leak prevention is a harness error, not a warning: evidence that cannot show its
+own history cutoff is not evidence. The audit runs for `--dry-run` too, and the
+resolved rules are printed (or included in `--json`) as the `leakage` field.
 
 Tasks must be deterministic: no wall-clock, network or unseeded randomness
 dependence, and the check must be runnable in a fresh checkout.
@@ -250,11 +265,13 @@ Record with every reported result:
 1. **Worktree base SHA** – in `report.worktrees[]` (and the task cwd commits).
 2. **Bank fingerprint** – the sha256 and the fingerprint file; assert `bank.verified`.
 3. **Arm env** – `report.arms[].env` (what was pinned on top of the task env).
-4. **Tuner settings** – `raw.autoInject`, `raw.pageSearchLimit`,
-   `raw.viewPolicy`, budget/repeat policies. Pin them in the plugin config or
-   `HINDSIGHT_CONFIG` file before the run. `autoTune` may mutate settings
-   between runs: disable it (or pin/freeze its state) and record the values, or
-   the arm silently drifts.
+4. **Tuner settings, plugin version and config pin** – the report pins
+   `experiment.plugin` (name/version), `experiment.bankId` and
+   `experiment.tuner` (config path + sha256, state path, `autoTune`,
+   `configUnchanged`, `stateChanged`). The run fails if the config hash changes
+   before the end, so `autoTune` cannot silently drift the arm; still record the
+   resolved values from the report. `state.json` changes are recorded but only a
+   config change is fatal.
 5. **Agent and model** – `--agent-command` (recorded in `report.experiment.agent`)
    including model/version flags.
 6. **Seed/bootstraps/alpha** and the preregistered `--primary`.
@@ -275,13 +292,21 @@ Record with every reported result:
                tokens, cost, durationMs */ ],
   "metrics": { "A3": { /* summarizeArm fields */ }, "A1": { ... } },
   "completeness": { "ok": true, "problems": [] },
+  "leakage": { "ok": true, "checked": 12,
+               "sets": { "screening": 8, "confirmation": 4 }, "problems": [] },
+  "memory": { "baseline": "A0", "tasks": 12, "arms": [ /* benefit/tax/net */ ] },
   "primary": "A3:A1",
   "prices": { ... } ,
   "bank": { "apiUrl", "bankId", "verified", "fingerprint", "capturedAt", ... },
   "worktrees": [{ "taskId", "arm", "repeat", "path", "repo", "baseSha",
                   "rel", "cwd" }],
   "experiment": { "startedAt", "finishedAt", "agent", "timeoutMs", "seed",
-                  "allowUnmetRequires", "armRequires", ... },
+                  "allowUnmetRequires", "armRequires",
+                  "plugin": { "name": "@jameryw/dsh-hindsight-tuner", "version": "0.18.0" },
+                  "bankId": "coding-agent::repo",
+                  "tuner": { "configPath", "configSha256", "statePath",
+                             "autoTune", "appliedAtStart", "configUnchanged",
+                             "stateChanged" } },
   "cleanupErrors": []
 }
 ```
@@ -312,6 +337,13 @@ solved/runs matrix.
   leak between repeats unless the task itself is idempotent.
 - **Manual metrics are not automated.** Memory Precision and False Fact Adoption
   require a human audit and a recorded sampling rule.
+- **Leak audit proves the metadata, not the seeding.** `asOf`, `baseSha` and the
+  screening/confirmation split are asserted automatically, but whether only
+  pre-cutoff history was actually seeded into the bank is still an operator step:
+  the fingerprint freezes the resulting bank, it cannot tell how it was built.
+- **`state.json` drift is recorded, not fatal.** A run fails only when the tuner
+  config file changes; `autoTune` bookkeeping in `state.json` is reported as
+  `experiment.tuner.stateChanged` for review.
 - **P3 needs two banks.** One `--fingerprint-out` covers the primary bank; use
   per-arm `HINDSIGHT_BANK_ID` plus separate runs for a full two-bank comparison.
 - **A3-V cannot be selected by env alone.** Pin the DSH plugin profile
@@ -324,6 +356,7 @@ solved/runs matrix.
 | `eval/worktree.mjs` | git worktree isolation: `repoRootOf`, `baseShaOf`, `createWorktree`, `verifyWorktree`, `disposeWorktree`, `resetWorktree`, `withWorktree` |
 | `eval/bank.mjs` | bank resolution, Pages tree/stats fingerprinting, fingerprint files, `verifyFingerprint`/`assertFrozen` |
 | `eval/stats.mjs` | attempt-row costs, `summarizeArm`, `assertComplete`, task-cluster `pairedComparison`, `formatStatsReport` |
+| `eval/leak.mjs` | leak-prevention audit: `asOf`/`baseSha` cutoff, `exclude` targets, screening/confirmation disjointness |
 | `eval/harness.mjs` | attempts-aware `evaluate`, derived runs, `formatReport`, `writeReport` |
 | `eval/ab.mjs` | CLI: flags, task/arm loading, worktree + bank lifecycle, agent/check spawning, JSON report |
 | `eval/selftest.mjs` | offline deterministic selftest (temp git repo, fake bank, synthetic rows, CLI dry runs) |

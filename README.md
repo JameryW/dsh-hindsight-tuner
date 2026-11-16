@@ -250,6 +250,12 @@ entries, `status` shows `journal N injections, max M pages` and marks
 at it); `suggest` then proposes a limit from the observed maximum instead of a
 round number.
 
+`status --json` also groups the journal into semantic classes under
+`activity.classes` — `injected`, `unchanged`, `fallback`, `timeout`, `cacheHit`,
+`notRecalled`, `failed`, `other` — so a degraded injection or a timeout is
+never read as a successful recall. The raw per-event counts stay available in
+`activity.totals`/`recent`.
+
 ## A/B evaluation
 
 `eval/` is an experiment-grade, dependency-free harness: it runs each task in an
@@ -259,10 +265,17 @@ fingerprints the Hindsight bank (`pages/tree` + `stats`) before the run, again
 before each new arm and once at the end (background consolidation must not
 change the memory mid-experiment; attempts also run with session retain off), and
 compares arms with a **preregistered primary** and a task-level paired
-bootstrap. A completeness check turns missing rows or overlapping attempts into
-an explicit inclusion warning in the report; a completed experiment exits 0 even
-when every task failed. The harness never calls a model itself — you point it at
-an agent command.
+bootstrap. Before any run it also audits leak prevention: with a memory arm,
+every task must declare `asOf` (the instant its history was frozen), a starting
+commit created after that cutoff is refused, a task may not start from a commit
+its `exclude` list names as the target fix, and the `screening`/`confirmation`
+sets may not reuse the same checkout and prompt. The run is pinned to the plugin
+version and a sha256 of the tuner config; if `autoTune` rewrites that config
+mid-experiment the harness fails instead of comparing drifted arms. A
+completeness check turns missing rows or overlapping attempts into an explicit
+inclusion warning in the report; a completed experiment exits 0 even when every
+task failed. The harness never calls a model itself — you point it at an agent
+command.
 
 ```sh
 # offline proof that the tooling works (no network, no agents)
@@ -281,8 +294,9 @@ node eval/ab.mjs --tasks tasks.json --arms A3,A1 --primary A3:A1 --repeats 5 \
 ```
 
 A task is `{ id, prompt, cwd, check }` (optional `maxAttempts`, `checkCwd`,
-`env`); `check` is a command, argv array or `{command, args}` object and its exit
-code is the ground truth. Arms are data: `A0` no memory, `A1` handwritten
+`env`, and for memory arms the leak-prevention fields `asOf`, `set`, `exclude`,
+`baseSha`); `check` is a command, argv array or `{command, args}` object and its
+exit code is the ground truth. Arms are data: `A0` no memory, `A1` handwritten
 conventions, `A2` Reflect, `A3` Pages, `A3-T` Pages + tuner truncation, `A3-V`
 Pages + Budgeted View, plus the P0 (`R0`/`R1`/`R2`) and P3 (`A4`/`A5`) arms in
 `eval/arms.example.json`. `--prices` supplies cache-adjusted input/output prices

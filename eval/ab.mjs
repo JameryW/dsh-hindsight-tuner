@@ -13,11 +13,12 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { configPath } from '../lib/config-file.js'
+import { configPath, tunerState } from '../lib/config-file.js'
 import { ENV_KEYS } from '../lib/diagnostics.js'
 import {
   DEFAULT_ARMS,
@@ -27,6 +28,7 @@ import {
   summarize as summarizeCompat,
   writeReport,
 } from './harness.mjs'
+import { armUsesMemory, auditTaskLeakage } from './leak.mjs'
 import * as stats from './stats.mjs'
 import {
   assertFrozen,
@@ -56,10 +58,77 @@ const ENV_TO_CONFIG_KEY = Object.fromEntries(
   Object.entries(ENV_KEYS).map(([configKey, envName]) => [envName, configKey]),
 )
 
+function hashFile(file) {
+  try {
+    return createHash('sha256').update(readFileSync(file)).digest('hex')
+  } catch (error) {
+    return error && error.code === 'ENOENT' ? null : 'unreadable'
+  }
+}
+
+/** The plugin version is part of the evidence fingerprint, not process state. */
+export function readPluginVersion() {
+  const pkg = JSON.parse(readFileSync(resolve(HERE, '..', 'package.json'), 'utf8'))
+  return { name: pkg.name, version: pkg.version }
+}
+
+/**
+ * Pin the pieces of host state an experiment must not silently move during a
+ * run: the tuner's shared config file (autoTune may rewrite it), its state
+ * file, the plugin version and the resolved settings it starts from. A
+ * fingerprint of the config makes "the agent's config changed under the
+ * experiment" a harness error instead of an unexplained performance shift.
+ *
+ * @param {{file?: string, stateFile?: string}} [options] injection points for tests
+ * @returns {{plugin: object, file: string, configHash: string|null,
+ *   stateFile: string, stateHash: string|null, autoTune: *, applied: string[],
+ *   pinnedAt: string}}
+ */
+export function pinExperimentConfig(options = {}) {
+  const state = tunerState()
+  const file = resolve(options.file ?? configPath())
+  const stateFile = resolve(options.stateFile ?? state.path)
+  return {
+    plugin: readPluginVersion(),
+    file,
+    configHash: hashFile(file),
+    stateFile,
+    stateHash: hashFile(stateFile),
+    autoTune: state.autoTune,
+    applied: state.applied,
+    pinnedAt: new Date().toISOString(),
+  }
+}
+
+/**
+ * @param {object} pin result of `pinExperimentConfig`
+ * @returns {{ok: boolean, problems: string[], configChanged: boolean,
+ *   stateChanged: boolean}}
+ */
+export function verifyPinnedConfig(pin) {
+  const configHash = hashFile(pin.file)
+  const stateHash = hashFile(pin.stateFile)
+  const configChanged = configHash !== pin.configHash
+  const stateChanged = stateHash !== pin.stateHash
+  const problems = []
+  if (configChanged) {
+    problems.push(
+      `tuner config ${pin.file} changed during the experiment (${pin.configHash ?? 'absent'} -> ${configHash ?? 'absent'}); autoTune must not mutate the experiment config`,
+    )
+  }
+  return { ok: problems.length === 0, problems, configChanged, stateChanged }
+}
+
 export const USAGE = `Usage: node eval/ab.mjs --tasks <file> [options]
 
 Required:
   --tasks <file>              JSON task list ({tasks:[...]} or [...])
+
+Leak prevention (checked before any run, including --dry-run):
+  With a memory arm, every task must declare "asOf": the ISO instant when its
+  history was frozen. A task whose "baseSha" was committed after its "asOf", or
+  whose "exclude" list names that commit, is refused. Tasks in the "screening"
+  and "confirmation" sets must not reuse the same checkout and prompt.
 
 Experiment:
   --arms <csv|file>           Arms: comma-separated names from eval/arms.example.json,
@@ -1207,6 +1276,21 @@ function printPlan(plan, options) {
         (task.cwdExists === false ? '  [cwd missing: runs will fail until the fixture exists]' : ''),
     )
   }
+  if (plan.leakage) {
+    const sets = plan.leakage.sets ?? { screening: 0, confirmation: 0 }
+    lines.push(
+      `  leakage: ${plan.leakage.checked ?? plan.tasks.length} task(s) checked · screening ${sets.screening} · confirmation ${sets.confirmation}` +
+        (plan.leakage.ok ? '' : `  PROBLEMS: ${(plan.leakage.problems ?? []).join('; ')}`),
+    )
+  }
+  if (plan.pin) {
+    const config = plan.pin.config ?? {}
+    lines.push(
+      `  pin: plugin ${plan.pin.plugin?.version ?? 'unknown'} · tuner config ${config.path ?? 'n/a'}` +
+        (config.sha256 ? ` sha256 ${config.sha256.slice(0, 12)}…` : ' (absent)') +
+        ` · autoTune ${config.autoTune === null || config.autoTune === undefined ? 'unset (default on)' : String(config.autoTune)}`,
+    )
+  }
   lines.push(`  arms: ${plan.arms.length} (${plan.armsSource.kind}${plan.armsSource.path ? `: ${plan.armsSource.path}` : ''})`)
   for (const arm of plan.arms) {
     const env = Object.entries(arm.env)
@@ -1289,6 +1373,18 @@ export async function main(argv = process.argv.slice(2)) {
   }
   const primary = options.primary ? parsePrimary(options.primary, armNames) : null
   const repoInfo = detectRepo(tasks)
+  // Leak prevention (roadmap §6): a task that will see memory must declare the
+  // history cutoff, and the cutoff must not admit commits after the task began.
+  // The audit runs here so --dry-run fails loudly too, instead of the first
+  // agent run discovering it.
+  const memoryArms = armsResult.arms.filter((arm) => armUsesMemory(arm))
+  const leakage = auditTaskLeakage(tasks, { requireAsOf: memoryArms.length > 0 })
+  if (!leakage.ok) {
+    throw new Error(`task leakage checks failed:\n- ${leakage.problems.join('\n- ')}`)
+  }
+  // Pin what an experiment must not silently move: the plugin version and the
+  // tuner config/state the runs start from. Re-verified after the run.
+  const pin = pinExperimentConfig()
 
   if (options.dryRun) {
     if (options.report) {
@@ -1308,6 +1404,11 @@ export async function main(argv = process.argv.slice(2)) {
       }),
       repoInfo,
     )
+    plan.leakage = leakage
+    plan.pin = {
+      plugin: pin.plugin,
+      config: { path: pin.file, sha256: pin.configHash, autoTune: pin.autoTune },
+    }
     if (options.json) process.stdout.write(`${JSON.stringify(plan, null, 2)}\n`)
     else process.stdout.write(`${printPlan(plan, options)}\n`)
     return 0
@@ -1350,6 +1451,7 @@ export async function main(argv = process.argv.slice(2)) {
       prepareRun: hooks.prepareRun,
       finishRun: hooks.finishRun,
       verifyBank,
+      requireAsOf: memoryArms.length > 0,
       onRow: options.json
         ? undefined
         : (row) => {
@@ -1364,6 +1466,12 @@ export async function main(argv = process.argv.slice(2)) {
     throw attachErrorCleanup(state, options, error)
   }
   const finishedAt = new Date().toISOString()
+  // The pinned config must still be the config the runs used: autoTune rewriting
+  // it mid-experiment would silently change every later arm.
+  const pinCheck = verifyPinnedConfig(pin)
+  if (!pinCheck.ok) {
+    throw attachErrorCleanup(state, options, new Error(`experiment config guard failed: ${pinCheck.problems.join('; ')}`))
+  }
 
   const report = {
     ...evaluation,
@@ -1393,6 +1501,20 @@ export async function main(argv = process.argv.slice(2)) {
       platform: process.platform,
       node: process.version,
       cwd: process.cwd(),
+      // Evidence pins: what the runs were actually executed with. The resolved
+      // bank id already lives in report.bank; repeating it here keeps the
+      // experiment block self-describing.
+      plugin: pin.plugin,
+      bankId: bank.info.bankId,
+      tuner: {
+        configPath: pin.file,
+        configSha256: pin.configHash,
+        statePath: pin.stateFile,
+        autoTune: pin.autoTune,
+        appliedAtStart: pin.applied,
+        configUnchanged: !pinCheck.configChanged,
+        stateChanged: pinCheck.stateChanged,
+      },
     },
     bank: bank.info,
     worktrees: state.worktrees,

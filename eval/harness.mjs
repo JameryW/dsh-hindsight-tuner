@@ -12,6 +12,7 @@
 
 import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
+import { armUsesMemory, auditTaskLeakage } from './leak.mjs'
 import {
   assertComplete,
   costOfRow,
@@ -265,6 +266,9 @@ function normalizePricesOrZeros(prices) {
  *   first run of each arm and once at the end; a throw aborts the experiment.
  *   Background consolidation can mutate the bank between arms, so a fingerprint
  *   captured before the experiment is not enough on its own.
+ * @param {boolean} [options.requireAsOf=false] require every task to declare
+ *   `asOf` (the history cutoff) when a memory arm is selected; the CLI sets it
+ *   so an experiment cannot run on tasks whose cutoff is unknown.
  */
 export async function evaluate(options = {}) {
   const {
@@ -293,6 +297,15 @@ export async function evaluate(options = {}) {
 
   const arms = normalizeArmList(rawArms ?? DEFAULT_ARMS)
   const tasks = normalizeTaskList(rawTasks, maxAttemptsDefault)
+  // Evidence that cannot show its own history cutoff is not evidence. When
+  // `requireAsOf` is set (the CLI sets it whenever a memory arm is selected),
+  // every task must declare `asOf`; any rule violation aborts before the first
+  // worktree or agent run.
+  const memoryArms = arms.filter((arm) => armUsesMemory(arm))
+  const leakage = auditTaskLeakage(tasks, { requireAsOf: options.requireAsOf === true && memoryArms.length > 0 })
+  if (!leakage.ok) {
+    fail(`task leakage checks failed: ${leakage.problems.join('; ')}`)
+  }
   const armNames = arms.map((arm) => arm.name)
   const order = armOrder === undefined || armOrder === null ? armNames : armOrder
   if (!Array.isArray(order)) fail('armOrder must be an array of arm names')
@@ -397,6 +410,7 @@ export async function evaluate(options = {}) {
     runs,
     metrics,
     completeness,
+    leakage,
     memory,
     primary: primarySpec,
     prices: priceTable,

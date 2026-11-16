@@ -1722,6 +1722,28 @@ const punctActivity = summarizeActivity({ harness: 'dsh', expectedOrigin: 'http:
 assert.equal(punctActivity.lastEndpoint, 'https://api.example:8443')
 assert.equal(punctActivity.lastBank, 'coding-agent::sub')
 
+// Semantic classes: a degraded injection, a timeout, a cache hit and a turn that
+// recalled nothing are distinct evidence, not one undifferentiated bucket.
+writeFileSync(process.env.HINDSIGHT_DIAG_FILE, [
+  { ts: now, event: 'inject_ok', chars: 100 },
+  { ts: now, event: 'inject_pages', count: 2 },
+  { ts: now, event: 'inject_unchanged' },
+  { ts: now, event: 'inject_timeout', after: 1000 },
+  { ts: now, event: 'pages_cached', count: 3 },
+  { ts: now, event: 'inject_fallback', reason: 'static guide' },
+  { ts: now, event: 'recall_empty' },
+  { ts: now, event: 'pages_failed', error: 'boom' },
+  { ts: now, event: 'mystery_event' },
+].map((entry) => JSON.stringify(entry)).join('\n'))
+const classActivity = summarizeActivity({ harness: 'dsh' })
+assert.deepEqual(
+  classActivity.classes,
+  { injected: 2, unchanged: 1, fallback: 1, timeout: 1, cacheHit: 1, notRecalled: 1, failed: 1, other: 1 },
+  'the journal separates injected, fallback, timeout, cache-hit, empty-recall and failed events',
+)
+const classStatus = JSON.parse(await tool.execute({ action: 'status', json: true }, exec))
+assert.equal(classStatus.activity.classes.cacheHit, 1, 'status --json exposes the semantic event classes')
+
 // The character-to-token ratio is answered by the caller: CJK recall is about one
 // token per character, so reporting it with the English 0.3 baseline understates
 // the size threefold.

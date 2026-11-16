@@ -71,8 +71,8 @@ governance bugs were fixed would have measured noise.
 | Repeat safety | compare against delivered text; identical turns skipped; new blocks sent as a `new-facts delta`; history never removed; a cut or omitted Budgeted View does not count as a full repeat; the last full non-delta base is kept for compaction re-injection | shipped |
 | Compaction safety | detect a shadowed injection from session events; re-inject the delivered text, labelled and counted | shipped |
 | Adaptive spend | per-turn tier from recent activity, with reasons in status | shipped |
-| Diagnosis | endpoint/token/bank/routing/effective config/probe/journal, compatible integration lines, deprecated tool names | shipped |
-| Evaluation | A/B harness: isolated worktrees, bank fingerprint verified before, between arms and after (session retain off), attempts-to-success, task-level statistics, paired memory benefit/tax | shipped |
+| Diagnosis | endpoint/token/bank/routing/effective config/probe/journal classified into semantic classes, compatible integration lines, deprecated tool names | shipped |
+| Evaluation | A/B harness: isolated worktrees, leak-prevention audit, bank fingerprint verified before, between arms and after (session retain off), pinned plugin version and tuner-config hash, attempts-to-success, task-level statistics, paired memory benefit/tax | shipped |
 
 Configuration stays opt-in at the plugin boundary for anything that changes
 model-visible text in a new way: the schema defaults are `budgetPolicy: off`,
@@ -166,19 +166,26 @@ dropped post-hoc.
 These are treated as executable tests, not intentions:
 
 1. Every Arm/Repeat runs in a fresh worktree from a recorded base SHA.
-2. Leak prevention: only history available before the task timestamp is readable;
-   the target fix commit/PR is excluded; screening and confirmation task sets are
-   disjoint.
+2. Leak prevention (automated in `eval/leak.mjs`, refused before any run): tasks
+   declare `asOf`; a starting commit created after that cutoff, a base commit
+   named in the task's `exclude` list, and a checkout/prompt reused across the
+   `screening` and `confirmation` sets are rejected. Only pre-cutoff history may
+   be seeded into the bank — the fingerprint freezes what exists; choosing the
+   cutoff while seeding stays an operator step.
 3. Bank verifiability: A2/A3 share one pre-warmed frozen snapshot; A4/A5 are
    independently writable; the Bank/Pages version fingerprint is saved per run.
-4. Config verifiability: `autoTune` cannot change the experiment's config; the
-   plugin version and resolved Bank ID are pinned in the report.
+4. Config verifiability (pinned in the report): the plugin version, resolved
+   Bank ID and a sha256 of the tuner config are recorded before the run. A
+   config change during the run fails the experiment (`autoTune` must not
+   mutate it); `state.json` changes are recorded but only config changes are
+   fatal.
 5. Write visibility: facts written in A4/A5 must finish extraction, consolidation
    and an explicit Pages refresh before a downstream test reads them
    (`pageTriggerType: manual` does not auto-refresh).
-6. Complete records: the journal distinguishes successful injection, fallback,
-   timeout, cache hit and not-recalled; "configured Reflect" is not treated as
-   "Reflect executed".
+6. Complete records: the journal is classified into `injected`, `unchanged`,
+   `fallback`, `timeout`, `cacheHit`, `notRecalled`, `failed` and `other`
+   (`activity.classes`), so a fallback or timeout is never read as a recall;
+   "configured Reflect" is not treated as "Reflect executed".
 
 ## 7. Roadmap
 

@@ -57,7 +57,20 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const AB_FILE = join(HERE, 'ab.mjs')
-const { parseArgs, readTasks, readPrices, resolveArms, parseUsage, splitCommand, normalizeCheck, createRunner } = await import('./ab.mjs')
+const {
+  parseArgs,
+  readTasks,
+  readPrices,
+  resolveArms,
+  parseUsage,
+  splitCommand,
+  normalizeCheck,
+  createRunner,
+  pinExperimentConfig,
+  verifyPinnedConfig,
+  readPluginVersion,
+} = await import('./ab.mjs')
+import { auditTaskLeakage } from './leak.mjs'
 
 // ---------------------------------------------------------------------------
 // Tiny assertion / reporting helpers
@@ -1371,6 +1384,7 @@ async function abChecks(repoDir, tempRoot) {
             check: ['node', '-e', 'process.exit(0)'],
             maxAttempts: 2,
             env: { HINDSIGHT_ARM: 'x', N: 1 },
+            asOf: '2020-01-01T00:00:00Z',
           },
           {
             id: 'impl',
@@ -1378,12 +1392,14 @@ async function abChecks(repoDir, tempRoot) {
             cwd: repoDir,
             check: { command: 'node', args: ['-e', 'process.exit(0)'] },
             checkCwd: 'sub',
+            asOf: '2020-01-01T00:00:00Z',
           },
           {
             id: 'stringcheck',
             prompt: 'string check form',
             cwd: repoDir,
             check: 'node script.js --flag',
+            asOf: '2020-01-01T00:00:00Z',
           },
         ],
       },
@@ -1816,6 +1832,76 @@ async function abChecks(repoDir, tempRoot) {
     includes(textRun.stdout, 'report: none', 'report plan')
     includes(textRun.stdout, 'fix', 'task id listed')
     includes(textRun.stdout, 'A0', 'arm listed')
+  })
+
+  // Leak prevention and evidence pinning: an experiment that cannot show its
+  // history cutoff or that lets the tuner rewrite its config mid-run is refused.
+  const noCutoffTasks = join(tempRoot, 'no-cutoff-tasks.json')
+  writeFileSync(
+    noCutoffTasks,
+    JSON.stringify({
+      tasks: [{ id: 'hot', prompt: 'fix it', cwd: repoDir, check: ['node', '-e', 'process.exit(0)'] }],
+    }),
+    'utf8',
+  )
+  const leakRefused = await runAbCli(['--tasks', noCutoffTasks, '--arms', 'A3', '--dry-run'])
+  check('ab refuses memory arms for tasks without a history cutoff', () => {
+    equal(leakRefused.status, 1, 'refused before any run')
+    includes(leakRefused.stderr, 'task leakage checks failed', 'error names the audit')
+    includes(leakRefused.stderr, 'has no asOf', 'error names the missing cutoff')
+  })
+
+  check('leak audit rejects late bases, excluded fixes, reused tasks and future cutoffs', () => {
+    const base = 'a'.repeat(40)
+    const audit = auditTaskLeakage(
+      [
+        {
+          id: 't1',
+          prompt: 'same prompt',
+          cwd: repoDir,
+          asOf: '2026-01-01T00:00:00Z',
+          baseSha: base,
+          set: 'screening',
+          exclude: [base],
+        },
+        {
+          id: 't2',
+          prompt: 'same prompt',
+          cwd: repoDir,
+          asOf: '2026-01-01T00:00:00Z',
+          set: 'confirmation',
+        },
+        { id: 't3', prompt: 'future', cwd: repoDir, asOf: '2999-01-01T00:00:00Z' },
+      ],
+      { now: Date.parse('2026-02-01T00:00:00Z'), gitCommitTime: () => '2026-03-01T00:00:00Z' },
+    )
+    equal(audit.ok, false, 'violations found')
+    const text = audit.problems.join('\n')
+    includes(text, 'after its asOf', 'late starting commit rejected')
+    includes(text, 'names as the target fix', 'excluded base commit rejected')
+    includes(text, 'must be disjoint', 'screening/confirmation reuse rejected')
+    includes(text, 'in the future', 'future cutoff rejected')
+    equal(audit.sets.screening, 1, 'screening set counted')
+    equal(audit.sets.confirmation, 1, 'confirmation set counted')
+  })
+
+  check('plugin version and tuner config are pinned for the experiment', () => {
+    const version = readPluginVersion()
+    equal(version.name, '@jameryw/dsh-hindsight-tuner', 'plugin name')
+    matches(version.version, /^\d+\.\d+\.\d+/, 'plugin version')
+    const configFile = join(tempRoot, 'pinned-config.json')
+    const stateFile = join(tempRoot, 'pinned-state.json')
+    writeFileSync(configFile, '{"autoInject":"pages"}', 'utf8')
+    writeFileSync(stateFile, '{"applied":{}}', 'utf8')
+    const pin = pinExperimentConfig({ file: configFile, stateFile })
+    equal(pin.plugin.version, version.version, 'pin carries the plugin version')
+    equal(pin.configHash.length, 64, 'config sha256 recorded')
+    equal(verifyPinnedConfig(pin).ok, true, 'an unchanged config verifies')
+    writeFileSync(configFile, '{"autoInject":"recall"}', 'utf8')
+    const changed = verifyPinnedConfig(pin)
+    equal(changed.ok, false, 'a mid-experiment rewrite is detected')
+    equal(changed.configChanged, true, 'config flagged as changed')
+    includes(changed.problems.join('\n'), 'changed during the experiment', 'problem names the mutation')
   })
 }
 
