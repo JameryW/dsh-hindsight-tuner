@@ -53,6 +53,21 @@ function quote(value) {
 }
 
 /**
+ * Block the current thread for a short backoff without timers/async.
+ * Used only by best-effort cleanup: the experiment result is already decided,
+ * and on Windows a just-exited agent (or one of its shell hooks) can keep a
+ * directory handle open for a few hundred milliseconds.
+ */
+function sleepSync(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+  } catch {
+    // Without SharedArrayBuffer the retries still run; only the delay is lost.
+  }
+}
+
+/**
  * Run git with array arguments (never a shell) and capture output.
  * `allowFailure` turns a non-zero exit into a result value instead of an error;
  * a missing git executable always throws, because silently pretending "not a
@@ -209,14 +224,35 @@ function makeHandle({ path, repo, baseSha, name }) {
   }
 }
 
+const REMOVE_ATTEMPTS = 4
+const REMOVE_RETRY_MS = 150
+const DELETE_ATTEMPTS = 16
+const DELETE_RETRY_MS = 500
+
 function removeWorktree({ repo, path }) {
-  const result = runGit(['worktree', 'remove', '--force', path], { cwd: repo, allowFailure: true })
+  let result = null
+  for (let attempt = 0; attempt < REMOVE_ATTEMPTS; attempt += 1) {
+    result = runGit(['worktree', 'remove', '--force', path], { cwd: repo, allowFailure: true })
+    if (result.ok || !existsSync(path)) break
+    // Windows can report EPERM/EBUSY while the agent process or one of its
+    // hooks is still releasing the directory; retry briefly before giving up.
+    if (attempt < REMOVE_ATTEMPTS - 1) sleepSync(REMOVE_RETRY_MS * (attempt + 1))
+  }
+  if (!result?.ok && existsSync(path)) {
+    // `git worktree remove` deletes the registration before the files on
+    // Windows, so later attempts report "not a working tree" while the
+    // directory (still held open by a lingering agent/hook) remains. Prune the
+    // stale registration and delete the files with a longer backoff.
+    runGit(['worktree', 'prune'], { cwd: repo, allowFailure: true })
+  }
   let fallbackError = null
-  if (!result.ok && existsSync(path)) {
+  for (let attempt = 0; attempt < DELETE_ATTEMPTS && existsSync(path); attempt += 1) {
     try {
-      rmSync(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+      rmSync(path, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 })
+      break
     } catch (error) {
       fallbackError = error
+      if (attempt < DELETE_ATTEMPTS - 1) sleepSync(DELETE_RETRY_MS)
     }
   }
   const prune = runGit(['worktree', 'prune'], { cwd: repo, allowFailure: true })
@@ -228,7 +264,7 @@ function removeWorktree({ repo, path }) {
   if (existsSync(path)) {
     const details = fallbackError ? `; fallback delete failed: ${firstLine(fallbackError.message)}` : ''
     throw new WorktreeError(
-      `could not remove worktree ${path}: ${firstLine(result.stderr) || `git exited ${result.status}`}${details}`,
+      `could not remove worktree ${path}: ${firstLine(result?.stderr) || `git exited ${result?.status}`}${details}`,
     )
   }
   return { removed: true, path }

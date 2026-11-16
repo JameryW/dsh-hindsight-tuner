@@ -1530,9 +1530,14 @@ export async function main(argv = process.argv.slice(2)) {
   process.stdout.write(options.json ? `${JSON.stringify(report, null, 2)}\n` : `${text}\n`)
 
   if (state.cleanupErrors.length > 0) {
+    // A worktree that cannot be deleted is a cleanup problem, not a lost
+    // experiment: the rows and the report were already written. Windows keeps a
+    // directory handle open while a just-exited agent or its shell hooks are
+    // still finishing, and that must not turn a completed run into exit 1.
     const first = state.cleanupErrors[0]
-    throw new Error(
-      `${state.cleanupErrors.length} worktree cleanup error(s); first: ${first.path}: ${first.message}`,
+    process.stderr.write(
+      `eval: warning: ${state.cleanupErrors.length} worktree cleanup error(s); first: ${first.path}: ${first.message}\n` +
+        'eval: the report is complete; remove the leftover directories manually or pass --keep-worktrees next time.\n',
     )
   }
   return 0

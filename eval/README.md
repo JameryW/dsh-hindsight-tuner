@@ -41,8 +41,10 @@ Useful flags: `--attempts N` (default 3, per-task `maxAttempts` wins),
 `--dry-run` prints the matrix (tasks, arms + env, repeats, attempts, worktree
 roots, bank/fingerprint actions) and exits 0 without spawning agents or touching
 the bank. Exit code 1 means a harness error (bad flags/tasks, git failure,
-unknown arm, fingerprint drift, cleanup error); a **completed experiment exits 0
-even when every task failed**.
+unknown arm, fingerprint drift); a **completed experiment exits 0 even when every
+task failed**. A worktree that cannot be deleted after the run is reported as a
+warning in `cleanupErrors` and does not change the exit code — the rows and the
+report are already complete.
 
 ## Task file
 
@@ -335,6 +337,10 @@ solved/runs matrix.
   attempts only between arms with the same attempt policy and hint handling.
 - **Isolation requires git.** Non-git tasks share `task.cwd`; side effects can
   leak between repeats unless the task itself is idempotent.
+- **Windows can keep a worktree locked briefly.** Cleanup retries the removal for
+  a few seconds; if an agent hook is still finishing, the directory is left in
+  place, listed in `cleanupErrors`, and the run still exits 0. Remove leftovers
+  manually (or use `--keep-worktrees` deliberately).
 - **Manual metrics are not automated.** Memory Precision and False Fact Adoption
   require a human audit and a recorded sampling rule.
 - **Leak audit proves the metadata, not the seeding.** `asOf`, `baseSha` and the
