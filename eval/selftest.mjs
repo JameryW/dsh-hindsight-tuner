@@ -1168,6 +1168,37 @@ async function harnessChecks() {
     deepEqual(rowsSeen, ['B', 'A'], 'onRow sees every row')
   })
 
+  await checkAsync('evaluate verifies the bank once per arm and once at the end', async () => {
+    const verified = []
+    const verifiedReport = await evaluate({
+      tasks: [
+        { id: 't1', prompt: 'x', maxAttempts: 1 },
+        { id: 't2', prompt: 'x', maxAttempts: 1 },
+      ],
+      arms: [{ name: 'A', env: {} }, { name: 'B', env: {} }],
+      runTask: async () => ({ passed: true, tokens: 5 }),
+      verifyBank: async ({ arm, stage }) => {
+        verified.push(`${arm?.name ?? 'all'}:${stage}`)
+      },
+    })
+    deepEqual(verified, ['A:arm-start', 'B:arm-start', 'all:end'], 'one check per arm plus a final check')
+    equal(verifiedReport.rows.length, 4, 'rows still recorded')
+    let failed = ''
+    try {
+      await evaluate({
+        tasks: [{ id: 't1', prompt: 'x', maxAttempts: 1 }],
+        arms: [{ name: 'A', env: {} }],
+        runTask: async () => ({ passed: true, tokens: 5 }),
+        verifyBank: async () => {
+          throw new Error('bank moved')
+        },
+      })
+    } catch (error) {
+      failed = error.message
+    }
+    equal(failed, 'bank moved', 'a failing bank check aborts the experiment')
+  })
+
   await checkAsync('writeReport writes readable JSON atomically', async () => {
     const target = join(await makeTempDir('report'), 'nested', 'report.json')
     const written = writeReport(report, target)

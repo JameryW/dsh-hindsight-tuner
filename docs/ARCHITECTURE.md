@@ -65,14 +65,14 @@ governance bugs were fixed would have measured noise.
 | Concern | Mechanism | Status |
 | --- | --- | --- |
 | Hard per-turn cap | outermost `agent/pre-step`, re-registered on `agents` mount and `agent/created` / `agent/session-start` | shipped |
-| Budget across messages | water-filling (`allocateBudget`), no hidden floor | shipped |
+| Budget across messages | weighted water-filling (`allocateBudget`): equal share by default, query-relevance weights keep task evidence before unrelated text; no hidden floor | shipped |
 | Over-budget payload | query-aware section order, then structure-aware trim that names the dropped sections and the tools that recover them | shipped |
 | Over-budget selection | Budgeted View: block ranking against the task text, provenance footer, measured result | shipped, opt-in |
-| Repeat safety | compare against delivered text; identical turns skipped; new blocks sent as a `new-facts delta`; history never removed | shipped |
+| Repeat safety | compare against delivered text; identical turns skipped; new blocks sent as a `new-facts delta`; history never removed; a cut or omitted Budgeted View does not count as a full repeat; the last full non-delta base is kept for compaction re-injection | shipped |
 | Compaction safety | detect a shadowed injection from session events; re-inject the delivered text, labelled and counted | shipped |
 | Adaptive spend | per-turn tier from recent activity, with reasons in status | shipped |
 | Diagnosis | endpoint/token/bank/routing/effective config/probe/journal, compatible integration lines, deprecated tool names | shipped |
-| Evaluation | A/B harness: isolated worktrees, frozen bank, attempts-to-success, task-level statistics, paired memory benefit/tax | shipped |
+| Evaluation | A/B harness: isolated worktrees, bank fingerprint verified before, between arms and after (session retain off), attempts-to-success, task-level statistics, paired memory benefit/tax | shipped |
 
 Configuration stays opt-in at the plugin boundary for anything that changes
 model-visible text in a new way: the schema defaults are `budgetPolicy: off`,

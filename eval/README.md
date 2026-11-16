@@ -232,6 +232,13 @@ also records `apiUrl`, `bankId`, `capturedAt` and `timeoutMs`.
 - `--verify-fingerprint <file>` re-captures **before** the experiment and aborts
   with a structural diff if the Pages tree or stats changed. The fingerprint
   file's `apiUrl`/`bankId` are used when `--api-url`/`--bank` are not passed.
+- With either option, the harness checks the fingerprint again before the first
+  run of every new arm and once at the end of the matrix; a change aborts with
+  `bank fingerprint check failed before arm <name>: …` (or `before the
+  experiment finished`) instead of comparing arms measured against different
+  memory. Attempts also run with `HINDSIGHT_RETAIN_SESSIONS=false` unless the
+  task or arm declares its own value, so a run does not mutate the bank it is
+  being measured against.
 
 Freeze one bank per experiment. Never compare arms measured on different banks.
 For A4/A5 use two separate experiments, each with its own frozen fingerprint.

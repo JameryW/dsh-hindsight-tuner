@@ -61,6 +61,7 @@ import {
   loadTokenizer,
   percentile,
   prioritizeSectionsByQuery,
+  queryRelevance,
   repetitionRatio,
   subtractRepeated,
   trimToBudget,
@@ -347,6 +348,19 @@ function stripRuntimePrefixes(text) {
 }
 
 /**
+ * True when the previous turn did not hand the model the whole recall.
+ *
+ * `lastCapped` covers a plain tail cut; `lastOmittedBlocks` covers a budgeted
+ * view that deliberately kept only the blocks matching that turn's query. In
+ * either case an identical raw recall arriving for a different query is new
+ * evidence, not a repeat: the blocks the previous projection omitted may be
+ * exactly what this turn needs.
+ */
+function hadOmittedContent(session) {
+  return Boolean(session?.lastCapped || (session?.lastOmittedBlocks ?? 0) > 0)
+}
+
+/**
  * Pick this turn's ceiling from the tier table.
  *
  * The policy is intentionally explainable rather than clever: every branch has
@@ -372,7 +386,9 @@ function chooseTier(tiers, session, text, total, { shadowed = null } = {}) {
   // (partly cut) recall again buys nothing, so it keeps the light ceiling.
   const previous = shadowed ? '' : stripRuntimePrefixes(session.lastInjectedText || session.lastRaw)
   // The stored raw recall is capped at RAW_MEMORY_LIMIT chars; compare on the same window.
-  const sameRecall = !shadowed && Boolean(session.lastRaw) && cleanText.slice(0, RAW_MEMORY_LIMIT) === session.lastRaw
+  // A partial previous delivery (cut, or a budgeted view that omitted blocks) can
+  // still be a full repeat for budget purposes only if everything was delivered.
+  const sameRecall = !shadowed && !hadOmittedContent(session) && Boolean(session.lastRaw) && cleanText.slice(0, RAW_MEMORY_LIMIT) === session.lastRaw
   const overlap = session.turns > 0 && previous
     ? (sameRecall ? 1 : repetitionRatio(previous, cleanText))
     : 0
@@ -417,36 +433,58 @@ function sessionEvents(session) {
  * replacements carry a `surfaceOp` range on the event envelope. Either is
  * authoritative for "the earlier copy is no longer in context".
  */
+function eventText(event) {
+  const content = event?.data?.content
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    const block = content.find((entry) => entry?.type === 'text')
+    return typeof block?.text === 'string' ? block.text : ''
+  }
+  return ''
+}
+
+function shadowOf(events, index, seq) {
+  if (seq === null) return null
+  for (let next = index + 1; next < events.length; next += 1) {
+    const later = events[next]
+    const shadowedSeqs = later?.data?.shadowedSeqs
+    if (Array.isArray(shadowedSeqs) && shadowedSeqs.includes(seq)) return 'compact'
+    const op = later?.surfaceOp
+    if (
+      op && op.op === 'replace'
+      && Number.isFinite(op.startSeq) && Number.isFinite(op.endSeq)
+      && seq >= op.startSeq && seq <= op.endSeq
+    ) {
+      return 'replace'
+    }
+  }
+  return null
+}
+
 function lastInjectionState(session, sourceKind) {
   const events = sessionEvents(session)
+  let latest = null
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]
     if (event?.type !== 'user/message') continue
     if (event?.data?.source?.kind !== sourceKind) continue
     const seq = Number.isFinite(event.seq) ? event.seq : null
-    let shadowed = null
-    if (seq !== null) {
-      for (let next = index + 1; next < events.length; next += 1) {
-        const later = events[next]
-        const shadowedSeqs = later?.data?.shadowedSeqs
-        if (Array.isArray(shadowedSeqs) && shadowedSeqs.includes(seq)) {
-          shadowed = 'compact'
-          break
-        }
-        const op = later?.surfaceOp
-        if (
-          op && op.op === 'replace'
-          && Number.isFinite(op.startSeq) && Number.isFinite(op.endSeq)
-          && seq >= op.startSeq && seq <= op.endSeq
-        ) {
-          shadowed = 'replace'
-          break
-        }
-      }
+    const shadowed = shadowOf(events, index, seq)
+    const isDelta = eventText(event).includes(DELTA_MARKER)
+    if (!latest) {
+      latest = { seq, shadowed, isDelta }
+      if (!isDelta) return latest
+      // A delta only carries the blocks that were new in its turn. Keep scanning
+      // for the full base recall that preceded it: if the base, rather than the
+      // delta, was shadowed, restoring the delta alone would leave most of the
+      // memory missing.
+      continue
     }
-    return { seq, shadowed }
+    if (!isDelta) {
+      return { ...latest, baseSeq: seq, baseShadowed: shadowed }
+    }
   }
-  return null
+  return latest
 }
 
 /**
@@ -474,6 +512,13 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
         // raw recall). Repetition and "is it still in context" are decided
         // against this, never against content that was cut before delivery.
         lastInjectedText: '',
+        // Blocks a budgeted view left out of the last delivery. Raw recall equality
+        // is not a repeat when part of the recall never reached the model: a new
+        // query may need exactly the blocks the previous projection omitted.
+        lastOmittedBlocks: 0,
+        // The last full, non-delta delivery. A delta only carries new blocks, so it
+        // cannot restore a base that a later compaction removed.
+        lastBaseText: '',
         lastCapped: false,
         cutCooldowns: 0,
         tier: null,
@@ -546,8 +591,10 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
    * Rebuild the last recall the model actually saw, because compaction removed
    * it while the integration's dedupe still believed it was present.
    */
-  function reentryText(session) {
-    const prior = session.lastInjectedText
+  function reentryText(session, logState) {
+    // A delta turn overwrites `lastInjectedText` with only the novel blocks. If
+    // the full base behind it was the shadowed copy, re-send the base instead.
+    const prior = logState?.baseShadowed && session.lastBaseText ? session.lastBaseText : session.lastInjectedText
     const text = prior.startsWith(REENTRY_PREFIX) ? prior : `${REENTRY_PREFIX}${prior}`
     const cap = settings.maxInjectTokens
     if (cap && meter.measure(text) > cap) {
@@ -565,7 +612,7 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
 
   /** Append a re-injection and account for it like any other injected text. */
   function reinject(decision, session, sessionId, logState) {
-    const text = reentryText(session)
+    const text = reentryText(session, logState)
     if (!text) return decision
     const tokens = meter.measure(text)
     const message = {
@@ -589,11 +636,15 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
     session.injected = (session.injected ?? 0) + tokens
     session.lastCapped = false
     session.cutCooldowns = 0
+    session.lastOmittedBlocks = 0
     session.lastInjectedText = text.slice(0, RAW_MEMORY_LIMIT)
+    // The re-injected copy is a full standalone delivery, so it becomes the new
+    // base any later delta can refer back to.
+    session.lastBaseText = text.slice(0, RAW_MEMORY_LIMIT)
     record({
       event: 'inject_reentered',
       session: sessionId,
-      reason: logState?.shadowed === 'compact' ? 'context-compacted' : 'surface-replaced',
+      reason: (logState?.shadowed ?? logState?.baseShadowed) === 'compact' ? 'context-compacted' : 'surface-replaced',
       seq: logState?.seq ?? null,
       tokens,
     })
@@ -637,7 +688,11 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
     noteTurn(decision.messages, sessionId)
     const session = sessionOf(sessionId)
     const logState = lastInjectionState(agentSession, settings.sourceKind)
-    const shadowed = logState?.shadowed ?? null
+    // `shadowed` describes the latest plugin message. When that latest message is
+    // a delta, its full base may separately have been shadowed by compaction: the
+    // base is what has to be restored, so treat that as the turn being shadowed.
+    const baseShadowed = logState?.baseShadowed ?? null
+    const shadowed = logState?.shadowed ?? baseShadowed
     // Re-entry depends on delivery history, not on the last turn's counter: a
     // turn whose recall was dropped as a duplicate delivers nothing
     // (`lastInjected = 0`) but the text the model actually received is still the
@@ -690,10 +745,11 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
     // "already there" and re-sending is required rather than wasteful.
     const previous = shadowed || !session.lastInjectedText ? '' : stripRuntimePrefixes(session.lastInjectedText)
     const freshText = fresh.map((candidate) => candidate.rawText).join('\n')
-    // An unchanged raw recall is a full repeat even when last turn delivered only
-    // a trimmed prefix or stripped runtime banners: re-sending it would buy
-    // nothing, so no block of it can be "new facts".
-    const sameRecall = Boolean(session.lastRaw) && Boolean(freshText) && freshText.slice(0, RAW_MEMORY_LIMIT) === session.lastRaw
+    // An unchanged raw recall is a full repeat only when the previous turn handed
+    // the model everything it asked for. After a cut or a budgeted view that
+    // omitted blocks, the missing content is still new: a different query can
+    // legitimately want exactly those blocks.
+    const sameRecall = !hadOmittedContent(session) && Boolean(session.lastRaw) && Boolean(freshText) && freshText.slice(0, RAW_MEMORY_LIMIT) === session.lastRaw
     const repeatRatio = previous && freshText
       ? (sameRecall ? 1 : repetitionRatio(previous, freshText))
       : 0
@@ -807,6 +863,7 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
     let tier = null
     let after = total
     let dropped = 0
+    let omittedBlocks = 0
     const finalTexts = new Map()
 
     if (cap && (settings.budgetPolicy === 'adaptive' || settings.budgetPolicy === 'scenario')) {
@@ -859,7 +916,12 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
     }
 
     if (budget && total > budget) {
-      const allocations = allocateBudget(survivors.map((candidate) => candidate.tokens), budget)
+      // Spend the turn budget where the current query has evidence: a large
+      // recall that mentions the task keeps more of its body than a small,
+      // unrelated one. Without lexical signal every weight is 1, which is the
+      // original equal-share water-filling.
+      const weights = survivors.map((candidate) => 1 + queryRelevance(candidate.rawText, queryText))
+      const allocations = allocateBudget(survivors.map((candidate) => candidate.tokens), budget, weights)
       // Only the budgeted view needs to know what the turn is about; the default
       // truncating mode never reads the other messages.
       const viewContext = settings.viewPolicy === 'budgeted'
@@ -907,6 +969,7 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
             stats.viewTurns += 1
             stats.viewKept += view.kept
             stats.viewOmitted += view.omitted
+            omittedBlocks += view.omitted
             record({
               event: 'inject_view',
               session: sessionId,
@@ -978,6 +1041,7 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
     session.tokens += total
     session.injected = (session.injected ?? 0) + after
     session.lastCapped = cappedThisTurn
+    session.lastOmittedBlocks = omittedBlocks
     session.cutCooldowns = tier?.cooldown ? 1 : 0
     // Remember the fresh recall request (history copies are not "the recall"
     // that arrives next turn), so an unchanged request is detected exactly.
@@ -986,7 +1050,12 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
         .map((candidate) => candidate.rawText)
         .join('\n')
         .slice(0, RAW_MEMORY_LIMIT)
-      if (deliveredText) session.lastInjectedText = deliveredText.slice(0, RAW_MEMORY_LIMIT)
+      if (deliveredText) {
+        session.lastInjectedText = deliveredText.slice(0, RAW_MEMORY_LIMIT)
+        // A delta turn delivers only novel blocks; keep the older full base so a
+        // later compaction can still restore the whole recall.
+        if (deltaTurns === 0) session.lastBaseText = deliveredText.slice(0, RAW_MEMORY_LIMIT)
+      }
     }
     stats.turns += 1
     stats.lastTurnTokens = total
@@ -1808,17 +1877,22 @@ export function apply(ctx, rawConfig) {
   function formatSuggestion(status) {
     const chars = status.activity.injectSizes ?? []
     // The upstream journal records characters, not tokens. Scale them with the
-    // ratio this process measured only when it is clearly CJK-dense (~1 token per
-    // character): the 0.3 English baseline stays for prose, and the measured mix
-    // of a mixed workspace is not applied to injections it did not describe.
+    // ratio this process measured when it is a plausible tokeniser density
+    // (0.22..1.10 tok/char): code-dense English sits around 0.35–0.43, where the
+    // old >0.45 gate silently fell back to 0.3 and underestimated the budget by
+    // a quarter. Outside that band the 0.3 English baseline is the safer default.
     const measuredRatio = status.budget.charRatio
-    const charRatio = measuredRatio > 0.45 ? measuredRatio : 0.3
+    const usableRatio = Number.isFinite(measuredRatio) && measuredRatio >= 0.22 && measuredRatio <= 1.10
+    const charRatio = usableRatio ? measuredRatio : 0.3
     const seen = chars.map((size) => Math.ceil(size * charRatio))
     const p50 = percentile(seen, 50)
     const p95 = percentile(seen, 95)
     const observed = p95 ?? status.budget.maxTurnTokens ?? 0
     const cap = Math.max(512, Math.min(8000, Math.ceil((observed || 2000) * 1.25)))
-    const recall = Math.min(cap, 2000)
+    // The server-side recall pool has to be at least as large as what the view
+    // may select from; a 2000-token pool starved the 3000+ deep tiers and made
+    // the budgeted policy choose among blocks it had already lost.
+    const recall = status.budget.viewPolicy === 'budgeted' ? Math.min(cap, 4000) : Math.min(cap, 2500)
     const lines = ['Hindsight budget suggestion (read-only)']
     if (p95) {
       lines.push(`  observed recall ~${p50} tok p50 · ~${p95} tok p95 (${seen.length} injections, char-based estimate)`)
@@ -1828,8 +1902,8 @@ export function apply(ctx, rawConfig) {
       lines.push('  no recall measured yet: the suggestion starts from the 2000-token default')
     }
     lines.push(`  cap      maxInjectTokens: ${cap}  (1.25× the p95, clamped 512..8000; current ${status.budget.cap})`)
-    if (measuredRatio > 0.45) {
-      lines.push(`  density  scaled with ~${measuredRatio} tok/char measured in this process (English prose is ~0.3); the cap above already accounts for it`)
+    if (usableRatio) {
+      lines.push(`  density  scaled with ~${measuredRatio} tok/char measured in this process (English prose is ~0.3, code-dense text is higher); the cap above already accounts for it`)
     }
     lines.push(`  recall   recallOptions.max_tokens: ${recall}  (Pages and Recall are separate ceilings; do not make recall larger than the cap by accident)`)
     const observedPages = status.activity?.pages

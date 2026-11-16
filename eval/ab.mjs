@@ -618,13 +618,19 @@ function relativeToRepo(repoRoot, dir) {
 
 function buildEnvForRun(task, arm, attempt) {
   const env = { ...process.env }
+  let retainDeclared = false
   for (const source of [task.env, arm.env]) {
     if (!source) continue
+    if (Object.prototype.hasOwnProperty.call(source, 'HINDSIGHT_RETAIN_SESSIONS')) retainDeclared = true
     for (const [key, value] of Object.entries(source)) env[key] = String(value)
   }
   env.HINDSIGHT_HARNESS = 'eval'
   env.HINDSIGHT_ARM = arm.name
   env.HINDSIGHT_ATTEMPT = String(attempt)
+  // A/B arms must see a frozen bank: background consolidation between arms would
+  // silently change the treatment. Arms that genuinely need retain can opt back
+  // in through task.env/arm.env, which is recorded in the arm definition.
+  if (!retainDeclared) env.HINDSIGHT_RETAIN_SESSIONS = 'false'
   return env
 }
 
@@ -1309,6 +1315,23 @@ export async function main(argv = process.argv.slice(2)) {
 
   const prices = options.prices ? readPrices(options.prices) : null
   const bank = await prepareBank(options, tasks)
+  // When a fingerprint was captured or verified, re-check it before every new
+  // arm and once at the end: one check before the experiment cannot notice a
+  // background consolidation that changes the bank while arms are running.
+  const verifyBank = bank.fingerprint
+    ? async ({ arm, stage }) => {
+        const label = stage === 'end' ? 'before the experiment finished' : `before arm ${arm?.name ?? '?'}`
+        try {
+          await assertFrozen(bank.fingerprint, {
+            apiUrl: bank.info.apiUrl,
+            bank: bank.info.bankId,
+            token: options.apiToken ?? undefined,
+          })
+        } catch (error) {
+          throw new Error(`bank fingerprint check failed ${label}: ${error.message}`)
+        }
+      }
+    : undefined
   const state = { worktrees: [], handles: [], cleanupErrors: [] }
   const hooks = createWorktreeHooks(options, state)
   const startedAt = new Date().toISOString()
@@ -1326,6 +1349,7 @@ export async function main(argv = process.argv.slice(2)) {
       defaultMaxAttempts: options.attempts,
       prepareRun: hooks.prepareRun,
       finishRun: hooks.finishRun,
+      verifyBank,
       onRow: options.json
         ? undefined
         : (row) => {

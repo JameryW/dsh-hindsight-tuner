@@ -36,7 +36,7 @@ delete process.env.DSH_PROFILE
 delete process.env.DSH_INSTALL_DIR
 for (const name of ['HINDSIGHT_AUTO_INJECT', 'HINDSIGHT_API_URL', 'HINDSIGHT_API_PORT', 'HINDSIGHT_DISABLED']) delete process.env[name]
 
-const { estimateTokens, truncateToBudget, trimToBudget, allocateBudget, countTokens, percentile, FALLBACK_MARGIN, overlapRatio, repetitionRatio, extractQueryTerms, prioritizeSectionsByQuery, buildRecoverableMarker } = await import('../lib/tokens.js')
+const { estimateTokens, truncateToBudget, trimToBudget, allocateBudget, countTokens, percentile, FALLBACK_MARGIN, overlapRatio, repetitionRatio, extractQueryTerms, prioritizeSectionsByQuery, buildRecoverableMarker, queryRelevance } = await import('../lib/tokens.js')
 const { applyTuning, revertTuning, readConfigFile, getPath, autoTuneEnabled, setAutoTune, sweepStaleTemps, tunerState } = await import('../lib/config-file.js')
 const { bankResolution, diagPath, effectiveConfig, effectiveServer, expandBankTemplate, installedBundles, isProfileRoot, legacyToolNames, optedOut, profileRoots, projectName, summarizeActivity } = await import('../lib/diagnostics.js')
 const { record, flushJournal, journalPending, summarizeTunerJournal } = await import('../lib/log.js')
@@ -98,6 +98,15 @@ assert.deepEqual(allocateBudget([10, 300], 200), [10, 190], 'small recall stays 
 assert.deepEqual(allocateBudget([50, 50, 300], 200), [50, 50, 100], 'the largest message absorbs the remainder')
 assert.deepEqual(allocateBudget([100, 100, 100], 600), [100, 100, 100], 'no cut needed under the cap')
 assert.equal(allocateBudget([], 600).length, 0)
+
+// Query-weighted allocation: the same depth per unit of relevance, still capped
+// by each message's own size. Weights of 1 are byte-for-byte the old behaviour.
+assert.deepEqual(allocateBudget([100, 100], 100, [2, 1]), [66, 34], 'the query-relevant message keeps a larger share')
+assert.deepEqual(allocateBudget([10, 300], 200, [1, 1]), [10, 190], 'default weights are still equal-share water-filling')
+assert.deepEqual(allocateBudget([100, 100], 100, [0, -1]), [50, 50], 'invalid weights fall back to 1')
+assert.ok(queryRelevance('## Budget accounting\nlib/tokens.js trimToBudget must hold', 'Fix lib/tokens.js trimToBudget') > 0.3, 'identifier hits score relevance')
+assert.equal(queryRelevance('completely unrelated prose about deployment', 'Fix lib/tokens.js trimToBudget'), 0, 'no term hits score zero')
+assert.equal(queryRelevance('anything', ''), 0, 'an empty query has no relevance')
 
 // Recall is markdown: a cut must not split a code fence, and should land on a
 // paragraph boundary rather than at an arbitrary character.
@@ -945,19 +954,25 @@ const repeatTurn = await adaptiveTurn('repeat', big)
 assert.ok(estimateTokens(injectedText(repeatTurn)) <= 100, 'a repeated recall drops to the light ceiling')
 adaptiveStatus = JSON.parse(await adaptiveTool.execute({ action: 'status', json: true }, adaptiveExec))
 assert.equal(adaptiveStatus.budget.tier.name, 'light')
-assert.match(adaptiveStatus.budget.tier.reason, /repeats what is in context/)
-
-const afterCutTurn = await adaptiveTurn('fresh', long.toUpperCase().repeat(3))
-assert.ok(estimateTokens(injectedText(afterCutTurn)) <= 100, 'a turn after a cut stays on the light ceiling')
-adaptiveStatus = JSON.parse(await adaptiveTool.execute({ action: 'status', json: true }, adaptiveExec))
+// The previous deep turn delivered only a 400-token prefix of `big`; an identical
+// raw recall still has unseen content, so it is the one-turn after-cut rule that
+// picks light, not the "full repeat" rule.
 assert.match(adaptiveStatus.budget.tier.reason, /previous recall had to be cut/)
 
-const stepUpRecall = Array.from({ length: 400 }, (_, index) => `alpha-zeta-${index} unique fact item for cooldown step-up check.`).join('\n')
-const stepUpTurn = await adaptiveTurn('recover', stepUpRecall)
-assert.ok(estimateTokens(injectedText(stepUpTurn)) <= 200, 'turn after light cooldown steps up to normal ceiling')
+// The repeated recall above was itself an after-cut turn, so it carries the
+// cooldown: the next turn steps back up to normal rather than staying at light.
+const afterCutTurn = await adaptiveTurn('fresh', long.toUpperCase().repeat(3))
+assert.ok(estimateTokens(injectedText(afterCutTurn)) <= 200, 'the turn after a cut steps back up to the normal ceiling')
 adaptiveStatus = JSON.parse(await adaptiveTool.execute({ action: 'status', json: true }, adaptiveExec))
 assert.equal(adaptiveStatus.budget.tier.name, 'normal')
 assert.match(adaptiveStatus.budget.tier.reason, /stepping back up after a cut/)
+
+const stepUpRecall = Array.from({ length: 400 }, (_, index) => `alpha-zeta-${index} unique fact item for cooldown step-up check.`).join('\n')
+const stepUpTurn = await adaptiveTurn('recover', stepUpRecall)
+assert.ok(estimateTokens(injectedText(stepUpTurn)) <= 100, 'the following cut cools down to the light ceiling')
+adaptiveStatus = JSON.parse(await adaptiveTool.execute({ action: 'status', json: true }, adaptiveExec))
+assert.equal(adaptiveStatus.budget.tier.name, 'light')
+assert.match(adaptiveStatus.budget.tier.reason, /previous recall had to be cut/)
 assert.equal('cooldown' in adaptiveStatus.budget.tier, false, 'internal cooldown flag is stripped from public status')
 
 // A tier can never raise the hard cap.
@@ -986,9 +1001,10 @@ const skipTurn = (id, text) => waterfall(skipping, 'agent/pre-step', { agent: { 
   kind: 'enter',
   messages: [human, adaptiveRecall(id, text)],
 }))
-const firstSkip = await skipTurn('first', big)
+const skipSeed = Array.from({ length: 20 }, (_, index) => `line ${index} duplicate governance sample with some prose.`).join('\n')
+const firstSkip = await skipTurn('first', skipSeed)
 assert.equal(firstSkip.messages.length, 2, 'the first recall is injected')
-const duplicateSkip = await skipTurn('duplicate', big)
+const duplicateSkip = await skipTurn('duplicate', skipSeed)
 assert.equal(duplicateSkip.messages.length, 1, 'an identical recall is not injected twice')
 assert.equal(duplicateSkip.messages.some((message) => message.source?.kind === 'plugin:hindsight'), false)
 const skipStatus = JSON.parse(await skipping.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status', json: true }, skipExec))
@@ -1116,6 +1132,34 @@ assert.ok(cappedReentryText.startsWith('[dsh-hindsight-tuner: memory re-injected
 assert.ok(cappedReentryText.includes('[Hindsight historical memory'), 'reentry trim protects VERIFY_REMINDER')
 for (const dispose of tightReentry.disposers) dispose()
 
+// A delta turn replaces `lastInjectedText` with only the novel blocks. If a
+// later compaction shadows the full base rather than the delta, re-entry must
+// restore the base, not the fragment.
+const deltaReentry = makeHarness()
+apply(deltaReentry.ctx, { autoTune: false, maxInjectTokens: 900, repeatPolicy: 'skip', repeatThreshold: 0.8 })
+const deltaLog = []
+const deltaTurnFn = (messages) => waterfall(
+  deltaReentry,
+  'agent/pre-step',
+  { agent: { session: { header: { id: 'delta-re' }, snapshotEvents: () => deltaLog } } },
+  async () => ({ kind: 'enter', messages }),
+)
+const deltaBase = Array.from({ length: 6 }, (_, block) => `### Base block ${block}\n${Array.from({ length: 4 }, (_, line) => `- base fact ${block}.${line} with enough words to occupy the ceiling`).join('\n')}`).join('\n\n')
+const deltaBaseTurn = await deltaTurnFn([human, adaptiveRecall('db1', deltaBase)])
+const deltaBaseText = injectedText(deltaBaseTurn)
+deltaLog.push({ type: 'user/message', seq: 10, data: { source: { kind: 'plugin:hindsight' }, content: [{ type: 'text', text: deltaBaseText }] } })
+const deltaWithExtra = `${deltaBase}\n\n### Extra block\n- the new fact that only the delta turn carries.`
+const drDeltaTurn = await deltaTurnFn([human, adaptiveRecall('db2', deltaWithExtra)])
+const drDeltaText = injectedText(drDeltaTurn)
+assert.ok(drDeltaText.includes('new-facts delta'), 'the second turn is delivered as a delta')
+deltaLog.push({ type: 'user/message', seq: 42, data: { source: { kind: 'plugin:hindsight' }, content: [{ type: 'text', text: drDeltaText }] } })
+deltaLog.push({ type: 'compaction/summary', seq: 43, data: { shadowedSeqs: [10] } })
+const baseReentry = await deltaTurnFn([human])
+const baseReentryText = injectedText(baseReentry)
+assert.ok(baseReentryText.includes('Base block 5'), 're-entry restores the full base, not the delta fragment')
+assert.ok(baseReentryText.length > drDeltaText.length, 'the re-injected base is larger than the delta')
+for (const dispose of deltaReentry.disposers) dispose()
+
 // --- budgeted view ----------------------------------------------------------
 // Truncation keeps the prefix; the budgeted view spends the same budget on the
 // blocks whose evidence matches the task, and labels what it left out.
@@ -1157,6 +1201,30 @@ assert.ok(plainText.startsWith('### Unrelated note 0'), 'with no signal the view
 assert.ok(estimateTokens(plainText) <= 200, 'the fallback selection is still measured')
 for (const dispose of viewHarness.disposers) dispose()
 for (const dispose of plainHarness.disposers) dispose()
+
+// A budgeted view omits blocks that did not match its query. The same raw Pages
+// arriving for a different query must not be classified as a repeat: the omitted
+// blocks are exactly the evidence the new turn may need (deferred selectivity).
+const revivalHarness = makeHarness()
+apply(revivalHarness.ctx, { autoTune: false, maxInjectTokens: 320, viewPolicy: 'budgeted', repeatPolicy: 'skip', repeatThreshold: 0.9 })
+const revivalExec = { agent: { session: { header: { id: 'revival', cwd: process.cwd() } } } }
+const revivalTurn = (messages) => waterfall(revivalHarness, 'agent/pre-step', revivalExec, async () => ({ kind: 'enter', messages }))
+const revivalNoise = Array.from({ length: 12 }, (_, index) => `### Unrelated ${index}\nDeployment trivia ${index} about a service that no longer exists anywhere.`).join('\n\n')
+const revivalAlpha = `### Alpha accounting\n${'- lib/tokens.js alpha budget line with unique detail.\n'.repeat(8)}`
+const revivalBeta = `### Beta rendering\n${'- beta renderer chunk with unique markup detail.\n'.repeat(8)}`
+const revivalRecall = `${revivalNoise}\n\n${revivalAlpha}\n\n${revivalBeta}`
+const revivalTask1 = { id: 'revival-1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Fix the alpha accounting in lib/tokens.js.' }] }
+const revivalTask2 = { id: 'revival-2', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Now change the beta rendering markup.' }] }
+const firstRevival = await revivalTurn([revivalTask1, adaptiveRecall('rv1', revivalRecall)])
+assert.ok(injectedText(firstRevival).includes('Alpha accounting'), 'the first query sees its own block')
+const firstRevivalStatus = JSON.parse(await revivalHarness.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status', json: true }, revivalExec))
+assert.ok(firstRevivalStatus.budget.viewOmitted > 0, 'the first view genuinely omitted blocks')
+const secondRevival = await revivalTurn([revivalTask2, adaptiveRecall('rv2', revivalRecall)])
+assert.equal(secondRevival.messages.length, 2, 'an identical raw recall for a different query is not skipped as a repeat')
+const secondRevivalText = injectedText(secondRevival)
+assert.ok(secondRevivalText.includes('Beta rendering'), 'the new query sees the block the previous projection omitted')
+assert.ok(estimateTokens(secondRevivalText) <= 320, 'the revived view still respects the cap')
+for (const dispose of revivalHarness.disposers) dispose()
 
 // A misspelled policy is reported and falls back, never silently half-applied.
 const invalidView = makeHarness()
@@ -1221,10 +1289,12 @@ const continuationTurn = await scenarioTurn(scenarioHarness, [human, freshRecall
 assert.ok(estimateTokens(injectedText(continuationTurn)) <= 100, 'a continuation step gets the light ceiling')
 assert.equal((await scenarioStatus()).budget.lastScenario.scenario, 'continuation')
 
-// The same recall requested again is a repeat, not a fresh debug turn.
+// The continuation turn above was cut at the light ceiling, so the identical
+// recall that follows is an after-cut turn, not a full "repeat": the model has
+// not seen the rest of this recall yet and may need it.
 await scenarioTurn(scenarioHarness, [human, freshRecall('s3-copy')])
 const repeatStatus = await scenarioStatus()
-assert.equal(repeatStatus.budget.lastScenario.scenario, 'repeat')
+assert.equal(repeatStatus.budget.lastScenario.scenario, 'after-cut')
 assert.equal(repeatStatus.budget.tier.name, 'light')
 
 // after-cut is a one-turn rule, not a permanent downgrade: the adaptive policy
@@ -1596,12 +1666,12 @@ const injectionJournal = [
 writeFileSync(process.env.HINDSIGHT_DIAG_FILE, injectionJournal)
 const measured = await tool.execute({ action: 'suggest' }, exec)
 assert.match(measured, /observed recall ~\d+ tok p50 · ~\d+ tok p95 \(10 injections, char-based estimate\)/)
-assert.match(measured, /maxInjectTokens: 2475/, 'cap follows the p95, clamped')
-assert.match(measured, /tiers\s+light \d+ \/ normal \d+ \/ deep 2475/, 'tiers follow the same distribution')
+assert.match(measured, /maxInjectTokens: 3300/, 'cap follows the measured density and the p95, clamped')
+assert.match(measured, /tiers\s+light 1296 \/ normal 2040 \/ deep 3300/, 'tiers follow the same distribution')
 assert.match(measured, /pages\s+pageSearchLimit: 7\s+\(journal max 5 pages per injection; currently unset, unset\)/, 'the Pages budget is suggested from the journal, not guessed')
 const pagesStatus = await tool.execute({ action: 'status' }, exec)
 assert.match(pagesStatus, /pages\s+pageSearchLimit=unset · recall max_tokens=2500 · journal 3 injections, max 5 pages/, 'status separates the Pages and Recall budgets')
-assert.match(measured, /recallOptions\.max_tokens: 2000/)
+assert.match(measured, /recallOptions\.max_tokens: 2500/)
 const memoryStatus = await tool.execute({ action: 'status' }, exec)
 assert.match(memoryStatus, /memory\s+24h: 100% of recalls were fresh \(10 injected \/ 0 unchanged\) · 0 server errors/, 'the memory line reports observable freshness, not a task-success claim')
 const memoryJson = JSON.parse(await tool.execute({ action: 'status', json: true }, exec))
@@ -1706,6 +1776,9 @@ try {
   const freshTs = new Date().toISOString()
   const padLine = JSON.stringify({ ts: oldTs, event: 'old_pad', note: '中文多字节内容'.repeat(20) })
   const padCount = Math.ceil((270 * 1024) / Buffer.byteLength(`${padLine}\n`, 'utf8'))
+  // Lifecycle events sit at the very head of the file, beyond any 256KB tail: a
+  // busy day must not make status believe auto-tune never ran.
+  const activatedLine = JSON.stringify({ ts: freshTs, event: 'activated', autoTune: true, cap: 3000, recall: 2500, budgetPolicy: 'adaptive', repeatPolicy: 'skip' })
   const recentLines = [
     JSON.stringify({ ts: freshTs, event: 'inject_capped', before: 500, after: 200 }),
     JSON.stringify({ ts: freshTs, event: 'inject_skipped', saved: 150 }),
@@ -1713,10 +1786,12 @@ try {
   ]
   writeFileSync(
     join(isoTunerDir, 'tuner.jsonl'),
-    `${Array.from({ length: padCount }, () => padLine).join('\n')}\n${recentLines.join('\n')}\n`,
+    `${activatedLine}\n${Array.from({ length: padCount }, () => padLine).join('\n')}\n${recentLines.join('\n')}\n`,
     'utf8',
   )
   const historySummary = summarizeTunerJournal({ windowHours: 24 })
+  assert.equal(historySummary.activated, 1, 'a lifecycle event ahead of a >256KB tail is still counted')
+  assert.equal(historySummary.lastActivated.budgetPolicy, 'adaptive', 'the last activation snapshot survives a large journal')
   assert.deepEqual(
     { capped: historySummary.capped, skipped: historySummary.skipped, trimmedTokens: historySummary.trimmedTokens, savedTokens: historySummary.savedTokens, totalSaved: historySummary.totalSaved },
     { capped: 1, skipped: 1, trimmedTokens: 300, savedTokens: 230, totalSaved: 530 },

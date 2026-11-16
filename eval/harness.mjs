@@ -261,6 +261,10 @@ function normalizePricesOrZeros(prices) {
  * @param {number} [options.defaultMaxAttempts=3]
  * @param {Function} [options.prepareRun] async ({task, arm, repeat}) => context
  * @param {Function} [options.finishRun] async ({task, arm, repeat, worktree, rows, context})
+ * @param {Function} [options.verifyBank] async ({arm, stage}) called before the
+ *   first run of each arm and once at the end; a throw aborts the experiment.
+ *   Background consolidation can mutate the bank between arms, so a fingerprint
+ *   captured before the experiment is not enough on its own.
  */
 export async function evaluate(options = {}) {
   const {
@@ -277,11 +281,13 @@ export async function evaluate(options = {}) {
     defaultMaxAttempts = DEFAULT_MAX_ATTEMPTS,
     prepareRun,
     finishRun,
+    verifyBank,
   } = options
   if (typeof runTask !== 'function') fail('evaluate requires a runTask function')
   if (onRow !== undefined && typeof onRow !== 'function') fail('onRow must be a function')
   if (prepareRun !== undefined && typeof prepareRun !== 'function') fail('prepareRun must be a function')
   if (finishRun !== undefined && typeof finishRun !== 'function') fail('finishRun must be a function')
+  if (verifyBank !== undefined && typeof verifyBank !== 'function') fail('verifyBank must be a function')
   if (!Number.isInteger(repeats) || repeats < 1) fail('repeats must be an integer >= 1')
   const maxAttemptsDefault = normalizeMaxAttempts(defaultMaxAttempts, 'defaultMaxAttempts', DEFAULT_MAX_ATTEMPTS)
 
@@ -304,9 +310,14 @@ export async function evaluate(options = {}) {
 
   const rows = []
   const runs = []
+  const verifiedArms = new Set()
   for (const task of tasks) {
     for (const armName of order) {
       const arm = armMap.get(armName)
+      if (verifyBank && !verifiedArms.has(armName)) {
+        await verifyBank({ arm, stage: 'arm-start' })
+        verifiedArms.add(armName)
+      }
       for (let repeat = 0; repeat < repeats; repeat += 1) {
         let context = null
         if (prepareRun) context = await prepareRun({ task, arm, repeat })
@@ -352,6 +363,8 @@ export async function evaluate(options = {}) {
       }
     }
   }
+  // Final check: catches consolidation that ran while the last arm was working.
+  if (verifyBank) await verifyBank({ arm: null, stage: 'end' })
 
   const metrics = {}
   for (const armName of order) {

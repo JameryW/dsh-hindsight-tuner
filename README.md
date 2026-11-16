@@ -36,7 +36,10 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    message that cannot fit even the marker is dropped. Across messages the
    budget is water-filled rather than proportionally cut: a short recall that
    fits within an equal share is kept whole, and the larger messages take the
-   remainder. There is no hidden 32-token floor — a tiny cap stays tiny (the
+   remainder. The water-filling is weighted by how strongly each message matches
+   the current turn's text, so a large recall that is actually about the task
+   keeps more of its body before a small, unrelated one is touched. There is no
+   hidden 32-token floor — a tiny cap stays tiny (the
    minimum useful cap is `0`, which disables trimming). Because the integration
    dedupes by comparing the new recall against the last injected text, a trimmed
    message never matches, so every turn is re-trimmed to the same ceiling instead
@@ -53,7 +56,11 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    otherwise the smallest tier the recall fits is used.
    A cut is a one-turn cooldown, not a permanent downgrade: the turn after the
    light one is a single step back up through `normal`, so a recall larger than
-   the light ceiling does not keep the session pinned at `light`.
+   the light ceiling does not keep the session pinned at `light`. A cut or a
+   `budgeted` view that omitted blocks also disables the "full repeat" shortcut:
+   the model did not receive everything, so a later turn asking a different
+   question can legitimately revive the omitted blocks instead of being tiered
+   down as if the text were already in context.
    The tier is a ceiling, not a target, and `status` shows the table, the last
    choice with its reason and the per-tier counts (`status --json` carries the
    same as data). `budgetPolicy: off` keeps the single hard ceiling.
@@ -91,7 +98,11 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    later event replaces its range), repetition is disabled and, when the
    integration suppressed a new injection because its own dedupe still sees the
    shadowed copy, the tuner re-appends the text the model used to have — labelled,
-   counted in the cap, and reported as `re-entered`.
+   counted in the cap, and reported as `re-entered`. A `new-facts delta` turn
+   stores only the novel blocks as the last delivery, so the tuner keeps the last
+   full non-delta base separately: if that base (rather than the later delta) was
+   the copy removed by compaction, the re-injection restores the whole base, not
+   the fragment.
 
    `viewPolicy: budgeted` (default `truncate`) changes how an over-budget recall
    is cut down. Instead of trimming the prefix, the recall is split into
@@ -149,7 +160,12 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    DSH's), and failures whose URL points at a different origin than the
    configured server are counted separately instead of being folded into the
    auth-failure total. `/hindsight suggest` proposes a cap from the journal's own
-   p95 recall size without writing anything. When the journal has addressed more
+   p95 recall size without writing anything. It uses the measured tokens-per-char
+   density when the journal has enough samples (code-dense text 0.22–1.10 tok/char
+   is honoured instead of being forced back to the 0.3 prose estimate), and
+   proposes `recallOptions.max_tokens` at 2500 for the truncating view or 4000
+   for the `budgeted` view — the recall pool must not be smaller than the cap the
+   view is allowed to use. When the journal has addressed more
    than one bank, the activity line names the banks and their counts, so a
    routing change (or a second harness sharing the install) is visible instead of
    being averaged into one number; and the `recall` line reports the current
@@ -239,8 +255,10 @@ round number.
 `eval/` is an experiment-grade, dependency-free harness: it runs each task in an
 isolated git worktree pinned to a recorded base SHA, gives each task up to
 `maxAttempts` attempts (every attempt is a row, failures are never dropped),
-fingerprints the Hindsight bank (`pages/tree` + `stats`) before and around a run,
-and compares arms with a **preregistered primary** and a task-level paired
+fingerprints the Hindsight bank (`pages/tree` + `stats`) before the run, again
+before each new arm and once at the end (background consolidation must not
+change the memory mid-experiment; attempts also run with session retain off), and
+compares arms with a **preregistered primary** and a task-level paired
 bootstrap. A completeness check turns missing rows or overlapping attempts into
 an explicit inclusion warning in the report; a completed experiment exits 0 even
 when every task failed. The harness never calls a model itself — you point it at
@@ -376,7 +394,7 @@ survives upgrades):
 | `budgetPolicy` | `adaptive` in the shipped row (`off` default) | `off` uses the cap; `adaptive` picks a per-turn ceiling from `budgetTiers`; `scenario` also reads turn state (compaction, continuation, repeat, cut) and the prompt signal (debug/edit/review/question) to choose a scenario and its tier |
 | `budgetTiers` | `{ light: 800, normal: 1600, deep: 3000 }` | Tier ceilings, each ≤ `maxInjectTokens`; must be ordered light ≤ normal ≤ deep |
 | `scenarioTiers` | scenario defaults from `lib/scenario.js` | Per-scenario tier override for `budgetPolicy: scenario` (e.g. `{ debug: 'light' }`); only the chosen scenario is affected |
-| `repeatPolicy` | `skip` in the shipped row (`inject` default) | `skip` compares against the delivered text: identical turns are skipped, new fact blocks travel as a `new-facts delta`; `inject` always injects |
+| `repeatPolicy` | `skip` in the shipped row (`inject` default) | `skip` compares against the delivered text: identical turns are skipped, new fact blocks travel as a `new-facts delta`; a cut or omitted Budgeted View is never treated as a full repeat; `inject` always injects |
 | `repeatThreshold` | `0.9` | Line-overlap ratio at which a recall counts as a repeat (0.5..1) |
 | `viewPolicy` | `truncate` | `truncate` orders sections by the current query then cuts the tail (naming what fell off); `budgeted` selects task-relevant fact blocks within the allotment |
 | `viewContextMessages` | `8` | Recent non-memory messages used as task context by `budgeted` (1..40) |
