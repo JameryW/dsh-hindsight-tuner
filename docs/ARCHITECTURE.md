@@ -66,11 +66,11 @@ governance bugs were fixed would have measured noise.
 | --- | --- | --- |
 | Hard per-turn cap | outermost `agent/pre-step`, re-registered on `agents` mount and `agent/created` / `agent/session-start` | shipped |
 | Budget across messages | weighted water-filling (`allocateBudget`): equal share by default, query-relevance weights keep task evidence before unrelated text; no hidden floor | shipped |
-| Over-budget payload | query-aware section order, then structure-aware trim that names the dropped sections and the tools that recover them | shipped |
-| Over-budget selection | Budgeted View: block ranking against the task text, provenance footer, measured result | shipped, opt-in |
-| Repeat safety | compare against delivered text; identical turns skipped; new blocks sent as a `new-facts delta`; history never removed; a cut or omitted Budgeted View does not count as a full repeat; the last full non-delta base is kept for compaction re-injection | shipped |
+| Over-budget payload | query-aware section selection rendered in original document order (prefix-cache safe), then structure-aware trim that names the dropped sections and the tools that recover them; fenced code measured denser; a long compact list is split between top-level items | shipped |
+| Over-budget selection | Budgeted View: block ranking against the task text (compound-identifier subwords, CJK n-grams, word-boundary prose terms), parent heading mounted with a selected child, provenance footer, measured result | shipped, opt-in |
+| Repeat safety | compare against delivered text; identical turns skipped; new blocks sent as a `new-facts delta`; history never removed; a cut or omitted Budgeted View does not count as a full repeat; the last full non-delta base is kept for compaction re-injection; a 20-minute pause resets stale cut state | shipped |
 | Compaction safety | detect a shadowed injection from session events; re-inject the delivered text, labelled and counted | shipped |
-| Adaptive spend | per-turn tier from recent activity, with reasons in status | shipped |
+| Adaptive spend | per-turn tier from recent activity and the prompt signal (a failing step outranks a continuation or the one-turn cooldown), with reasons in status | shipped |
 | Diagnosis | endpoint/token/bank/routing/effective config/probe/journal classified into semantic classes, compatible integration lines, deprecated tool names | shipped |
 | Evaluation | A/B harness: isolated worktrees, leak-prevention audit, bank fingerprint verified before, between arms and after (session retain off), pinned plugin version and tuner-config hash, attempts-to-success, task-level statistics, paired memory benefit/tax, and written arm hints delivered through `eval/agents/claude-hint.mjs` | shipped |
 
@@ -168,8 +168,9 @@ These are treated as executable tests, not intentions:
 1. Every Arm/Repeat runs in a fresh worktree from a recorded base SHA.
 2. Leak prevention (automated in `eval/leak.mjs`, refused before any run): tasks
    declare `asOf`; a starting commit created after that cutoff, a base commit
-   named in the task's `exclude` list, and a checkout/prompt reused across the
-   `screening` and `confirmation` sets are rejected. Only pre-cutoff history may
+   named in the task's `exclude` list, a base commit shared by the `screening`
+   and `confirmation` sets, and a checkout/prompt reused across the two sets are
+   rejected. Only pre-cutoff history may
    be seeded into the bank — the fingerprint freezes what exists; choosing the
    cutoff while seeding stays an operator step.
 3. Bank verifiability: A2/A3 share one pre-warmed frozen snapshot; A4/A5 are

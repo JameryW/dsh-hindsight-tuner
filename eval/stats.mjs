@@ -702,8 +702,13 @@ export function pairedComparison(rowsA, rowsB, options = {}) {
  *   tax      = mean over tasks of max(0, rate_baseline - rate_memory)
  *   netValue = benefit - tax
  *
- * `regressedTaskIds` names the exact tasks the memory arm made worse, which is
- * the actionable list: inspect those before adopting the arm.
+ * Tax is split by cause when the rows say so: a regression on a task whose
+ * memory run was truncated or whose budgeted view omitted blocks is `trimTax`
+ * (the recall was damaged by the ceiling), everything else is `distractionTax`
+ * (the recall was delivered but pulled the model off the task). Rows may carry
+ * `trimmed: true` or a positive `omittedBlocks` from the agent's own reporting;
+ * without that metadata the whole loss counts as distraction, never silently as
+ * a trim. `regressedTaskIds` names the exact tasks the memory arm made worse.
  */
 export function memoryValue(rows, options = {}) {
   if (!Array.isArray(rows)) throw new TypeError('memoryValue requires an array of attempt rows')
@@ -737,15 +742,29 @@ export function memoryValue(rows, options = {}) {
     )
   }
 
+  /** Tasks whose memory runs reported a truncated/omitted recall. */
+  const trimmedFor = (arm) => {
+    const byTask = new Map()
+    for (const run of runs) {
+      if (run.arm !== arm) continue
+      if (run.rows.some((row) => row?.trimmed === true || (Number.isFinite(row?.omittedBlocks) && row.omittedBlocks > 0))) {
+        byTask.set(run.taskId, true)
+      }
+    }
+    return byTask
+  }
+
   const base = rateFor(baseline)
   const arms = []
   for (const arm of armNames) {
     if (arm === baseline) continue
     const mine = rateFor(arm)
+    const trimmedTasks = trimmedFor(arm)
     const improvedTaskIds = []
     const regressedTaskIds = []
     let benefitSum = 0
-    let taxSum = 0
+    let trimSum = 0
+    let distractionSum = 0
     let tasks = 0
     for (const [taskId, baseRate] of base) {
       const armRate = mine.get(taskId)
@@ -756,18 +775,23 @@ export function memoryValue(rows, options = {}) {
         benefitSum += delta
         improvedTaskIds.push(taskId)
       } else if (delta < 0) {
-        taxSum += -delta
+        if (trimmedTasks.get(taskId)) trimSum += -delta
+        else distractionSum += -delta
         regressedTaskIds.push(taskId)
       }
     }
     if (tasks === 0) continue
     const benefit = round(benefitSum / tasks, 4)
-    const tax = round(taxSum / tasks, 4)
+    const trimTax = round(trimSum / tasks, 4)
+    const distractionTax = round(distractionSum / tasks, 4)
+    const tax = round((trimSum + distractionSum) / tasks, 4)
     arms.push({
       arm,
       tasks,
       benefit,
       tax,
+      trimTax,
+      distractionTax,
       netValue: round(benefit - tax, 4),
       improvedTaskIds: improvedTaskIds.sort(),
       // Tasks where Tax > 0: the ones to read before trusting the arm.
@@ -782,12 +806,12 @@ export function memoryValue(rows, options = {}) {
 export function formatMemoryValue(value) {
   if (!value || !Array.isArray(value.arms) || value.arms.length === 0) return null
   const lines = [`memory value vs ${value.baseline} — mean per-task success-rate change (0..1)`]
-  const header = `${'arm'.padEnd(14)}${'benefit'.padStart(9)}${'tax'.padStart(9)}${'net'.padStart(9)}  regressed`
+  const header = `${'arm'.padEnd(14)}${'benefit'.padStart(9)}${'tax'.padStart(9)}${'trim'.padStart(9)}${'distract'.padStart(10)}${'net'.padStart(9)}  regressed`
   lines.push(header)
   for (const arm of value.arms) {
     const regressed = arm.regressedTaskIds.length > 0 ? arm.regressedTaskIds.join(', ') : '-'
     lines.push(
-      `${String(arm.arm).padEnd(14)}${formatNumber(arm.benefit, 2).padStart(9)}${formatNumber(arm.tax, 2).padStart(9)}${formatNumber(arm.netValue, 2).padStart(9)}  ${regressed}`,
+      `${String(arm.arm).padEnd(14)}${formatNumber(arm.benefit, 2).padStart(9)}${formatNumber(arm.tax, 2).padStart(9)}${formatNumber(arm.trimTax, 2).padStart(9)}${formatNumber(arm.distractionTax, 2).padStart(10)}${formatNumber(arm.netValue, 2).padStart(9)}  ${regressed}`,
     )
   }
   return lines.join('\n')

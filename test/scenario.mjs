@@ -43,12 +43,21 @@ assert.equal(chooseScenario({ firstTurn: true, step: 2, promptText: 'fix the err
 // DSH passes 1-based step numbers inside a turn: step 1 is turn entry, >=2 is continuation.
 assert.equal(chooseScenario({ step: 1, promptText: 'Fix the error' }).scenario, 'debug')
 assert.equal(chooseScenario({ step: 1 }).scenario, 'default')
-assert.equal(chooseScenario({ step: 2, promptText: 'Fix the error' }).scenario, 'continuation')
+// An explicit failure signature outranks continuation and the after-cut cooldown
+// (proposal 14): a debugging step needs pitfall memory even mid-turn.
+assert.equal(chooseScenario({ step: 2, promptText: 'Fix the error' }).scenario, 'debug')
+assert.equal(chooseScenario({ step: 2, promptText: 'Add a retry loop' }).scenario, 'continuation')
 assert.equal(chooseScenario({ step: 3 }).scenario, 'continuation')
 assert.equal(chooseScenario({ step: 3 }).tier, 'light')
 assert.equal(chooseScenario({ repetition: 0.8, promptText: 'fix the error' }).scenario, 'repeat')
 assert.equal(chooseScenario({ repetition: 0.8 }).tier, 'light')
-assert.equal(chooseScenario({ lastCapped: true, promptText: 'fix the error' }).scenario, 'after-cut')
+assert.equal(chooseScenario({ lastCapped: true, promptText: 'fix the error' }).scenario, 'debug')
+assert.equal(chooseScenario({ lastCapped: true, promptText: 'Add a retry loop' }).scenario, 'after-cut')
+assert.equal(
+  chooseScenario({ lastCapped: true, repetition: 0.5, promptText: 'fix the error' }).scenario,
+  'after-cut',
+  'a mostly-repeating debug recall keeps the cut cooldown',
+)
 
 // Task kind only applies when no turn-state signal is present.
 const debug = chooseScenario({ promptText: 'Fix the failing test — error: expected 3' })

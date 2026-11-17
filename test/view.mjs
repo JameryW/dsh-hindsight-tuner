@@ -110,6 +110,27 @@ check('createMatcher rewards tilde fences identically sized to plain text', () =
   assert.ok(score(withTilde) > score(plain), 'tilde fence receives fence bonus')
 })
 
+check('createMatcher matches short prose words only at word boundaries', () => {
+  const score = createMatcher('fix the bug')
+  assert.ok(score('### Notes\n- the bug is in the parser') > 0)
+  assert.equal(score('### Notes\n- bugfix helpers and prefixes'), 0, 'bug does not match inside bugfix')
+})
+
+check('createMatcher reaches compound identifier subwords', () => {
+  const score = createMatcher('refactor trimToBudget in lib/tokens.js')
+  assert.ok(score('### Budget accounting\n- the budget accounting rule caps tokens') > 0, 'the camelCase subword budget matches')
+})
+
+check('budgetedView mounts the nearest parent heading for a matching child', () => {
+  const context = 'The greeting helper must be sayHello in src/greeting.mjs'
+  const text = '## Conventions\n### Greeting helper\n- the named export is `sayHello(name)` from `src/greeting.mjs`\n\n### Unrelated\n- retired service trivia about queues\n'
+  const view = budgetedView({ text, contextText: context, budget: 160, count: estimateTokens })
+  assert.ok(view)
+  assert.ok(view.text.includes('## Conventions'), 'the parent heading is mounted with its winning child')
+  assert.ok(view.text.includes('sayHello'), 'the matching child is rendered')
+  assert.equal(view.text.includes('Unrelated'), false)
+})
+
 check('evidenceHints keeps commit, page and path pointers', () => {
   assert.deepEqual(evidenceHints('commit 3f8a1c9 path `lib/tokens.js`'), ['commit 3f8a1c9', 'path lib/tokens.js'])
   assert.deepEqual(evidenceHints('pageId: kp-1a976de9'), ['page kp-1a976de9'])

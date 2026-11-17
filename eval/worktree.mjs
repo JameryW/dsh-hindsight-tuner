@@ -218,8 +218,13 @@ function makeHandle({ path, repo, baseSha, name }) {
     },
     dispose() {
       if (disposedAt !== null) return { removed: false, path, alreadyDisposed: true }
+      // Only mark the handle disposed after the removal succeeded: a failed
+      // dispose (locked directory, EPERM) must stay retryable, otherwise the
+      // caller believes the worktree is gone while it still holds disk and a
+      // registration entry.
+      const result = removeWorktree({ repo, path })
       disposedAt = new Date().toISOString()
-      return removeWorktree({ repo, path })
+      return result
     },
   }
 }
@@ -238,13 +243,11 @@ function removeWorktree({ repo, path }) {
     // hooks is still releasing the directory; retry briefly before giving up.
     if (attempt < REMOVE_ATTEMPTS - 1) sleepSync(REMOVE_RETRY_MS * (attempt + 1))
   }
-  if (!result?.ok && existsSync(path)) {
-    // `git worktree remove` deletes the registration before the files on
-    // Windows, so later attempts report "not a working tree" while the
-    // directory (still held open by a lingering agent/hook) remains. Prune the
-    // stale registration and delete the files with a longer backoff.
-    runGit(['worktree', 'prune'], { cwd: repo, allowFailure: true })
-  }
+  // `git worktree remove` deletes the registration before the files on Windows,
+  // so later attempts report "not a working tree" while the directory (still
+  // held open by a lingering agent/hook) remains. The deletion loop below
+  // handles that case; a `git worktree prune` here would be a no-op because the
+  // directory still exists, so it is deliberately omitted.
   let fallbackError = null
   for (let attempt = 0; attempt < DELETE_ATTEMPTS && existsSync(path); attempt += 1) {
     try {

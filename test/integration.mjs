@@ -287,10 +287,23 @@ assert.ok(estimateTokens(step1DebugText) <= 250 && estimateTokens(step1DebugText
 injection = Array.from({ length: 220 }, (_, i) => `continuation turn line ${i}: unique content for step 2 light ceiling check.`).join('\n')
 const step2Decision = await waterfall(modernHarness, 'agent/pre-step', { agent: modernAgent, step: 2, signal: { aborted: false } }, async () => ({
   kind: 'enter',
-  messages: [debugPrompt],
+  messages: [human],
 }))
 const step2Text = injectedText(step2Decision.messages, 'step 2')
 assert.ok(estimateTokens(step2Text) <= 120, 'step 2 triggers continuation/light tier')
+
+// A failing step is about to be debugged, so it outranks the tool-continuation
+// rule even on a later step: the debugging turn keeps the normal ceiling.
+injection = Array.from({ length: 220 }, (_, i) => `debug continuation line ${i}: unique content for step 3 debug check.`).join('\n')
+const step3Decision = await waterfall(modernHarness, 'agent/pre-step', { agent: modernAgent, step: 3, signal: { aborted: false } }, async () => ({
+  kind: 'enter',
+  messages: [debugPrompt],
+}))
+const step3Text = injectedText(step3Decision.messages, 'step 3 debug')
+assert.ok(
+  estimateTokens(step3Text) > 120 && estimateTokens(step3Text) <= 250,
+  'a failing step outranks continuation and keeps debug/normal',
+)
 
 for (const dispose of modernHarness.disposers) dispose()
 console.log(`integration: all checks passed against ${join(packageDir, 'dist', 'dsh.js')}`)

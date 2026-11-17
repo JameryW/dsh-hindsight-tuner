@@ -14,7 +14,9 @@
  *    starting commit — a task cannot begin from the change it is meant to make;
  *  - the screening and confirmation sets must be disjoint: reusing the same
  *    repository checkout and prompt in both sets means the confirmation set
- *    was chosen by the very tasks it confirms.
+ *    was chosen by the very tasks it confirms, and a starting commit shared by
+ *    both sets is the same leak with different bookkeeping
+ *    (`baseSha` cross-set conflict).
  *
  * These are harness errors, not warnings: evidence that cannot show its own
  * cutoff is not evidence. `auditTaskLeakage` is exported so the CLI can run it
@@ -72,6 +74,7 @@ export function auditTaskLeakage(tasks, options = {}) {
 
   const ids = new Set()
   const signatures = new Map()
+  const bases = new Map()
   tasks.forEach((task, index) => {
     const label = `tasks[${index}]`
     const id = task && typeof task.id === 'string' ? task.id.trim() : ''
@@ -103,6 +106,20 @@ export function auditTaskLeakage(tasks, options = {}) {
       problems.push(
         `task ${JSON.stringify(id)} repeats task ${JSON.stringify(seen.id)} in the ${set} set; the screening and confirmation sets must be disjoint`,
       )
+    }
+
+    // A shared starting commit across sets is the same leak with different
+    // bookkeeping: both sets would be graded against one checkout, and a
+    // selection made on it would carry over.
+    const baseSha = typeof task.baseSha === 'string' ? task.baseSha.trim() : ''
+    if (baseSha && set !== undefined) {
+      const seenBase = bases.get(baseSha)
+      if (seenBase === undefined) bases.set(baseSha, { id, set })
+      else if (seenBase.set !== set) {
+        problems.push(
+          `baseSha ${JSON.stringify(baseSha)} is shared by task ${JSON.stringify(seenBase.id)} (${seenBase.set}) and task ${JSON.stringify(id)} (${set}); each set needs its own checkout`,
+        )
+      }
     }
 
     if (task.asOf === undefined) {

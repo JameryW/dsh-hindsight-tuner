@@ -82,7 +82,8 @@ report are already complete.
   starting tree could already contain the fix.
 - `set` (optional, `screening` or `confirmation`): the two sets must not reuse
   the same checkout and prompt, so the confirmation set is not chosen by the
-  tasks it confirms.
+  tasks it confirms; the same `baseSha` may not be recorded in both sets either,
+  so the confirmation set also cannot be selected by the checkout it confirms.
 - `exclude` (optional): commit or PR references that must stay out of the task's
   history; naming the starting commit there is refused.
 - `baseSha` (optional): the expected pre-fix base commit, checked against
@@ -208,10 +209,14 @@ first pass. Attempt rows carry `passed`, `tokens`, `usage`, `durationMs`,
   (auto-detected as `R0`, else `A0` in the shipped arm list). For every task present in both arms, `rate(t)` is the fraction
   of that task's runs that passed; `Benefit` is the mean of `max(0, rate − rate_base)`,
   `Tax` the mean of `max(0, rate_base − rate)`, and `NetValue = Benefit − Tax`
-  (all in success-rate units, 0..1). `regressedTaskIds` lists the tasks where the
+  (all in success-rate units, 0..1). The tax is split in two: `trimTax` counts
+  regressions whose memory row reported a truncated or omitted recall (the
+  ceiling damaged the evidence), `distractionTax` the rest (irrelevant memory
+  that misled the agent; a regression with no trim metadata is counted here,
+  never silently as trim). `regressedTaskIds` lists the tasks where the
   arm solved less than the baseline, so a positive net value cannot hide a
-  regressed task; a metric report is emitted as `report.memory` and printed as a
-  `memory value vs <baseline>` block.
+  regressed task; the metric report is emitted as `report.memory` and printed as a
+  `memory value vs <baseline>` block with `benefit/tax/trim/distract/net` columns.
 - **Memory Precision (manual audit)** – of the memory statements actually
   injected into the agent context, the fraction that are relevant and correct
   for the task. This is a human audit: sample injected memories (e.g. 20 per

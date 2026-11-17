@@ -975,6 +975,23 @@ function statsChecks() {
     throws(() => memoryValue(rows, { baseline: 'A9' }), 'not among the rows', 'unknown baseline rejected')
   })
 
+  check('memoryValue splits trim tax from distraction tax', () => {
+    const rows = [
+      makeRow({ taskId: 't1', arm: 'A0', passed: true }),
+      makeRow({ taskId: 't2', arm: 'A0', passed: true }),
+      makeRow({ taskId: 't3', arm: 'A0', passed: true }),
+      makeRow({ taskId: 't1', arm: 'A3', passed: false, trimmed: true }),
+      makeRow({ taskId: 't2', arm: 'A3', passed: false, omittedBlocks: 2 }),
+      makeRow({ taskId: 't3', arm: 'A3', passed: false }),
+    ]
+    const value = memoryValue(rows, { baseline: 'A0' })
+    const [arm] = value.arms
+    approx(arm.tax, 1, 1e-3, 'every regressed task counts as tax')
+    approx(arm.trimTax, 2 / 3, 1e-3, 'cut and omitted tasks are trim tax')
+    approx(arm.distractionTax, 1 / 3, 1e-3, 'a regression without trim metadata is distraction tax')
+    matches(formatMemoryValue(value), /arm\s+benefit\s+tax\s+trim\s+distract\s+net/, 'columns name both taxes')
+  })
+
   check('assertComplete accepts a complete experiment including timeout rows', () => {
     const tasks = [
       { id: 't1', maxAttempts: 3 },
@@ -1965,6 +1982,19 @@ async function abChecks(repoDir, tempRoot) {
     includes(text, 'in the future', 'future cutoff rejected')
     equal(audit.sets.screening, 1, 'screening set counted')
     equal(audit.sets.confirmation, 1, 'confirmation set counted')
+  })
+
+  check('leak audit rejects a base recorded in both sets', () => {
+    const shared = 'b'.repeat(40)
+    const audit = auditTaskLeakage(
+      [
+        { id: 's1', prompt: 'one prompt', cwd: repoDir, set: 'screening', baseSha: shared },
+        { id: 'c1', prompt: 'two prompt', cwd: repoDir, set: 'confirmation', baseSha: shared },
+      ],
+      { gitCommitTime: () => null },
+    )
+    equal(audit.ok, false, 'shared base found')
+    includes(audit.problems.join('\n'), 'each set needs its own checkout', 'cross-set baseSha rejected')
   })
 
   check('plugin version and tuner config are pinned for the experiment', () => {

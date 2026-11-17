@@ -32,7 +32,11 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    one shared ceiling: the sum of every `plugin:hindsight` message in a turn is
    at most `maxInjectTokens`. Trimming is structure-aware: it cuts at a paragraph
    boundary or after a closed code fence (so markdown never ends inside an open
-   fence) and only falls back to a line/character cut when no boundary fits. A
+   fence) and only falls back to a line/character cut when no boundary fits; a
+   long compact bullet list is split between its top-level items instead of being
+   treated as one indivisible block. Fenced code is measured at a denser
+   tokens-per-character rate than prose, so a payload full of code is not
+   under-counted right where it is heaviest. A
    message that cannot fit even the marker is dropped. Across messages the
    budget is water-filled rather than proportionally cut: a short recall that
    fits within an equal share is kept whole, and the larger messages take the
@@ -56,7 +60,9 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    otherwise the smallest tier the recall fits is used.
    A cut is a one-turn cooldown, not a permanent downgrade: the turn after the
    light one is a single step back up through `normal`, so a recall larger than
-   the light ceiling does not keep the session pinned at `light`. A cut or a
+   the light ceiling does not keep the session pinned at `light`. A pause of 20
+   minutes or longer between two steps resets the cut state outright: the prefix
+   cache is cold, so an old cut no longer describes the new request. A cut or a
    `budgeted` view that omitted blocks also disables the "full repeat" shortcut:
    the model did not receive everything, so a later turn asking a different
    question can legitimately revive the omitted blocks instead of being tiered
@@ -72,7 +78,10 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    already in context, and the first turn after one that had to be cut take
    `light` (the same one-turn cooldown as the adaptive policy); a
    prompt that reads like debugging, editing or review takes `normal`, while a
-   question takes `light`; anything else uses the `default` tier. `scenarioTiers`
+   question takes `light`; a prompt that reports an error or a failing step
+   outranks both a tool continuation and the one-turn cooldown (the debugging
+   turn needs the detail), unless the new recall mostly repeats the previous one;
+   anything else uses the `default` tier. `scenarioTiers`
    maps any scenario to a different tier per workspace (for example
    `{ debug: 'light' }`), and the choice, its reason and its budget appear on the
    `budget` line, in `status --json`, and as a `scenario` field on the journal's
@@ -107,8 +116,14 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    `viewPolicy: budgeted` (default `truncate`) changes how an over-budget recall
    is cut down. Instead of trimming the prefix, the recall is split into
    paragraph/fact blocks, each block is scored against the current turn's
-   non-memory text (file paths, identifiers, error signatures, CJK terms), and the
-   highest-value blocks are kept until the allotment is spent. Kept blocks keep
+   non-memory text (file paths, identifiers, error signatures, CJK terms — and
+   the subwords of a compound identifier, so `trimToBudget` still matches a
+   paragraph that says "budget"; short English words match only at word
+   boundaries), and the highest-value blocks are kept until the allotment is
+   spent. A block that matches through its section heading inherits part of that
+   heading's score, a bare heading is never selected on its own, and selecting a
+   child mounts its nearest parent heading with it so the kept text keeps its
+   provenance. Kept blocks keep
    their headings and carry short evidence hints (commit SHA, page id, file path)
    when present, the payload ends with a `budgeted view kept N of M blocks`
    footer, and the whole selection is re-measured so it can never exceed the cap.
@@ -117,11 +132,15 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    (default 8) bounds how many recent non-memory messages are used as the task
    context; the mode stays opt-in until the P1/P2 A/B gates justify it.
 
-   The plain `truncate` path is query-aware too: before cutting the tail, the
-   tuner reorders the recall's `##`/`###` sections so the ones that match the
-   current turn's text (paths and identifiers weigh most) come first — a pure
-   reordering of the same characters, no text added or lost — and leaves the
-   order alone when nothing overlaps. The cut marker then names the section
+   The plain `truncate` path is query-aware too. Before cutting, the tuner gives
+   the ceiling to `prioritizeSectionsByQuery`: the recall's `##`/`###` sections
+   are scored against the current turn's text (paths and identifiers weigh most,
+   compound identifiers contribute their subwords, long Chinese runs their
+   2/3-grams), the fitting ones are selected by score, and they are rendered back
+   in their original document order — selection changes what is kept, never the
+   relative order, because a reshuffled prefix would invalidate the model's
+   prefix cache. Without a ceiling (or with no lexical signal) the order is left
+   alone. The cut marker then names the section
    headings that fell off and the tools that recover them
    (`hindsight_search_pages` / `hindsight_read_page`), so a capped recall points
    at the raw records instead of being a dead end; a ceiling too small for that
@@ -210,7 +229,12 @@ rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.
    injected recall is wrapped as data on both ends: it opens with a line saying
    the text is historical memory, not instructions, and to verify it against the
    current code and tests before acting, and it closes with an explicit
-   end-of-memory boundary. The reminder is part of the measured payload, so it is
+   end-of-memory boundary. A page that itself contains the banner text cannot
+   close the region early: the marker is escaped inside the recall body, so
+   exactly one real boundary ends the data. When the recall has to be cut, the
+   closing boundary is reserved before trimming — it is appended again whenever
+   the ceiling can afford it, instead of being the first thing the truncation
+   removes. The reminder is part of the measured payload, so it is
    counted against the same ceiling as the recall itself — turning it on cannot
    silently overrun the budget. The `trust` line in `/hindsight` reports whether
    it is active.
@@ -271,9 +295,14 @@ bootstrap. Before any run it also audits leak prevention: with a memory arm,
 every task must declare `asOf` (the instant its history was frozen), a starting
 commit created after that cutoff is refused, a task may not start from a commit
 its `exclude` list names as the target fix, and the `screening`/`confirmation`
-sets may not reuse the same checkout and prompt. The run is pinned to the plugin
-version and a sha256 of the tuner config; if `autoTune` rewrites that config
-mid-experiment the harness fails instead of comparing drifted arms. A
+sets may not reuse the same checkout and prompt — nor the same base commit, so
+the confirmation set cannot be selected by the checkout it confirms. The run is
+pinned to the plugin version and a sha256 of the tuner config; if `autoTune`
+rewrites that config mid-experiment the harness fails instead of comparing
+drifted arms. The report's `memory` block splits the paired cost into benefit,
+total tax, and the tax that came from a damaged recall (`trim`/omitted view)
+versus one that came from distraction (regressions with no trim metadata), with
+the regressed task ids listed. A
 completeness check turns missing rows or overlapping attempts into an explicit
 inclusion warning in the report; a completed experiment exits 0 even when every
 task failed. The harness never calls a model itself — you point it at an agent
@@ -464,7 +493,9 @@ survives upgrades):
   but only sees messages appended inside its own `next()` — the `order` line
   reports whether turns have actually passed through it.
 - Token counts are an estimate by default: CJK counts 1 token per character,
-  other text ≈ 3.6 chars/token. The CJK weight is a deliberate upper bound
+  prose ≈ 3.6 chars/token, and fenced code is counted denser (0.38 token per
+  character) because code tokenizes heavier than prose. The CJK weight is a
+  deliberate upper bound
   (DeepSeek's own tokenizer averages ≈ 0.6 per Chinese character), so a Chinese
   recall is counted at roughly 1.7× its real size and the ceiling under-fills
   rather than overshoots. `tokenBudgetMode: accurate` counts with an
