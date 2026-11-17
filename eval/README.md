@@ -154,12 +154,31 @@ unlocks); a plan lists every arm's `hint`/`requires`.
 - **A3-V** needs the DSH plugin profile setting `settings.viewPolicy=budgeted`
   (lib/view.js) pinned before the run; `HINDSIGHT_PAGE_SEARCH_LIMIT` only covers
   the page search limit.
-- **A1** needs the fixture repository to contain the handwritten conventions
-  file (AGENTS.md/CLAUDE.md) before worktrees are created.
+- **A1** needs either the fixture repository to contain the handwritten
+  conventions file (AGENTS.md/CLAUDE.md) before worktrees are created, or the
+  same conventions delivered as a written hint: set `HINDSIGHT_EVAL_HINT` in the
+  arm's `env` and point `--agent-command` at `node eval/agents/claude-hint.mjs …`
+  (see below).
 - **A4/A5** need two differently seeded banks; run each bank as its own
   experiment with its own fingerprint, or pin a per-arm `HINDSIGHT_BANK_ID`.
-- `HINDSIGHT_EVAL_HINT` is an eval-only convention for the agent wrapper (it can
-  append the matching hint text to the attempt prompt); it is not a plugin knob.
+- `HINDSIGHT_EVAL_HINT` is an eval-only convention for the agent command
+  wrapper; it is not a plugin knob.
+
+The harness writes the task prompt to the agent's **stdin**, so a wrapper is
+what turns `HINDSIGHT_EVAL_HINT` into prompt text. `eval/agents/claude-hint.mjs`
+reads stdin, prepends a non-empty hint (separated by `\n\n---\n\n`), runs the
+real `claude` CLI with the same arguments, and pipes the modified prompt to it;
+with an empty hint the prompt passes through unchanged, so one command serves
+every arm:
+
+```bash
+--agent-command '["node","<repo>/eval/agents/claude-hint.mjs","-p",
+                   "--output-format","json","--permission-mode","acceptEdits"]'
+```
+
+Use it for the gate P0 arms (R1/R2 failure feedback) and for A1. `report.json`
+still records each arm's `hint` as metadata; the wrapper is the only component
+that acts on it.
 
 ## Metrics
 
@@ -243,12 +262,24 @@ Bearer`).
 `GET /v1/default/banks/<url-encoded id>/pages/tree` (falling back to the legacy
 `/knowledge-base/tree` on 404) and `GET .../stats`, canonicalises the JSON with
 sorted keys and stores a sha256 over `{tree, stats}` in a fingerprint file that
-also records `apiUrl`, `bankId`, `capturedAt` and `timeoutMs`.
+also records `apiUrl`, `bankId`, `capturedAt` and `timeoutMs`. The server's
+operation bookkeeping is filtered out of that digest (`operations_by_status`,
+`pending_operations`, `failed_operations`, `pending_consolidation`,
+`failed_consolidation`, `last_consolidated_at`, `last_memory_write_at`): a live
+bank queues refreshes and maintenance on its own, and those counters move
+without any memory changing. Memory-bearing stats (node/link counts,
+`nodes_by_fact_type`, …) and the Pages tree stay in the digest, so a real change
+still fails the check. Fingerprint files from the older format are refused with
+`capture a new baseline with --fingerprint-out`; recapture once after upgrading.
 
-- `--fingerprint-out <file>` captures **before** the experiment and writes it.
-- `--verify-fingerprint <file>` re-captures **before** the experiment and aborts
-  with a structural diff if the Pages tree or stats changed. The fingerprint
-  file's `apiUrl`/`bankId` are used when `--api-url`/`--bank` are not passed.
+`--fingerprint-out <file>` captures **before** the experiment and writes it.
+`--verify-fingerprint <file>` re-captures **before** the experiment and aborts
+with a structural diff if the Pages tree or the memory-bearing stats changed. The
+fingerprint file's `apiUrl`/`bankId` are used when `--api-url`/`--bank` are not
+passed. Per-page refresh metadata (`timestamp`, `is_stale`,
+`last_refresh_failed_at`) is also excluded: a refresh cron rewrites it without
+changing a page's identity, description or tags, and the diff would otherwise
+name a page refresh as memory drift.
 - With either option, the harness checks the fingerprint again before the first
   run of every new arm and once at the end of the matrix; a change aborts with
   `bank fingerprint check failed before arm <name>: …` (or `before the
@@ -324,9 +355,11 @@ solved/runs matrix.
   integration/refresh timing is asynchronous; capture the fingerprint only after
   the bank has settled. A fingerprint taken mid-ingest can drift during the
   experiment even though the harness itself never writes to the bank.
-- **The fingerprint proves tree/stats equality only.** It does not hash page
+- **The fingerprint proves tree/memory-stats equality only.** It does not hash page
   bodies, embeddings, recall scoring config or pending operation contents, so two
-  banks with equal tree+stats can still retrieve differently.
+  banks with equal tree+stats can still retrieve differently. Operation
+  bookkeeping is deliberately excluded — a live bank's refresh cron and
+  maintenance change those counters without changing memory.
 - **Tokenizer estimate vs exact.** Token counts come from the agent's own JSON
   usage when available; cost is computed from those counts and the supplied
   price list. Without a prices file, cost equals the row's `tokens` count, which

@@ -72,7 +72,7 @@ governance bugs were fixed would have measured noise.
 | Compaction safety | detect a shadowed injection from session events; re-inject the delivered text, labelled and counted | shipped |
 | Adaptive spend | per-turn tier from recent activity, with reasons in status | shipped |
 | Diagnosis | endpoint/token/bank/routing/effective config/probe/journal classified into semantic classes, compatible integration lines, deprecated tool names | shipped |
-| Evaluation | A/B harness: isolated worktrees, leak-prevention audit, bank fingerprint verified before, between arms and after (session retain off), pinned plugin version and tuner-config hash, attempts-to-success, task-level statistics, paired memory benefit/tax | shipped |
+| Evaluation | A/B harness: isolated worktrees, leak-prevention audit, bank fingerprint verified before, between arms and after (session retain off), pinned plugin version and tuner-config hash, attempts-to-success, task-level statistics, paired memory benefit/tax, and written arm hints delivered through `eval/agents/claude-hint.mjs` | shipped |
 
 Configuration stays opt-in at the plugin boundary for anything that changes
 model-visible text in a new way: the schema defaults are `budgetPolicy: off`,
@@ -174,6 +174,11 @@ These are treated as executable tests, not intentions:
    cutoff while seeding stays an operator step.
 3. Bank verifiability: A2/A3 share one pre-warmed frozen snapshot; A4/A5 are
    independently writable; the Bank/Pages version fingerprint is saved per run.
+   The digest covers the Pages tree structure and the memory-bearing stats; the
+   server's operation bookkeeping (queue and consolidation counters, last-write
+   timestamps) and per-page refresh metadata (refresh timestamp, staleness flag)
+   are excluded, because a healthy live bank moves them without changing a
+   single memory.
 4. Config verifiability (pinned in the report): the plugin version, resolved
    Bank ID and a sha256 of the tuner config are recorded before the run. A
    config change during the run fails the experiment (`autoTune` must not

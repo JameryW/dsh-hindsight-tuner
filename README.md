@@ -261,7 +261,9 @@ never read as a successful recall. The raw per-event counts stay available in
 `eval/` is an experiment-grade, dependency-free harness: it runs each task in an
 isolated git worktree pinned to a recorded base SHA, gives each task up to
 `maxAttempts` attempts (every attempt is a row, failures are never dropped),
-fingerprints the Hindsight bank (`pages/tree` + `stats`) before the run, again
+fingerprints the Hindsight bank (`pages/tree` + memory-bearing `stats`, with the
+server's operation bookkeeping excluded so a background refresh does not count as
+drift) before the run, again
 before each new arm and once at the end (background consolidation must not
 change the memory mid-experiment; attempts also run with session retain off), and
 compares arms with a **preregistered primary** and a task-level paired
@@ -299,7 +301,12 @@ A task is `{ id, prompt, cwd, check }` (optional `maxAttempts`, `checkCwd`,
 exit code is the ground truth. Arms are data: `A0` no memory, `A1` handwritten
 conventions, `A2` Reflect, `A3` Pages, `A3-T` Pages + tuner truncation, `A3-V`
 Pages + Budgeted View, plus the P0 (`R0`/`R1`/`R2`) and P3 (`A4`/`A5`) arms in
-`eval/arms.example.json`. `--prices` supplies cache-adjusted input/output prices
+`eval/arms.example.json`. Arms that carry a written `hint` (the P0 `R1`/`R2`
+failure feedback and `A1`) point `--agent-command` at
+`eval/agents/claude-hint.mjs`: it prepends that arm's `HINDSIGHT_EVAL_HINT` to
+the prompt it receives on stdin and then runs `claude`, passing the prompt
+through unchanged when no hint is set. `--prices` supplies cache-adjusted
+input/output prices
 so the report's cost columns reflect real cost rather than raw token counts; the
 headline metrics are Attempts to Success and Cost per Solved Node, with Task
 Success Rate as the non-inferiority guardrail. See [eval/README.md](eval/README.md)

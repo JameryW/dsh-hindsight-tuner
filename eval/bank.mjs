@@ -7,9 +7,10 @@
  * and verifies that fingerprint before (and after) a run.
  *
  * Fingerprint = sha256 of canonical (recursively key-sorted) JSON of
- * `{tree, stats}`. It proves the Pages tree and bank stats are byte-for-byte
- * identical (after canonicalisation); it says nothing about page bodies,
- * embeddings, or server internals.
+ * `{tree, stats}` with the server's bookkeeping filtered out (see
+ * `VOLATILE_STATS` and `VOLATILE_TREE`). It proves the Pages tree's structure and
+ * the memory-bearing stats are byte-for-byte identical (after canonicalisation);
+ * it says nothing about page bodies, embeddings, or server internals.
  *
  * Endpoints (verified against Hindsight 0.8.x):
  *   GET {apiUrl}/v1/default/banks/{encodeURIComponent(bank)}/pages/tree
@@ -25,8 +26,63 @@ import { basename, dirname, resolve } from 'node:path'
 export const DEFAULT_API_URL = 'http://127.0.0.1:9077'
 export const DEFAULT_BANK_TEMPLATE = 'coding-agent::{gitProject}'
 export const DEFAULT_TIMEOUT_MS = 15_000
-export const FINGERPRINT_FORMAT = 'dsh-hindsight-tuner/bank-fingerprint@1'
-export const FINGERPRINT_ALGORITHM = 'sha256(canonical-json({tree,stats}))'
+export const FINGERPRINT_FORMAT = 'dsh-hindsight-tuner/bank-fingerprint@2'
+export const FINGERPRINT_ALGORITHM = 'sha256(canonical-json({tree,stats-without-operation-counters}))'
+
+/**
+ * Bank stats keys that record server bookkeeping, not memory content.
+ *
+ * They move on their own while a bank is healthy: the page-refresh cron queues
+ * operations, maintenance sweeps the ledger, and consolidation records when it
+ * last ran. Hashing them made the frozen-bank guard trip on a live bank whose
+ * memories and Pages had not changed at all, so they are filtered out of both
+ * the digest and the structural diff. Memory-bearing stats (node/link counts,
+ * `nodes_by_fact_type`, `total_observations`, …) stay in, and the Pages tree is
+ * hashed after dropping only its per-page refresh metadata (see
+ * `VOLATILE_TREE`).
+ */
+const VOLATILE_STATS = new Set([
+  'operations_by_status',
+  'pending_operations',
+  'failed_operations',
+  'pending_consolidation',
+  'failed_consolidation',
+  'last_consolidated_at',
+  'last_memory_write_at',
+])
+
+/** Stats with the operation bookkeeping removed (shallow copy). */
+export function fingerprintStats(stats) {
+  if (stats === null || typeof stats !== 'object' || Array.isArray(stats)) return {}
+  const copy = {}
+  for (const [key, value] of Object.entries(stats)) {
+    if (VOLATILE_STATS.has(key)) continue
+    copy[key] = value
+  }
+  return copy
+}
+
+/**
+ * Page-tree keys that only record when a page last refreshed.
+ *
+ * The content of a page is not in the tree at all; these fields move whenever
+ * the refresh cron rewrites the page, even when the generated body is
+ * unchanged. They are excluded so a page refresh is not mistaken for memory
+ * drift. A description/tag/structure change still alters the digest.
+ */
+const VOLATILE_TREE = new Set(['timestamp', 'is_stale', 'last_refresh_failed_at'])
+
+/** Page tree with per-page refresh metadata removed (deep copy). */
+export function fingerprintTree(tree) {
+  if (Array.isArray(tree)) return tree.map((entry) => fingerprintTree(entry))
+  if (tree === null || typeof tree !== 'object') return tree
+  const copy = {}
+  for (const [key, value] of Object.entries(tree)) {
+    if (VOLATILE_TREE.has(key)) continue
+    copy[key] = fingerprintTree(value)
+  }
+  return copy
+}
 
 /** A bank/API problem was detected. */
 export class BankError extends Error {
@@ -206,10 +262,10 @@ export function canonicalJson(value) {
   return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
 }
 
-/** sha256 over canonical JSON of `{tree, stats}`. */
+/** sha256 over canonical JSON of the filtered tree and stats. */
 export function fingerprintOf({ tree, stats } = {}) {
   const digest = createHash('sha256')
-  digest.update(canonicalJson({ tree, stats }), 'utf8')
+  digest.update(canonicalJson({ tree: fingerprintTree(tree), stats: fingerprintStats(stats) }), 'utf8')
   return digest.digest('hex')
 }
 
@@ -317,6 +373,12 @@ function validateFingerprintObject(fingerprint, context) {
   }
   if (typeof fingerprint.fingerprint !== 'string' || !/^[0-9a-f]{64}$/i.test(fingerprint.fingerprint)) {
     throw new BankError(`${context}: fingerprint.fingerprint must be a sha256 hex digest`)
+  }
+  if (fingerprint.format != null && fingerprint.format !== FINGERPRINT_FORMAT) {
+    throw new BankError(
+      `${context}: fingerprint.format ${JSON.stringify(fingerprint.format)} predates ${FINGERPRINT_FORMAT} ` +
+        '(operation counters used to be part of the digest); capture a new baseline with --fingerprint-out',
+    )
   }
   if (fingerprint.tree === null || typeof fingerprint.tree !== 'object' || Array.isArray(fingerprint.tree)) {
     throw new BankError(`${context}: fingerprint.tree must be an object`)
@@ -430,8 +492,8 @@ export async function verifyFingerprint(expected, opts = {}) {
   }
 
   const structural = []
-  diffValues('tree', frozen.tree, actual.tree, structural, maxDiffs)
-  diffValues('stats', frozen.stats, actual.stats, structural, maxDiffs)
+  diffValues('tree', fingerprintTree(frozen.tree), fingerprintTree(actual.tree), structural, maxDiffs)
+  diffValues('stats', fingerprintStats(frozen.stats), fingerprintStats(actual.stats), structural, maxDiffs)
   if (structural.length > 0) {
     diffs.push(...structural)
   } else {

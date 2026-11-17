@@ -18,10 +18,13 @@ import { fileURLToPath } from 'node:url'
 
 import {
   BankError,
+  FINGERPRINT_FORMAT,
   assertFrozen,
   canonicalJson,
   captureFingerprint,
   fingerprintOf,
+  fingerprintStats,
+  fingerprintTree,
   readFingerprint,
   resolveBank,
   verifyFingerprint,
@@ -44,6 +47,7 @@ import {
   pairedComparison,
   summarizeArm,
 } from './stats.mjs'
+import { HINT_SEPARATOR, hintedPrompt } from './agents/claude-hint.mjs'
 import {
   WorktreeError,
   baseShaOf,
@@ -732,6 +736,84 @@ async function bankChecks(repoDir, tempRoot) {
         ok(error instanceof BankError, 'assertFrozen throws BankError')
       } finally {
         fake.state.stats.total_nodes = 3
+      }
+    })
+
+    await checkAsync('operation bookkeeping does not change the frozen fingerprint', async () => {
+      fake.state.stats.operations_by_status = { completed: 25 }
+      fake.state.stats.pending_operations = 2
+      fake.state.stats.last_consolidated_at = '2026-02-01T00:00:00Z'
+      try {
+        const verification = await verifyFingerprint(captured, {
+          apiUrl: fake.apiUrl,
+          bank: bankName,
+          timeoutMs: 5000,
+        })
+        equal(verification.ok, true, 'operation-only change stays ok')
+        equal(verification.diffs.length, 0, 'no diffs for operation-only change')
+        equal(verification.actual.fingerprint, captured.fingerprint, 'fingerprint ignores bookkeeping')
+        equal(
+          Object.keys(fingerprintStats({ operations_by_status: {}, pending_operations: 1 })).length,
+          0,
+          'fingerprintStats filters every bookkeeping key',
+        )
+
+        fake.state.stats.total_nodes = 4
+        const drifted = await verifyFingerprint(captured, {
+          apiUrl: fake.apiUrl,
+          bank: bankName,
+          timeoutMs: 5000,
+        })
+        equal(drifted.ok, false, 'memory change still fails')
+        ok(
+          drifted.diffs.some((diff) => diff.includes('stats.total_nodes')),
+          `memory diff reported, got ${JSON.stringify(drifted.diffs)}`,
+        )
+      } finally {
+        fake.state.stats.total_nodes = 3
+        delete fake.state.stats.operations_by_status
+        delete fake.state.stats.pending_operations
+        delete fake.state.stats.last_consolidated_at
+      }
+    })
+
+    await checkAsync('page refresh metadata does not change the frozen fingerprint', async () => {
+      const root = fake.state.tree.roots[0]
+      root.timestamp = '2026-04-01T00:00:00Z'
+      root.is_stale = true
+      root.last_refresh_failed_at = null
+      try {
+        const verification = await verifyFingerprint(captured, {
+          apiUrl: fake.apiUrl,
+          bank: bankName,
+          timeoutMs: 5000,
+        })
+        equal(verification.ok, true, 'refresh metadata change stays ok')
+        equal(verification.actual.fingerprint, captured.fingerprint, 'fingerprint ignores refresh metadata')
+        equal(
+          Object.keys(fingerprintTree({ timestamp: 'x', roots: [{ is_stale: true, name: 'a' }] })).includes(
+            'timestamp',
+          ),
+          false,
+          'fingerprintTree drops refresh metadata at every depth',
+        )
+
+        root.name = 'Renamed Root'
+        const drifted = await verifyFingerprint(captured, {
+          apiUrl: fake.apiUrl,
+          bank: bankName,
+          timeoutMs: 5000,
+        })
+        equal(drifted.ok, false, 'page structure change still fails')
+        ok(
+          drifted.diffs.some((diff) => diff.includes('tree.roots[0].name')),
+          `page diff reported, got ${JSON.stringify(drifted.diffs)}`,
+        )
+      } finally {
+        root.name = 'Selftest Root'
+        delete root.timestamp
+        delete root.is_stale
+        delete root.last_refresh_failed_at
       }
     })
 
@@ -1588,7 +1670,7 @@ async function abChecks(repoDir, tempRoot) {
   writeFileSync(
     frozenFile,
     JSON.stringify({
-      format: 'dsh-hindsight-tuner/bank-fingerprint@1',
+      format: FINGERPRINT_FORMAT,
       apiUrl: 'http://frozen.invalid:1',
       bankId: 'frozen-bank',
       tree: { roots: [] },
@@ -1902,6 +1984,17 @@ async function abChecks(repoDir, tempRoot) {
     equal(changed.ok, false, 'a mid-experiment rewrite is detected')
     equal(changed.configChanged, true, 'config flagged as changed')
     includes(changed.problems.join('\n'), 'changed during the experiment', 'problem names the mutation')
+  })
+
+  check('the claude-hint wrapper prepends only a non-empty written hint', () => {
+    equal(hintedPrompt('do the task', ''), 'do the task', 'an empty hint passes the prompt through')
+    equal(hintedPrompt('do the task', '   '), 'do the task', 'a blank hint passes the prompt through')
+    equal(
+      hintedPrompt('do the task', ' Use cents. '),
+      `Use cents.${HINT_SEPARATOR}do the task`,
+      'a hint is trimmed and prepended with a separator'
+    )
+    includes(hintedPrompt('prompt', 'hint'), HINT_SEPARATOR, 'separator keeps the bytes from running together')
   })
 }
 
