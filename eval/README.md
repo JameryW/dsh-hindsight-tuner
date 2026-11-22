@@ -18,17 +18,18 @@ What changed from the old per-arm aggregate harness:
 
 ```bash
 # 1. offline proof that the tooling itself works (no network, no agents)
-node eval/selftest.mjs          # prints: eval selftest: 61 checks passed
+node eval/selftest.mjs          # prints: eval selftest: <N> checks passed
 
 # 2. inspect the plan without spending anything (your own task file, see below)
-node eval/ab.mjs --tasks my-tasks.json --arms A3,A1 --primary A3:A1 --dry-run
+node eval/ab.mjs --tasks my-tasks.json --arms A3,A0 --primary A3:A0 --dry-run
 
 # 3. capture a frozen bank fingerprint, then run the experiment
-node eval/ab.mjs --tasks tasks.json --arms A3,A1 --primary A3:A1 --repeats 5 \
+#    (A1 declares a fixture requirement; pass --allow-unmet-requires once prepared)
+node eval/ab.mjs --tasks tasks.json --arms A3,A1 --primary A3:A1 --allow-unmet-requires --repeats 5 \
   --fingerprint-out experiments/p1-bank.json --report experiments/p1.json
 
 # 4. a follow-up run must verify the same bank
-node eval/ab.mjs --tasks tasks.json --arms A3,A1 --primary A3:A1 --repeats 5 \
+node eval/ab.mjs --tasks tasks.json --arms A3,A1 --primary A3:A1 --allow-unmet-requires --repeats 5 \
   --verify-fingerprint experiments/p1-bank.json --report experiments/p1-rerun.json
 ```
 

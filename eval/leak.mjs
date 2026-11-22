@@ -36,12 +36,24 @@ export function taskSignature(task) {
   return `${cwd}\u0000${prompt}`
 }
 
+const HEX_SHA = /^[0-9a-f]{7,40}$/
+
+function sameCommitRef(left, right) {
+  const a = String(left ?? '').trim().toLowerCase()
+  const b = String(right ?? '').trim().toLowerCase()
+  if (!a || !b) return false
+  if (a === b) return true
+  if (HEX_SHA.test(a) && HEX_SHA.test(b)) return a.startsWith(b) || b.startsWith(a)
+  return false
+}
+
 function defaultGitCommitTime(cwd, sha) {
   try {
     return (
       execFileSync('git', ['-C', cwd, 'log', '-1', '--format=%cI', sha], {
         encoding: 'utf8',
         timeout: 5000,
+        windowsHide: true,
         stdio: ['ignore', 'pipe', 'ignore'],
       }).trim() || null
     )
@@ -74,7 +86,7 @@ export function auditTaskLeakage(tasks, options = {}) {
 
   const ids = new Set()
   const signatures = new Map()
-  const bases = new Map()
+  const seenBases = []
   tasks.forEach((task, index) => {
     const label = `tasks[${index}]`
     const id = task && typeof task.id === 'string' ? task.id.trim() : ''
@@ -113,12 +125,13 @@ export function auditTaskLeakage(tasks, options = {}) {
     // selection made on it would carry over.
     const baseSha = typeof task.baseSha === 'string' ? task.baseSha.trim() : ''
     if (baseSha && set !== undefined) {
-      const seenBase = bases.get(baseSha)
-      if (seenBase === undefined) bases.set(baseSha, { id, set })
-      else if (seenBase.set !== set) {
+      const seenBase = seenBases.find((entry) => entry.set !== set && sameCommitRef(entry.baseSha, baseSha))
+      if (seenBase !== undefined) {
         problems.push(
           `baseSha ${JSON.stringify(baseSha)} is shared by task ${JSON.stringify(seenBase.id)} (${seenBase.set}) and task ${JSON.stringify(id)} (${set}); each set needs its own checkout`,
         )
+      } else {
+        seenBases.push({ baseSha, id, set })
       }
     }
 
@@ -154,9 +167,7 @@ export function auditTaskLeakage(tasks, options = {}) {
       problems.push(`task ${JSON.stringify(id)} exclude must be an array of commit or PR references`)
     } else if (Array.isArray(task.exclude) && typeof task.baseSha === 'string' && task.baseSha.trim()) {
       const base = task.baseSha.trim()
-      const named = task.exclude.some(
-        (entry) => typeof entry === 'string' && entry.trim() !== '' && (base === entry.trim() || (entry.trim().length >= 7 && base.startsWith(entry.trim()))),
-      )
+      const named = task.exclude.some((entry) => typeof entry === 'string' && sameCommitRef(base, entry))
       if (named) {
         problems.push(
           `task ${JSON.stringify(id)} starts from ${base}, which its exclude list names as the target fix; pick the pre-fix base commit`,

@@ -15,8 +15,10 @@
  * When HINDSIGHT_EVAL_HINT is empty or missing the prompt is passed through
  * unchanged, so the same command can serve every arm.
  */
-import { spawn } from 'node:child_process'
-import { pathToFileURL } from 'node:url'
+import { spawn, spawnSync } from 'node:child_process'
+import { realpathSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 export const HINT_SEPARATOR = '\n\n---\n\n'
 
@@ -28,40 +30,84 @@ export function hintedPrompt(input, hint) {
 }
 
 function readStdin() {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolveStdin, reject) => {
     const chunks = []
     process.stdin.on('data', (chunk) => chunks.push(chunk))
-    process.stdin.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+    process.stdin.on('end', () => resolveStdin(Buffer.concat(chunks).toString('utf8')))
     process.stdin.on('error', reject)
   })
+}
+
+function resolvesOnWindows(command) {
+  try {
+    const result = spawnSync('where.exe', [command], { stdio: 'ignore', windowsHide: true })
+    return result.status === 0
+  } catch {
+    return false
+  }
+}
+
+function canonical(path) {
+  const absolute = resolve(path)
+  try {
+    return realpathSync.native(absolute)
+  } catch {
+    return absolute
+  }
+}
+
+function invokedDirectly() {
+  if (!process.argv[1]) return false
+  const self = canonical(fileURLToPath(import.meta.url))
+  const script = canonical(process.argv[1])
+  return process.platform === 'win32'
+    ? self.toLowerCase() === script.toLowerCase()
+    : self === script
 }
 
 async function main() {
   const args = process.argv.slice(2)
   const input = await readStdin()
   const prompt = hintedPrompt(input, process.env.HINDSIGHT_EVAL_HINT)
-  const child = spawn('claude', args, {
-    stdio: ['pipe', 'inherit', 'inherit'],
-    // On Windows `claude` resolves to a .exe next to a .cmd shim; the shell is
-    // what makes the shim work in the same way the operator's terminal does.
-    shell: process.platform === 'win32'
-  })
-  child.on('error', (error) => {
-    console.error(`claude-hint: failed to start claude: ${error.message}`)
-    process.exit(127)
-  })
-  child.stdin.on('error', () => {})
-  child.stdin.end(prompt)
-  child.on('exit', (code, signal) => {
-    if (signal) {
-      console.error(`claude-hint: claude exited with signal ${signal}`)
-      process.exit(1)
-    }
-    process.exit(code ?? 1)
-  })
+  let retriedThroughShell = false
+  let child = null
+  const start = (shell) => {
+    const current = spawn('claude', args, {
+      stdio: ['pipe', 'inherit', 'inherit'],
+      shell,
+      windowsHide: true,
+    })
+    child = current
+    current.on('error', (error) => {
+      if (current !== child) return
+      // On Windows `claude` can be a `.cmd` shim that CreateProcess cannot run
+      // directly; retry through the shell only after ENOENT + where.exe confirms
+      // a shim exists so normal arguments are never shell-split unnecessarily.
+      if (process.platform === 'win32' && !retriedThroughShell && error && error.code === 'ENOENT') {
+        retriedThroughShell = true
+        if (resolvesOnWindows('claude')) {
+          start(true)
+          return
+        }
+      }
+      console.error(`claude-hint: failed to start claude: ${error.message}`)
+      process.exit(127)
+    })
+    current.stdin.on('error', () => {})
+    current.stdin.end(prompt)
+    current.on('close', (code, signal) => {
+      if (current !== child) return
+      if (signal) {
+        console.error(`claude-hint: claude exited with signal ${signal}`)
+        process.exit(1)
+      }
+      process.exit(code ?? 1)
+    })
+  }
+  start(false)
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (invokedDirectly()) {
   main().catch((error) => {
     console.error(`claude-hint: ${error?.message ?? error}`)
     process.exit(1)

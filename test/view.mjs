@@ -222,4 +222,50 @@ check('subtractRepeated keeps only the new blocks of a superset recall', () => {
   assert.equal(identical.text, '')
 })
 
+check('extractTerms splits kebab-case and dotted identifiers into subwords', () => {
+  const terms = extractTerms('Tune budget-policy and server.timeout for the session')
+  assert.ok(terms.has('budget') && terms.has('policy'), 'kebab-case subwords are indexed')
+  assert.ok(terms.has('server') && terms.has('timeout'), 'dotted identifier subwords are indexed')
+})
+
+check('budgetedView never emits an orphaned bare heading after shrinking or no-signal fallback', () => {
+  // Heading matches strongly, child inherits partial weight, tight budget forces shrink.
+  const matchingBare = [
+    '## Greeting helper',
+    '',
+    'Plain details about the function return value that will be dropped when tight.',
+    '',
+    '### Unrelated',
+    'Other notes.',
+  ].join('\n')
+  const tight = budgetedView({
+    text: matchingBare,
+    contextText: 'Check the Greeting helper',
+    budget: 55,
+    count: estimateTokens,
+  })
+  if (tight !== null) {
+    assert.equal(tight.text.startsWith('## Greeting helper\n\n…['), false, 'shrink loop must not leave an orphan bare heading')
+  }
+
+  // No-signal prefix fallback: bare heading fits, its large child does not -> must not emit bare heading alone.
+  const noSignalBare = [
+    '## Huge section',
+    '',
+    'word '.repeat(120),
+    '',
+    '## Small note',
+    'fits cleanly on its own.',
+  ].join('\n')
+  const fallback = budgetedView({
+    text: noSignalBare,
+    contextText: 'completely unrelated gardening query',
+    budget: 80,
+    count: estimateTokens,
+  })
+  assert.ok(fallback, 'non-bare block still survives no-signal fallback')
+  assert.equal(fallback.text.includes('## Huge section'), false, 'no-signal fallback drops orphaned bare heading')
+  assert.ok(fallback.text.includes('## Small note'), 'real non-bare block survives')
+})
+
 console.log('view: all checks passed')

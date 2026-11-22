@@ -954,7 +954,16 @@ function prepareIsolatedConfigKeys(baseEnv, overrideEnv) {
   for (const container of ['harnesses', 'paths', 'banks']) {
     const map = parsed[container]
     if (!map || typeof map !== 'object' || Array.isArray(map)) continue
-    for (const section of Object.values(map)) stripOverriddenKeys(section, overriddenKeys)
+    for (const section of Object.values(map)) {
+      stripOverriddenKeys(section, overriddenKeys)
+      if (container === 'harnesses' && section && typeof section === 'object' && !Array.isArray(section)) {
+        for (const nested of ['paths', 'banks']) {
+          const sub = section[nested]
+          if (!sub || typeof sub !== 'object' || Array.isArray(sub)) continue
+          for (const subSection of Object.values(sub)) stripOverriddenKeys(subSection, overriddenKeys)
+        }
+      }
+    }
   }
   const dir = mkdtempSync(join(tmpdir(), 'tuner-ab-cfg-'))
   const target = join(dir, 'hindsight-config.json')
@@ -974,9 +983,15 @@ export function createRunner(options) {
     }
     const baseEnv = buildEnvForRun(task, arm, attempt)
     const armSetsConfig = arm?.env && Object.prototype.hasOwnProperty.call(arm.env, 'HINDSIGHT_CONFIG')
+    const effectiveOverrides = {
+      HINDSIGHT_HARNESS: baseEnv.HINDSIGHT_HARNESS,
+      HINDSIGHT_RETAIN_SESSIONS: baseEnv.HINDSIGHT_RETAIN_SESSIONS,
+      ...task.env,
+      ...arm.env,
+    }
     const isolated = armSetsConfig
       ? { env: {}, dir: null }
-      : prepareIsolatedConfigKeys(baseEnv, { ...task.env, ...arm.env })
+      : prepareIsolatedConfigKeys(baseEnv, effectiveOverrides)
     const env = { ...baseEnv, ...isolated.env }
     try {
       const agentResult = await runProcess(options.agent[0], options.agent.slice(1), {
@@ -1547,10 +1562,19 @@ export async function main(argv = process.argv.slice(2)) {
 // without importing the CLI implementation twice.
 export { DEFAULT_ARMS, stats, summarizeCompat }
 
+function canonicalPath(value) {
+  const absolute = resolve(value)
+  try {
+    return realpathSync.native(absolute)
+  } catch {
+    return absolute
+  }
+}
+
 function invokedDirectly() {
   if (!process.argv[1]) return false
-  const self = resolve(fileURLToPath(import.meta.url))
-  const script = resolve(process.argv[1])
+  const self = canonicalPath(fileURLToPath(import.meta.url))
+  const script = canonicalPath(process.argv[1])
   return process.platform === 'win32'
     ? self.toLowerCase() === script.toLowerCase()
     : self === script

@@ -53,13 +53,27 @@ async function request(url, token, timeoutMs = 5000) {
   const headers = { accept: 'application/json' }
   if (token) headers.authorization = `Bearer ${token}`
   const response = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) })
-  let body = ''
+  let raw = ''
   try {
-    body = (await response.text()).slice(0, 300)
+    raw = await response.text()
   } catch {
     // The status code is already enough to report.
   }
-  return { status: response.status, body }
+  return { status: response.status, body: raw.slice(0, 300), raw }
+}
+
+/** Whether a 200 `/pages/tree` payload describes an empty bank (`roots: []` or `pages: []`). */
+function isEmptyPageTree(text) {
+  const trimmed = String(text ?? '').trim()
+  if (!trimmed) return false
+  try {
+    const parsed = JSON.parse(trimmed)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false
+    const lists = [parsed.roots, parsed.pages].filter(Array.isArray)
+    return lists.length > 0 && lists.every((list) => list.length === 0)
+  } catch {
+    return false
+  }
 }
 
 async function main() {
@@ -101,7 +115,7 @@ async function main() {
 
     if (!disabled) {
       let bankStatus = null
-      let bankSeeded = false
+      let bankEmpty = false
       let bankFailed = false
 
       try {
@@ -119,12 +133,12 @@ async function main() {
           const tree = await request(url, server.token)
           bankStatus = tree.status
           if (tree.status === 200) {
-            bankSeeded = true
             // A reachable bank can still be empty: the daemon creates the bank on
             // the first probe and only sessions that retain memories fill it. An
             // empty tree is reported as a note, not "seeded", so a machine that
             // has never memorised anything is not mistaken for a working memory.
-            if (/^\{"pages":\s*\[\s*\]/.test(tree.body.trim())) {
+            if (isEmptyPageTree(tree.raw)) {
+              bankEmpty = true
               note('bank', `${bank} (${resolution.source}) exists but has no pages yet — sessions will fill it as they retain memory`)
             } else {
               pass('bank', `${bank} (${resolution.source}) is seeded`)
@@ -186,16 +200,17 @@ async function main() {
           || bankStatus === 403
           || (realRecallOk === 0 && (recallFailures > 0 || bankFailed))
         )
-        // An unseeded bank is the documented cold state (see "Verifying a
-        // restart" in the README): the integration's first page fetch 404s and
-        // it injects its static guide, so the failures are explained and the
-        // bank is reported as a NOTE. A 401/403 is never explained that way —
-        // that is a token/config problem and stays a failure.
-        const unseeded = bankStatus === 404 && realRecallOk === 0 && (activity.authFailures ?? 0) === 0
+        // An unseeded or empty bank is the documented cold state (see "Verifying
+        // a restart" in the README): the integration injects its static guide, so
+        // there is no project memory yet and recall is reported as a NOTE. A
+        // 401/403 is never explained that way — that is a token/config problem
+        // and stays a failure.
+        const unseeded = (bankStatus === 404 || bankEmpty) && realRecallOk === 0 && (activity.authFailures ?? 0) === 0
 
         if (injected > 0) {
           if (unseeded) {
-            note('recall', `${injected} inject_ok event(s) recorded, but bank is not seeded yet (static guide only) · ${diagPath()}`)
+            const stateText = bankStatus === 404 ? 'bank is not seeded yet' : 'bank has no pages yet'
+            note('recall', `${injected} inject_ok event(s) recorded, but ${stateText} (static guide only) · ${diagPath()}`)
           } else if (onlyStaticGuide) {
             fail('recall', `${injected} inject_ok event(s) in journal, but server recall/pages failed (static tool guide only, no project memory) · ${diagPath()}`)
           } else {

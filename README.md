@@ -313,14 +313,15 @@ command.
 node eval/selftest.mjs
 
 # inspect the plan: tasks, arms, worktrees, bank actions — spawns nothing
-node eval/ab.mjs --tasks eval/tasks.example.json --arms A3,A1 --primary A3:A1 --dry-run
+node eval/ab.mjs --tasks eval/tasks.example.json --arms A3,A0 --primary A3:A0 --dry-run
 
 # a real run, with a frozen bank fingerprint saved for reproducibility
-node eval/ab.mjs --tasks tasks.json --arms A3,A1 --primary A3:A1 --repeats 5 \
+# (A1 declares a fixture requirement; pass --allow-unmet-requires once prepared)
+node eval/ab.mjs --tasks tasks.json --arms A3,A1 --primary A3:A1 --allow-unmet-requires --repeats 5 \
   --fingerprint-out experiments/p1-bank.json --report experiments/p1.json
 
 # a follow-up run must match the frozen bank, or it refuses to compare
-node eval/ab.mjs --tasks tasks.json --arms A3,A1 --primary A3:A1 --repeats 5 \
+node eval/ab.mjs --tasks tasks.json --arms A3,A1 --primary A3:A1 --allow-unmet-requires --repeats 5 \
   --verify-fingerprint experiments/p1-bank.json
 ```
 

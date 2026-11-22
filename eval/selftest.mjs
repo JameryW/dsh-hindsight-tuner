@@ -1997,6 +1997,102 @@ async function abChecks(repoDir, tempRoot) {
     includes(audit.problems.join('\n'), 'each set needs its own checkout', 'cross-set baseSha rejected')
   })
 
+  check('leak audit matches uppercase and abbreviated SHAs in exclude and cross-set baseSha', () => {
+    const full = 'abcdef1234567890abcdef1234567890abcdef12'
+    const audit = auditTaskLeakage(
+      [
+        {
+          id: 's1',
+          prompt: 'screening prompt',
+          cwd: repoDir,
+          set: 'screening',
+          baseSha: full.slice(0, 10).toUpperCase(),
+          exclude: [full],
+        },
+        {
+          id: 'c1',
+          prompt: 'confirmation prompt',
+          cwd: repoDir,
+          set: 'confirmation',
+          baseSha: full,
+        },
+      ],
+      { gitCommitTime: () => null },
+    )
+    equal(audit.ok, false, 'case/prefix SHA conflicts detected')
+    const joined = audit.problems.join('\n')
+    includes(joined, 'exclude list names as the target fix', 'short uppercase baseSha matches full lowercase exclude SHA')
+    includes(joined, 'each set needs its own checkout', 'short uppercase screening baseSha matches full confirmation baseSha')
+  })
+
+  await checkAsync('createRunner strips retainSessions from coding-agent.json even when arm/task env omit it', async () => {
+    const cfgFile = join(tempRoot, 'retain-hindsight.json')
+    const outFile = join(tempRoot, 'retain-seen.json')
+    writeFileSync(
+      cfgFile,
+      JSON.stringify({
+        retainSessions: true,
+        autoInject: 'pages',
+        harnesses: {
+          eval: {
+            retainSessions: true,
+            paths: { [repoDir]: { retainSessions: true, seedLimit: 10 } },
+            banks: { 'coding-agent::x': { retainSessions: true, dynamicBankId: true } },
+          },
+        },
+      }, null, 2),
+      'utf8',
+    )
+    const agentScript = join(tempRoot, 'inspect-retain.mjs')
+    writeFileSync(
+      agentScript,
+      [
+        "import { readFileSync, writeFileSync } from 'node:fs'",
+        'const cfgPath = process.env.HINDSIGHT_CONFIG',
+        'writeFileSync(process.env.OUT_FILE, JSON.stringify({',
+        '  cfgPath,',
+        '  retainEnv: process.env.HINDSIGHT_RETAIN_SESSIONS,',
+        "  cfg: JSON.parse(readFileSync(cfgPath, 'utf8')),",
+        '}))',
+      ].join('\n'),
+      'utf8',
+    )
+    const prevCfg = process.env.HINDSIGHT_CONFIG
+    process.env.HINDSIGHT_CONFIG = cfgFile
+    try {
+      const runner = createRunner({
+        agent: [process.execPath, agentScript],
+        timeoutMs: 10_000,
+        resetBetweenAttempts: false,
+      })
+      const result = await runner({
+        task: {
+          id: 'retain-iso',
+          prompt: 'test',
+          cwd: repoDir,
+          check: { command: process.execPath, args: ['-e', 'process.exit(0)'] },
+          env: { OUT_FILE: outFile },
+        },
+        arm: { name: 'A3', env: {} },
+        attempt: 1,
+        worktree: null,
+      })
+      equal(result.passed, true, `runner passed: ${result.error || result.note || ''}`)
+      const seen = JSON.parse(readFileSync(outFile, 'utf8'))
+      ok(seen.cfgPath !== cfgFile, 'isolated config used for default retainSessions=false')
+      equal(seen.retainEnv, 'false', 'default HINDSIGHT_RETAIN_SESSIONS=false preserved')
+      equal('retainSessions' in seen.cfg, false, 'top-level retainSessions stripped')
+      equal('retainSessions' in seen.cfg.harnesses.eval, false, 'harnesses.eval.retainSessions stripped')
+      equal('retainSessions' in seen.cfg.harnesses.eval.paths[repoDir], false, 'nested harnesses.eval.paths.*.retainSessions stripped')
+      equal('retainSessions' in seen.cfg.harnesses.eval.banks['coding-agent::x'], false, 'nested harnesses.eval.banks.*.retainSessions stripped')
+      equal(seen.cfg.harnesses.eval.paths[repoDir].seedLimit, 10, 'unrelated nested path setting kept')
+      equal(seen.cfg.autoInject, 'pages', 'unrelated top-level setting kept')
+    } finally {
+      if (prevCfg === undefined) delete process.env.HINDSIGHT_CONFIG
+      else process.env.HINDSIGHT_CONFIG = prevCfg
+    }
+  })
+
   check('plugin version and tuner config are pinned for the experiment', () => {
     const version = readPluginVersion()
     equal(version.name, '@jameryw/dsh-hindsight-tuner', 'plugin name')

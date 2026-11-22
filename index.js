@@ -24,7 +24,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   appliedPaths,
@@ -60,9 +60,9 @@ import {
   FALLBACK_MARGIN,
   loadTokenizer,
   percentile,
-  prioritizeSectionsByQuery,
   queryRelevance,
   repetitionRatio,
+  selectSectionsByQuery,
   subtractRepeated,
   trimToBudget,
 } from './lib/tokens.js'
@@ -286,14 +286,22 @@ function integrationManifest(path) {
  */
 function findIntegration() {
   const roots = profileRoots()
-  const key = roots.join('|')
+  const probes = roots.map((root) => {
+    const manifest = join(root, 'node_modules', '@vectorize-io', 'hindsight-coding-agents', 'package.json')
+    try {
+      const stat = statSync(manifest, { bigint: true })
+      return { manifest, stamp: `${stat.size}:${stat.mtimeNs}` }
+    } catch {
+      return { manifest, stamp: 'missing' }
+    }
+  })
+  const key = probes.map((entry) => `${entry.manifest}=${entry.stamp}`).join('|')
   if (integrationMemo?.key === key) return integrationMemo.value
 
   let value = { installed: false, path: null, version: null }
-  for (const root of roots) {
-    const manifest = join(root, 'node_modules', '@vectorize-io', 'hindsight-coding-agents', 'package.json')
-    if (existsSync(manifest)) {
-      value = integrationManifest(manifest)
+  for (const entry of probes) {
+    if (entry.stamp !== 'missing') {
+      value = integrationManifest(entry.manifest)
       break
     }
   }
@@ -621,13 +629,30 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
     const cap = settings.maxInjectTokens
     if (cap && meter.measure(text) > cap) {
       const countFn = meter.fastCount ?? meter.count
-      const minOffset = leadingPrefix(text).length
+      const hasEnvelope = text.endsWith(MEMORY_ENVELOPE_CLOSE) && leadingPrefix(text).includes(VERIFY_REMINDER)
+      const body = hasEnvelope ? text.slice(0, -MEMORY_ENVELOPE_CLOSE.length) : text
+      const minOffset = leadingPrefix(body).length
+      const prefixTokens = minOffset > 0 ? countFn(body.slice(0, minOffset)) : 0
+      const tryTrim = (markers, closeSuffix) => {
+        const closeTokens = closeSuffix ? countFn(closeSuffix) : 0
+        const inner = cap - closeTokens
+        if (inner <= prefixTokens) return ''
+        for (const marker of markers) {
+          const cut = trimToBudget(body, inner, marker, countFn, { minOffset })
+          if (!cut || cut.length <= minOffset) continue
+          const joined = `${cut}${closeSuffix}`
+          if (countFn(joined) <= cap) return joined
+        }
+        return ''
+      }
       // The prefixes are protected: a small ceiling shrinks the body first and
-      // the marker second, rather than dropping the whole re-injection.
-      let trimmed = trimToBudget(text, cap, REENTRY_MARKER, countFn, { minOffset })
-      if (!trimmed) trimmed = trimToBudget(text, cap, REENTRY_MARKER_MIN, countFn, { minOffset })
-      if (!trimmed) trimmed = trimToBudget(text, cap, '', countFn, { minOffset })
-      return trimmed
+      // the marker second, rather than dropping the whole re-injection. Keep the
+      // closing data boundary when the cap can afford both body and marker.
+      if (hasEnvelope) {
+        const closed = tryTrim([REENTRY_MARKER, REENTRY_MARKER_MIN], MEMORY_ENVELOPE_CLOSE)
+        if (closed) return closed
+      }
+      return tryTrim([REENTRY_MARKER, REENTRY_MARKER_MIN, ''], '')
     }
     return text
   }
@@ -753,6 +778,7 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
         text,
         rawText,
         tokens,
+        hasEnvelope: text.endsWith(MEMORY_ENVELOPE_CLOSE) && leadingPrefix(text).includes(VERIFY_REMINDER),
         // An id known from an earlier turn is history the model already has; it
         // may be rewritten for budget, never silently dropped as a duplicate.
         isNew: !session.seenIds.has(message.id),
@@ -826,6 +852,7 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
             deltaSavedTokens += Math.max(0, candidate.tokens - deltaTokens)
             const message = rebuild(candidate.message, deltaText)
             candidate.text = deltaText
+            candidate.hasEnvelope = false
             candidate.tokens = deltaTokens
             candidate.message = message
             edits.set(candidate.index, message)
@@ -879,14 +906,17 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
     const remind = Boolean(settings.verifyReminder)
     let remindApplied = false
     if (remind) {
-      const target = survivors.find((candidate) => candidate.isNew) ?? survivors[0]
-      if (!target.text.startsWith(VERIFY_REMINDER) && !target.text.startsWith(`${REENTRY_PREFIX}${VERIFY_REMINDER}`)) {
-        target.text = `${VERIFY_REMINDER}${escapeEnvelopeBoundaries(target.text)}${MEMORY_ENVELOPE_CLOSE}`
-        target.hasEnvelope = true
-        target.tokens = meter.measure(target.text)
-        target.message = rebuild(target.message, target.text)
-        edits.set(target.index, target.message)
-        remindApplied = true
+      const freshSurvivors = survivors.filter((candidate) => candidate.isNew)
+      const targets = freshSurvivors.length > 0 ? freshSurvivors : [survivors[0]]
+      for (const target of targets) {
+        if (!target.text.startsWith(VERIFY_REMINDER) && !target.text.startsWith(`${REENTRY_PREFIX}${VERIFY_REMINDER}`)) {
+          target.text = `${VERIFY_REMINDER}${escapeEnvelopeBoundaries(target.text)}${MEMORY_ENVELOPE_CLOSE}`
+          target.hasEnvelope = true
+          target.tokens = meter.measure(target.text)
+          target.message = rebuild(target.message, target.text)
+          edits.set(target.index, target.message)
+          remindApplied = true
+        }
       }
     }
 
@@ -955,7 +985,7 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
       // recall that mentions the task keeps more of its body than a small,
       // unrelated one. Without lexical signal every weight is 1, which is the
       // original equal-share water-filling.
-      const weights = survivors.map((candidate) => 1 + queryRelevance(candidate.rawText, queryText))
+      const weights = survivors.map((candidate) => 1 + queryRelevance(stripRuntimePrefixes(candidate.text), queryText))
       const allocations = allocateBudget(survivors.map((candidate) => candidate.tokens), budget, weights)
       // Only the budgeted view needs to know what the turn is about; the default
       // truncating mode never reads the other messages.
@@ -971,36 +1001,50 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
           finalTexts.set(candidate.index, candidate.text)
           return
         }
-        const prefix = leadingPrefix(candidate.text)
+        const hasEnvelope = Boolean(candidate.hasEnvelope)
+        const baseText = hasEnvelope && candidate.text.endsWith(MEMORY_ENVELOPE_CLOSE)
+          ? candidate.text.slice(0, -MEMORY_ENVELOPE_CLOSE.length)
+          : candidate.text
+        const prefix = leadingPrefix(baseText)
         const prefixTokens = prefix ? countFn(prefix) : 0
+        const closeSuffix = hasEnvelope ? MEMORY_ENVELOPE_CLOSE : ''
+        const closeTokens = closeSuffix ? countFn(closeSuffix) : 0
         let trimmed = ''
         if (allotted > prefixTokens && settings.viewPolicy === 'budgeted') {
           // Budgeted view: spend the allotment on the fact blocks that match the
-          // task, keeping evidence pointers, instead of the leading blocks.
-          const body = candidate.text.slice(prefix.length)
-          const bodyBudget = allotted - prefixTokens
-          let view = budgetedView({
-            text: body,
-            contextText: viewContext,
-            budget: bodyBudget,
-            count: countFn,
-          })
-          if (view && prefix) {
-            const over = countFn(`${prefix}${view.text}`) - allotted
-            if (over > 0) {
-              view = bodyBudget - over > 0
-                ? budgetedView({
-                    text: body,
-                    contextText: viewContext,
-                    budget: bodyBudget - over,
-                    count: countFn,
-                  })
-                : null
-              if (view && countFn(`${prefix}${view.text}`) > allotted) view = null
+          // task, keeping evidence pointers, instead of the leading blocks. Strip
+          // the closing envelope first so it is not scored as a recall block, and
+          // re-append it after the view footer when the budget can afford it.
+          const body = baseText.slice(prefix.length)
+          const runView = (suffix, suffixTokens) => {
+            const bodyBudget = allotted - prefixTokens - suffixTokens
+            if (bodyBudget <= 0) return null
+            let view = budgetedView({
+              text: body,
+              contextText: viewContext,
+              budget: bodyBudget,
+              count: countFn,
+            })
+            if (view && (prefix || suffix)) {
+              const over = countFn(`${prefix}${view.text}${suffix}`) - allotted
+              if (over > 0) {
+                view = bodyBudget - over > 0
+                  ? budgetedView({
+                      text: body,
+                      contextText: viewContext,
+                      budget: bodyBudget - over,
+                      count: countFn,
+                    })
+                  : null
+                if (view && countFn(`${prefix}${view.text}${suffix}`) > allotted) view = null
+              }
             }
+            return view ? { view, text: `${prefix}${view.text}${suffix}` } : null
           }
-          if (view) {
-            trimmed = `${prefix}${view.text}`
+          const picked = (closeSuffix ? runView(closeSuffix, closeTokens) : null) ?? runView('', 0)
+          if (picked) {
+            const { view } = picked
+            trimmed = picked.text
             stats.viewTurns += 1
             stats.viewKept += view.kept
             stats.viewOmitted += view.omitted
@@ -1019,32 +1063,64 @@ function createGovernor(settings, stats, meter, { onBeforeStep } = {}) {
         if (!trimmed && allotted > 0) {
           // A prefix cut keeps whatever the bank returned first. With a ceiling
           // the sections that match the query are selected (rendered in their
-          // original order, so the host's prefix cache keeps a stable prefix);
-          // without one they are only reordered.
-          const ordered = prioritizeSectionsByQuery(candidate.text, queryText, { maxTokens: allotted, count: countFn })
+          // original order, so the host's prefix cache keeps a stable prefix) and
+          // every dropped section is named in the recoverable marker; when no
+          // matching section fits whole they are reordered by relevance so the
+          // trim cuts inside the match instead of discarding it.
           const baseMarker = `\n\n…[dsh-hindsight-tuner: cut from ~${candidate.tokens} to ~${allotted} tokens. Ask Hindsight for the full recall explicitly, or raise maxInjectTokens.]`
-          // Name the sections that fell off so recovery is one tool call away
-          // instead of blind guessing, and keep every existing marker word.
-          const marker = buildRecoverableMarker(baseMarker)
-          trimmed = trimToBudget(ordered, allotted, marker, countFn, { minOffset: prefix.length })
-          if (!trimmed) {
-            // The pointer is worth its tokens normally, but a ceiling that is only
-            // a little above the prefix cannot afford it: fall back to the plain
-            // marker so a tiny budget still delivers some memory instead of none.
-            trimmed = trimToBudget(ordered, allotted, baseMarker, countFn, { minOffset: prefix.length })
-          }
-          if (trimmed && candidate.hasEnvelope) {
-            // The closing boundary belongs to the final text, not to the input
-            // that gets cut: re-trim against the budget left after reserving it,
-            // so a trimmed recall never ends mid-fence with the envelope open.
-            const closingTokens = countFn(MEMORY_ENVELOPE_CLOSE)
-            if (allotted > closingTokens + prefixTokens) {
-              const closed = trimToBudget(ordered, allotted - closingTokens, baseMarker, countFn, { minOffset: prefix.length })
-              if (closed && closed.length > prefix.length && countFn(`${closed}${MEMORY_ENVELOPE_CLOSE}`) <= allotted) {
-                trimmed = `${closed}${MEMORY_ENVELOPE_CLOSE}`
+          const baseMarkerTokens = countFn(baseMarker)
+          const trimWithEnvelope = (suffix, suffixTokens) => {
+            const innerBudget = allotted - suffixTokens
+            if (innerBudget <= prefixTokens) return ''
+            const fit = (content) => {
+              if (!content || content.length <= prefix.length) return ''
+              const joined = `${content}${suffix}`
+              return countFn(joined) <= allotted ? joined : ''
+            }
+            const selectionCap = Math.max(0, innerBudget - baseMarkerTokens)
+            const selection = selectionCap > prefixTokens
+              ? selectSectionsByQuery(baseText, queryText, { maxTokens: selectionCap, count: countFn })
+              : selectSectionsByQuery(baseText, queryText)
+            if (selection.selected) {
+              const keptBody = selection.text.replace(/\s+$/, '')
+              const pointer1 = buildRecoverableMarker(baseMarker, { extraDropped: selection.dropped })('')
+              const withPointer1 = fit(`${keptBody}${pointer1}`)
+              if (withPointer1) return withPointer1
+              const pointerCap = innerBudget - countFn(pointer1)
+              if (pointerCap > prefixTokens) {
+                const selection2 = selectSectionsByQuery(baseText, queryText, { maxTokens: pointerCap, count: countFn })
+                if (selection2.selected) {
+                  const pointer2 = buildRecoverableMarker(baseMarker, { extraDropped: selection2.dropped })('')
+                  const withPointer2 = fit(`${selection2.text.replace(/\s+$/, '')}${pointer2}`)
+                  if (withPointer2) return withPointer2
+                }
+              }
+              const withBase = fit(`${keptBody}${baseMarker}`)
+              if (withBase) return withBase
+            }
+            const ordered = selection.selected ? selectSectionsByQuery(baseText, queryText).text : selection.text
+            const marker = buildRecoverableMarker(baseMarker)
+            // Name the sections that fell off so recovery is one tool call away
+            // instead of blind guessing; fall back to the plain marker when a
+            // tight ceiling cannot afford the extra pointer tokens.
+            for (const activeMarker of [marker, baseMarker]) {
+              const cut = trimToBudget(ordered, innerBudget, activeMarker, countFn, { minOffset: prefix.length })
+              if (!cut) continue
+              const joined = fit(cut)
+              if (joined) return joined
+              if (suffix) {
+                const over = countFn(`${cut}${suffix}`) - allotted
+                if (over > 0 && innerBudget - over > prefixTokens) {
+                  const tighter = fit(trimToBudget(ordered, innerBudget - over, activeMarker, countFn, { minOffset: prefix.length }))
+                  if (tighter) return tighter
+                }
               }
             }
+            return ''
           }
+          // Reserve the closing boundary first so a trimmed recall keeps its
+          // data envelope intact AND preserves recoverable cut pointers.
+          trimmed = (closeSuffix ? trimWithEnvelope(closeSuffix, closeTokens) : '') || trimWithEnvelope('', 0)
         }
         if (!trimmed) {
           removed.add(candidate.index)
@@ -1268,6 +1344,9 @@ function hintFor(status) {
   if (status.tuneError) {
     return `Automatic tuning failed (${status.tuneError}). Fix the permission or file error above, then run /hindsight tune.`
   }
+  if (status.budget.prestepErrors > 0) {
+    return `${status.budget.prestepErrors} pre-step(s) failed inside the plugin and passed through ungoverned; inspect tuner.jsonl (prestep_error) before trusting the budget.`
+  }
   if (status.budget.turns === 0 && status.budget.preSteps > 0 && status.budget.injectSinceBoot) {
     return 'The journal shows Hindsight injections since this process started, but none reached this hook: another pre-step listener is wrapping it. Restart DSH or check bundle order, then check /hindsight again.'
   }
@@ -1301,12 +1380,14 @@ async function buildStatus(settings, stats, governor, cwd = process.cwd(), sessi
   const ratios = stats.ratios ?? []
   const expectedOrigin = originOf(server.apiUrl)
   const charRatio = stats.totalChars > 0 ? Math.round((stats.totalTokens / stats.totalChars) * 100) / 100 : null
-  // The journal stores characters; hand it a measured ratio only when this process
-  // is CJK-dense, otherwise its English 0.3 baseline is the better fit.
+  // The journal stores characters; hand it the measured ratio whenever it falls
+  // inside a plausible tokeniser density band (0.22..1.10 tok/char), matching
+  // formatSuggestion so code-dense English (0.35-0.45) is not under-counted.
+  const usableRatio = Number.isFinite(charRatio) && charRatio >= 0.22 && charRatio <= 1.10
   const activity = summarizeActivity({
     expectedOrigin,
     harness: 'dsh',
-    tokenRatio: charRatio > 0.45 ? charRatio : null,
+    tokenRatio: usableRatio ? charRatio : null,
   })
   const history = summarizeTunerJournal({ windowHours: 24 })
   const lastInjectAt = activity.lastInject?.ts ? Date.parse(activity.lastInject.ts) : Number.NaN
@@ -1545,7 +1626,7 @@ function formatStatus(status) {
     lines.push('  order    outermost hook installed (prepend); confirmed on the first recall')
   }
   if (status.budget.prestepErrors > 0) {
-    lines.push(`  errors   WARNING: ${status.budget.prestepErrors} pre-step(s) failed inside the plugin and continued without memory (journal: prestep_error)`)
+    lines.push(`  errors   WARNING: ${status.budget.prestepErrors} pre-step(s) failed inside the plugin and passed through ungoverned (journal: prestep_error)`)
   }
 
   const pageLimit = status.effective.pageSearchLimit
@@ -1584,7 +1665,7 @@ function formatStatus(status) {
   lines.push(`  activity ${formatActivity(status.activity)}`)
   const memoryLine = formatMemory(status.memory)
   if (memoryLine) lines.push(`  memory   ${memoryLine}`)
-  if (!status.probe?.ok && status.activity.lastInject) {
+  if (status.probe && !status.probe.ok && status.activity.lastInject) {
     lines.push('  note     inject_ok counts what Hindsight sent; while recall fails that is its static tool guide, not project memory')
   }
   lines.push(`  next     ${status.hint}`)
@@ -1998,6 +2079,7 @@ export function apply(ctx, rawConfig) {
       })
       if (!dryRun) {
         stats.lastTuneError = null
+        settings.autoTune = true
         tuning = Promise.resolve(result)
       }
       record({ event: dryRun ? 'tune_previewed' : 'tune_requested', changed: result.changed.map((change) => change.path) })
@@ -2006,7 +2088,10 @@ export function apply(ctx, rawConfig) {
     if (action === 'revert') {
       const dryRun = options.dryRun === true
       const result = revertTuning({ dryRun })
-      if (!dryRun) tuning = Promise.resolve({ skipped: true, reason: 'reverted' })
+      if (!dryRun) {
+        settings.autoTune = false
+        tuning = Promise.resolve({ skipped: true, reason: 'reverted' })
+      }
       record({ event: dryRun ? 'revert_previewed' : 'tune_reverted', reverted: result.reverted.map((entry) => entry.path) })
       return formatRevert(result)
     }
@@ -2090,7 +2175,10 @@ export function apply(ctx, rawConfig) {
         }
         // The tool schema cannot be the only guard: a caller that reaches
         // `execute` directly must be refused the same combinations the command
-        // handler refuses, and `dryRun` only means something on tune/revert.
+        // handler refuses, and `dryRun`/`overwrite` only apply to their actions.
+        if (args?.overwrite !== undefined && action !== 'tune') {
+          return 'hindsight_tuner: overwrite is only valid with tune.'
+        }
         if (args?.dryRun === true && !['tune', 'revert'].includes(action)) {
           return 'hindsight_tuner: dryRun is only valid with tune or revert.'
         }
@@ -2139,7 +2227,7 @@ export function apply(ctx, rawConfig) {
               cwd: invocation?.agent?.session?.header?.cwd,
               sessionId: invocation?.agent?.session?.header?.id,
               dryRun: flags.dryRun === true,
-              overwrite: flags.overwrite === true,
+              overwrite: flags.overwrite ? true : undefined,
               cap: flags.cap,
               json: flags.json === true,
             })
