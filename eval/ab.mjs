@@ -33,8 +33,10 @@ import * as stats from './stats.mjs'
 import {
   assertFrozen,
   captureFingerprint,
+  probeCapabilities,
   readFingerprint,
   resolveBank,
+  uniqueBankId,
   writeFingerprint,
 } from './bank.mjs'
 import {
@@ -141,6 +143,7 @@ Experiment:
   --seed N                    Bootstrap seed (default ${DEFAULT_SEED})
   --bootstraps N              Bootstrap resamples (default ${DEFAULT_BOOTSTRAPS})
   --prices <file>             USD per-million-token prices JSON
+  --midr-threshold <rate>     MIDR gate ceiling for memory arms (0..1, default 0.05)
   --timeout ms                Per agent/check process timeout (default ${DEFAULT_TIMEOUT_MS})
   --agent-command "<cmd>"     Agent command; JSON array for args with spaces
                               (default: ${DEFAULT_AGENT.join(' ')})
@@ -154,8 +157,12 @@ Isolation:
 
 Bank reproducibility:
   --bank <id>                 Hindsight bank id (env HINDSIGHT_BANK_ID)
+  --fresh-bank                Generate a timestamped unique bank id instead of reusing the
+                              resolved default id (#6444: a crash-retried setup must not
+                              delete a newly created bank)
   --api-url <url>             Hindsight API base URL (env HINDSIGHT_API_URL)
   --api-token <token>         Bearer token (env HINDSIGHT_API_TOKEN)
+  --probe-capabilities        Probe separated Embedding and Operation Validator support
   --fingerprint-out <file>    Capture the bank fingerprint before running and write it
   --verify-fingerprint <file> Verify a frozen fingerprint before running (abort on drift)
 
@@ -174,6 +181,8 @@ const BOOLEAN_FLAGS = new Set([
   '--no-reset-between-attempts',
   '--no-isolate',
   '--allow-unmet-requires',
+  '--fresh-bank',
+  '--probe-capabilities',
   '--help',
   '-h',
 ])
@@ -195,6 +204,7 @@ const VALUE_FLAGS = new Set([
   '--bootstraps',
   '--seed',
   '--prices',
+  '--midr-threshold',
 ])
 
 /** Split a command string respecting quotes and escaped spaces without breaking Windows paths. */
@@ -255,6 +265,18 @@ function parseInteger(value, flag, { min = 0 } = {}) {
   return number
 }
 
+function parseRate(value, flag) {
+  const text = String(value).trim()
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(text)) {
+    throw new Error(`${flag} requires a number between 0 and 1 (got ${JSON.stringify(value)})`)
+  }
+  const number = Number(text)
+  if (!Number.isFinite(number) || number < 0 || number > 1) {
+    throw new Error(`${flag} must be between 0 and 1 (got ${number})`)
+  }
+  return number
+}
+
 function parseAgentCommand(value) {
   const text = String(value).trim()
   if (!text) throw new Error('--agent-command requires a command')
@@ -297,6 +319,9 @@ function defaultOptions() {
     apiToken: null,
     fingerprintOut: null,
     verifyFingerprint: null,
+    freshBank: false,
+    probeCapabilities: false,
+    midrThreshold: 0.05,
     primary: null,
     bootstraps: DEFAULT_BOOTSTRAPS,
     seed: DEFAULT_SEED,
@@ -349,6 +374,12 @@ export function parseArgs(argv = []) {
           break
         case '--allow-unmet-requires':
           options.allowUnmetRequires = true
+          break
+        case '--fresh-bank':
+          options.freshBank = true
+          break
+        case '--probe-capabilities':
+          options.probeCapabilities = true
           break
         default:
           options.help = true
@@ -428,6 +459,9 @@ export function parseArgs(argv = []) {
           break
         case '--prices':
           options.prices = String(value)
+          break
+        case '--midr-threshold':
+          options.midrThreshold = parseRate(value, flag)
           break
         default:
           throw new Error(`unknown argument: ${token}`)
@@ -1164,10 +1198,12 @@ async function prepareBank(options, tasks) {
     repo: repoInfo.repo,
     repoSource: repoInfo.source,
     verified: false,
+    freshBank: Boolean(options.freshBank),
     fingerprint: null,
     capturedAt: null,
     expectedFingerprint: null,
     fingerprintFile: null,
+    capabilities: null,
   }
   if (options.verifyFingerprint) {
     const expected = readFingerprint(options.verifyFingerprint)
@@ -1205,6 +1241,12 @@ async function prepareBank(options, tasks) {
       info.fingerprintFile = writeFingerprint(options.fingerprintOut, fingerprint)
     }
   }
+  if (options.probeCapabilities) {
+    info.capabilities = await probeCapabilities({
+      apiUrl: info.apiUrl,
+      token: options.apiToken ?? undefined,
+    })
+  }
   return { info, fingerprint, resolved }
 }
 
@@ -1237,6 +1279,7 @@ function buildPlan(options, tasks, armsResult, resolved, repoInfo) {
     apiUrl: resolved.apiUrl,
     bankId: resolved.bank,
     tokenSource: resolved.source.token,
+    freshBank: Boolean(options.freshBank),
     verify: options.verifyFingerprint ? resolve(options.verifyFingerprint) : null,
     fingerprintOut: options.fingerprintOut ? resolve(options.fingerprintOut) : null,
     expectedFingerprint: null,
@@ -1388,6 +1431,20 @@ export async function main(argv = process.argv.slice(2)) {
   }
   const primary = options.primary ? parsePrimary(options.primary, armNames) : null
   const repoInfo = detectRepo(tasks)
+  if (options.freshBank && options.bank) {
+    throw new Error('--fresh-bank cannot be combined with --bank: the generated id must not be overridden')
+  }
+  if (options.freshBank && options.verifyFingerprint) {
+    throw new Error('--fresh-bank cannot be combined with --verify-fingerprint: a fresh bank has no frozen baseline')
+  }
+  if (options.freshBank) {
+    const base = resolveBank({
+      apiUrl: options.apiUrl,
+      token: options.apiToken,
+      repo: repoInfo.repo,
+    })
+    options.bank = uniqueBankId(base.bank)
+  }
   // Leak prevention (roadmap §6): a task that will see memory must declare the
   // history cutoff, and the cutoff must not admit commits after the task began.
   // The audit runs here so --dry-run fails loudly too, instead of the first
@@ -1511,6 +1568,7 @@ export async function main(argv = process.argv.slice(2)) {
       seed: options.seed,
       bootstraps: options.bootstraps,
       alpha: 0.05,
+      midrThreshold: options.midrThreshold,
       prices: options.prices ? resolve(options.prices) : null,
       costUnit: prices ? 'USD' : 'tokens (zero prices: cost = total tokens)',
       platform: process.platform,
@@ -1535,12 +1593,21 @@ export async function main(argv = process.argv.slice(2)) {
     worktrees: state.worktrees,
     cleanupErrors: state.cleanupErrors,
   }
+  report.midr = stats.memoryGate(report.memory, { threshold: options.midrThreshold })
+  report.generalization = stats.generalizationCheck(tasks, { agent: options.agent })
 
-  const text = formatReport(report, {
+  let text = formatReport(report, {
     primary,
     seed: options.seed,
     bootstraps: options.bootstraps,
   })
+  if (report.midr && !report.midr.passed) {
+    const failed = report.midr.arms.filter((arm) => !arm.pass).map((arm) => `${arm.arm} ${(arm.midr * 100).toFixed(1)}%`)
+    text += `\nMIDR gate FAILED (ceiling ${(report.midr.threshold * 100).toFixed(1)}%): ${failed.join(', ')}`
+  }
+  if (report.generalization.warnings.length > 0) {
+    text += `\nGeneralization warnings: ${report.generalization.warnings.join('; ')}`
+  }
   if (options.report) writeReport(report, options.report)
   process.stdout.write(options.json ? `${JSON.stringify(report, null, 2)}\n` : `${text}\n`)
 

@@ -38,8 +38,23 @@ for (const name of ['HINDSIGHT_AUTO_INJECT', 'HINDSIGHT_API_URL', 'HINDSIGHT_API
 
 const { estimateTokens, truncateToBudget, trimToBudget, allocateBudget, countTokens, percentile, FALLBACK_MARGIN, overlapRatio, repetitionRatio, extractQueryTerms, prioritizeSectionsByQuery, selectSectionsByQuery, buildRecoverableMarker, queryRelevance, splitBlocks } = await import('../lib/tokens.js')
 const { applyTuning, revertTuning, readConfigFile, getPath, autoTuneEnabled, setAutoTune, sweepStaleTemps, tunerState } = await import('../lib/config-file.js')
-const { bankResolution, classifyMoveEvent, diagPath, effectiveConfig, effectiveServer, expandBankTemplate, installedBundles, isProfileRoot, legacyToolNames, optedOut, profileRoots, projectName, summarizeActivity } = await import('../lib/diagnostics.js')
+const { bankResolution, classifyMoveEvent, cordisRuntimeInfo, diagPath, effectiveConfig, effectiveServer, expandBankTemplate, hotReloadDiagnostics, installedBundles, isProfileRoot, legacyToolNames, optedOut, profileRoots, projectName, summarizeActivity } = await import('../lib/diagnostics.js')
 const { record, flushJournal, journalPending, summarizeTunerJournal } = await import('../lib/log.js')
+
+// --- P37 cordis realm and hot-reload diagnostics ---------------------------
+const cordisRoot = join(scratch, 'cordis-runtime')
+mkdirSync(join(cordisRoot, 'node_modules', '@deepseek-ai', 'cordis'), { recursive: true })
+writeFileSync(
+  join(cordisRoot, 'node_modules', '@deepseek-ai', 'cordis', 'package.json'),
+  JSON.stringify({ name: '@deepseek-ai/cordis', version: '4.1.2' }),
+)
+const cordisInfo = cordisRuntimeInfo({ env: {}, argv: [process.execPath, join(cordisRoot, 'entry.js')] })
+assert.equal(cordisInfo.version, '4.1.2')
+assert.equal(cordisInfo.isolateRealm, true)
+assert.equal(hotReloadDiagnostics(null, { env: {}, argv: [] }).rootInclude, null)
+assert.equal(hotReloadDiagnostics({ include: [] }, { env: {}, argv: [] }).rootInclude, true)
+assert.equal(hotReloadDiagnostics({}, { env: {}, argv: [] }).rootInclude, false)
+assert.match(hotReloadDiagnostics({}, { env: {}, argv: [] }).note, /root Include item is missing/)
 
 // --- journal buffering ------------------------------------------------------
 record({ event: 'buffered_probe' })
@@ -945,7 +960,7 @@ assert.equal(tiny.messages.length, 1, 'unfittable message is dropped')
 // Under the cap: untouched.
 const small = { ...recallMessage, id: 'recall-small', content: [{ type: 'text', text: 'short recall' }] }
 const under = await waterfall(harness, 'agent/pre-step', { agent: { session: { header: { id: 'under' } } } }, async () => ({ kind: 'enter', messages: [small] }))
-assert.equal(under.messages[0].content[0].text, 'short recall')
+assert.equal(under.messages[0].content[0].text, '[snapshot #1 — supersedes earlier memory-governor views]\n\nshort recall')
 
 // A recall that carries images keeps them; only its text is trimmed.
 const withImage = {
@@ -975,6 +990,7 @@ assert.match(status, /recall\s+2 turns/, 'per-session recall accounting')
 assert.match(status, /budget\s+cap 600 tok\/turn · capped \d+ · dropped 0/)
 assert.match(status, /order\s+outermost hook/)
 assert.match(status, /pages\s+pageSearchLimit=/)
+assert.match(status, /runtime\s+cordis/)
 
 // The same status is available as data, so a user or a script need not parse prose.
 const statusJson = await tool.execute({ action: 'status', json: true }, exec)
@@ -1193,7 +1209,7 @@ assert.match(await compactionHarness.tools.find((candidate) => candidate.name ==
 for (const dispose of compactionHarness.disposers) dispose()
 
 const tightReentry = makeHarness()
-apply(tightReentry.ctx, { autoTune: false, maxInjectTokens: 80, repeatPolicy: 'skip', verifyReminder: true })
+apply(tightReentry.ctx, { autoTune: false, maxInjectTokens: 120, repeatPolicy: 'skip', verifyReminder: true })
 const tightLog = []
 const tightTurnFn = (messages) => waterfall(
   tightReentry,
@@ -1207,7 +1223,7 @@ tightLog.push({ type: 'user/message', seq: 2, data: { source: { kind: 'plugin:hi
 tightLog.push({ type: 'compaction/summary', seq: 3, data: { shadowedSeqs: [2] } })
 const cappedReentry = await tightTurnFn([human])
 const cappedReentryText = injectedText(cappedReentry)
-assert.ok(estimateTokens(cappedReentryText) <= 80, 'trimmed re-entry respects cap')
+assert.ok(estimateTokens(cappedReentryText) <= 120, 'trimmed re-entry respects cap')
 assert.ok(cappedReentryText.startsWith('[dsh-hindsight-tuner: memory re-injected after context compaction]'), 'reentry trim protects REENTRY_PREFIX')
 assert.ok(cappedReentryText.includes('[Hindsight historical memory'), 'reentry trim protects VERIFY_REMINDER')
 for (const dispose of tightReentry.disposers) dispose()
@@ -1276,7 +1292,7 @@ const plainTurn = await waterfall(plainHarness, 'agent/pre-step', { agent: { ses
   messages: [human, adaptiveRecall('p1', irrelevant.join('\n\n'))],
 }))
 const plainText = injectedText(plainTurn)
-assert.ok(plainText.startsWith('### Unrelated note 0'), 'with no signal the view keeps the prefix')
+assert.ok(plainText.startsWith('[snapshot #1 — supersedes earlier memory-governor views]\n\n### Unrelated note 0'), 'with no signal the view keeps the prefix')
 // token estimation is already imported at the top of this file
 assert.ok(estimateTokens(plainText) <= 200, 'the fallback selection is still measured')
 for (const dispose of viewHarness.disposers) dispose()
@@ -1561,6 +1577,24 @@ assert.match(await trusting.tools.find((candidate) => candidate.name === 'hindsi
 assert.equal(JSON.parse(await trusting.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status', json: true }, { agent: { session: { header: { id: 'other' } } } })).budget.verifyReminder, true)
 for (const dispose of trusting.disposers) dispose()
 
+// P37: every delivered projection carries a monotonic snapshot declaration so a
+// later compaction cannot make an old view look current.
+const snapshot = makeHarness()
+apply(snapshot.ctx, { autoTune: false, maxInjectTokens: 500, verifyReminder: true })
+const snapExec = { agent: { session: { header: { id: 'snapshot' } } } }
+const snapTurn = (messages) => waterfall(snapshot, 'agent/pre-step', { agent: { session: { header: { id: 'snapshot' } } } }, async () => ({ kind: 'enter', messages }))
+const snapFirst = await snapTurn([human, adaptiveRecall('snap1', '- first snapshot fact about sockets')])
+const snapFirstText = injectedText(snapFirst)
+assert.match(snapFirstText, /^\[Hindsight historical memory[\s\S]*\n\n\[snapshot #1 — supersedes earlier memory-governor views\]\n\n/, 'first delivered view gets snapshot #1')
+const snapSecond = await snapTurn([human, adaptiveRecall('snap1', snapFirstText), adaptiveRecall('snap2', '- second snapshot fact about locks')])
+const snapSecondText = snapSecond.messages.map((message) => message.content?.[0]?.text ?? '').join('\n')
+assert.match(snapSecondText, /\[snapshot #2 — supersedes earlier memory-governor views\]/, 'fresh recall gets the next snapshot number')
+assert.match(snapSecondText, /\[snapshot #1 — supersedes earlier memory-governor views\]/, 'history copy keeps its original snapshot number')
+const snapStatus = JSON.parse(await snapshot.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status', json: true }, snapExec))
+assert.equal(snapStatus.budget.session.snapshot, 2)
+assert.match(await snapshot.tools.find((candidate) => candidate.name === 'hindsight_tuner').execute({ action: 'status' }, snapExec), /snapshot #2/)
+for (const dispose of snapshot.disposers) dispose()
+
 // The data boundary is closed on both ends whenever the recall fits uncut: the
 // model sees where the untrusted text starts and where it stops.
 const envelope = makeHarness()
@@ -1659,7 +1693,7 @@ const strUnder = await strTurn([
   { id: 'u-str', role: 'user', source: { kind: 'user' }, content: 'Fix lib/tokens.js' },
   { id: 'r-str-1', role: 'user', source: { kind: 'plugin:hindsight', form: 'recall' }, content: 'short string recall' },
 ])
-assert.equal(strUnder.messages[1].content, 'short string recall', 'under-cap string content untouched')
+assert.equal(strUnder.messages[1].content, '[snapshot #1 — supersedes earlier memory-governor views]\n\nshort string recall', 'under-cap string content gets a snapshot declaration')
 const strView = await strTurn([
   { id: 'u-str-2', role: 'user', source: { kind: 'user' }, content: 'Fix the budget accounting in lib/tokens.js trimToBudget recallBudget' },
   { id: 'r-str-2', role: 'user', source: { kind: 'plugin:hindsight', form: 'recall' }, content: [...irrelevant, relevant].join('\n\n') },
@@ -2012,7 +2046,7 @@ try {
 const zero = makeHarness()
 apply(zero.ctx, { autoTune: false, maxInjectTokens: 0 })
 const untouched = await waterfall(zero, 'agent/pre-step', { agent: { session: { header: { id: 'zero' } } } }, next)
-assert.equal(untouched.messages[1].content[0].text, big, 'cap 0 leaves the recall alone')
+assert.equal(untouched.messages[1].content[0].text, `[snapshot #1 — supersedes earlier memory-governor views]\n\n${big}`, 'cap 0 leaves the recall body alone but adds the snapshot declaration')
 const zeroStatus = await zero.tools[0].execute({ action: 'status' }, { agent: { session: { header: { id: 'zero' } } } })
 assert.match(zeroStatus, /recall\s+1 turns/)
 assert.match(zeroStatus, /cap off/)

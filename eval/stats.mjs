@@ -793,6 +793,9 @@ export function memoryValue(rows, options = {}) {
       trimTax,
       distractionTax,
       netValue: round(benefit - tax, 4),
+      // MIDR (memory-induced degradation rate): the share of shared tasks on
+      // which this memory arm solved strictly less often than the baseline.
+      midr: round(regressedTaskIds.length / tasks, 4),
       improvedTaskIds: improvedTaskIds.sort(),
       // Tasks where Tax > 0: the ones to read before trusting the arm.
       regressedTaskIds: regressedTaskIds.sort(),
@@ -806,15 +809,70 @@ export function memoryValue(rows, options = {}) {
 export function formatMemoryValue(value) {
   if (!value || !Array.isArray(value.arms) || value.arms.length === 0) return null
   const lines = [`memory value vs ${value.baseline} — mean per-task success-rate change (0..1)`]
-  const header = `${'arm'.padEnd(14)}${'benefit'.padStart(9)}${'tax'.padStart(9)}${'trim'.padStart(9)}${'distract'.padStart(10)}${'net'.padStart(9)}  regressed`
+  const header = `${'arm'.padEnd(14)}${'benefit'.padStart(9)}${'tax'.padStart(9)}${'trim'.padStart(9)}${'distract'.padStart(10)}${'net'.padStart(9)}${'midr'.padStart(8)}  regressed`
   lines.push(header)
   for (const arm of value.arms) {
     const regressed = arm.regressedTaskIds.length > 0 ? arm.regressedTaskIds.join(', ') : '-'
     lines.push(
-      `${String(arm.arm).padEnd(14)}${formatNumber(arm.benefit, 2).padStart(9)}${formatNumber(arm.tax, 2).padStart(9)}${formatNumber(arm.trimTax, 2).padStart(9)}${formatNumber(arm.distractionTax, 2).padStart(10)}${formatNumber(arm.netValue, 2).padStart(9)}  ${regressed}`,
+      `${String(arm.arm).padEnd(14)}${formatNumber(arm.benefit, 2).padStart(9)}${formatNumber(arm.tax, 2).padStart(9)}${formatNumber(arm.trimTax, 2).padStart(9)}${formatNumber(arm.distractionTax, 2).padStart(10)}${formatNumber(arm.netValue, 2).padStart(9)}${formatPercent(arm.midr === undefined ? null : arm.midr * 100).padStart(8)}  ${regressed}`,
     )
   }
   return lines.join('\n')
+}
+
+/**
+ * P39 MIDR gate: WikiTrace showed memory can make a model worse on a minority
+ * of tasks even when the mean improves. A memory arm is admissible only when
+ * its memory-induced degradation rate is at or below the configured ceiling
+ * (5% by default). Returns null when there is no memory block.
+ */
+export function memoryGate(value, { threshold = 0.05 } = {}) {
+  if (!value || !Array.isArray(value.arms) || value.arms.length === 0) return null
+  const rate = Number(threshold)
+  if (!Number.isFinite(rate) || rate < 0 || rate > 1) {
+    throw new TypeError(`memoryGate: threshold must be between 0 and 1 (got ${JSON.stringify(threshold)})`)
+  }
+  const arms = value.arms.map((arm) => ({
+    arm: arm.arm,
+    tasks: arm.tasks,
+    degraded: arm.regressedTaskIds.length,
+    midr: arm.midr,
+    pass: Number(arm.midr) <= rate,
+  }))
+  return { threshold: rate, baseline: value.baseline, arms, passed: arms.every((arm) => arm.pass) }
+}
+
+const TRAINING_SETS = new Set(['training', 'train', 'screening', 'dev'])
+const HELDOUT_SETS = new Set(['confirmation', 'heldout', 'held-out', 'test', 'validation'])
+
+/**
+ * P39 generalization preconditions borrowed from Reglos: a single task set
+ * cannot tell optimization from memorization, and one agent family cannot
+ * distinguish a memory effect from a model quirk. These are warnings, not
+ * scores: the report records them so a reader never sees a bare number.
+ */
+export function generalizationCheck(tasks, { agent = [] } = {}) {
+  const list = Array.isArray(tasks) ? tasks : []
+  const sets = {}
+  for (const task of list) {
+    const raw = typeof task?.set === 'string' && task.set.trim() ? task.set.trim().toLowerCase() : 'unspecified'
+    sets[raw] = (sets[raw] ?? 0) + 1
+  }
+  const names = Object.keys(sets)
+  const training = names.filter((name) => TRAINING_SETS.has(name)).reduce((sum, name) => sum + sets[name], 0)
+  const heldout = names.filter((name) => HELDOUT_SETS.has(name)).reduce((sum, name) => sum + sets[name], 0)
+  const warnings = []
+  if (training === 0 || heldout === 0) {
+    warnings.push('no explicit training/held-out split: declare task.set as screening/confirmation (or training/heldout)')
+  }
+  const agentText = Array.isArray(agent) ? agent.join(' ').toLowerCase() : String(agent ?? '').toLowerCase()
+  const families = ['claude', 'gpt', 'openai', 'deepseek', 'qwen', 'gemini', 'llama', 'mistral'].filter((family) =>
+    agentText.includes(family),
+  )
+  if (families.length <= 1) {
+    warnings.push('single agent family: repeat the primary comparison on a second model family before generalizing')
+  }
+  return { sets, total: list.length, training, heldout, families, warnings }
 }
 
 function formatNumber(value, digits = 2) {

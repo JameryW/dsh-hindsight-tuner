@@ -175,6 +175,111 @@ export function resolveBank({ apiUrl, bank, token, repo, cwd } = {}) {
   }
 }
 
+let evalBankCounter = 0
+
+/**
+ * Hindsight #6444: a crash-retried setup may delete a newly created bank that
+ * reused the old name. Evaluation banks therefore carry a timestamp and a
+ * random suffix, making each run's bank unmistakably new. The suffix is
+ * deliberately readable (not a UUID) so a cleanup can find all eval banks.
+ */
+export function uniqueBankId(base, { now = new Date(), random = Math.random } = {}) {
+  const name = String(base ?? '').trim()
+  if (!name) throw new BankError('uniqueBankId requires a non-empty base bank id')
+  const date = now instanceof Date ? now : new Date(now)
+  if (Number.isNaN(date.getTime())) throw new BankError('uniqueBankId received an invalid date')
+  const stamp = date.toISOString().slice(0, 19).replace(/[-:]/g, '').replace('T', '-')
+  const draw = Number(random())
+  const fraction = Number.isFinite(draw) ? Math.min(Math.max(draw, 0), 0.999999999999) : 0
+  evalBankCounter += 1
+  const suffix = Math.floor(fraction * 36 ** 6).toString(36).padStart(6, '0').slice(-6)
+  return `${name}--eval-${stamp}-${suffix}${evalBankCounter > 1 ? `-${evalBankCounter}` : ''}`
+}
+
+function findCapabilityBoolean(payload, patterns, path = '') {
+  if (payload === null || typeof payload !== 'object') {
+    if (typeof payload === 'boolean' && patterns.some((pattern) => pattern.test(path))) return payload
+    return null
+  }
+  for (const [key, value] of Object.entries(payload)) {
+    const next = path ? `${path}.${key}` : key
+    const found = findCapabilityBoolean(value, patterns, next)
+    if (found !== null) return found
+  }
+  return null
+}
+
+/**
+ * Probe Hindsight v1.2.0's separated query/document embedding path and its
+ * Operation Validator. The server has no single stable capability endpoint
+ * across versions, so `/health` and `/v1/default/capabilities` are tried in
+ * order; an absent field stays `null` (unknown) rather than being reported as
+ * unsupported.
+ */
+export async function probeCapabilities({ apiUrl, token, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  const resolved = resolveBank({ apiUrl, token })
+  const timeout = normalizeTimeout(timeoutMs)
+  const attempts = []
+  let payload = null
+  let usedUrl = null
+  for (const path of ['/health', '/v1/default/capabilities']) {
+    const url = `${resolved.apiUrl}${path}`
+    try {
+      const body = await fetchJson(url, { token: resolved.token, timeoutMs: timeout, what: 'capabilities' })
+      attempts.push({ url, status: 200, ok: true })
+      payload = payload && typeof payload === 'object' && body && typeof body === 'object'
+        ? { ...payload, ...body }
+        : (payload ?? body)
+      usedUrl = usedUrl ?? url
+    } catch (error) {
+      if (error instanceof BankHttpError && error.status === 404) {
+        attempts.push({ url, status: 404, ok: false })
+        continue
+      }
+      return {
+        apiUrl: resolved.apiUrl,
+        ok: false,
+        url: attempts.length > 0 ? attempts[attempts.length - 1].url : url,
+        status: error instanceof BankHttpError ? error.status : 0,
+        error: clip(error?.message ?? error),
+        embedding: { separated: null },
+        operationValidator: { available: null },
+        attempts,
+      }
+    }
+  }
+  if (payload === null) {
+    return {
+      apiUrl: resolved.apiUrl,
+      ok: false,
+      url: attempts.length > 0 ? attempts[attempts.length - 1].url : null,
+      status: 404,
+      error: 'no capability endpoint returned a supported payload',
+      embedding: { separated: null },
+      operationValidator: { available: null },
+      attempts,
+    }
+  }
+  const separateEmbedding = findCapabilityBoolean(payload, [
+    /(?:separate[d]?|split|query[._-]?document|query[._-]?and[._-]?document).*embedding/i,
+    /embedding.*(?:separate[d]?|split|query[._-]?document|query[._-]?and[._-]?document)/i,
+  ])
+  const operationValidator = findCapabilityBoolean(payload, [
+    /operation[._-]?validator/i,
+    /validator.*operation/i,
+  ])
+  return {
+    apiUrl: resolved.apiUrl,
+    ok: true,
+    url: usedUrl,
+    status: 200,
+    version: typeof payload?.version === 'string' ? payload.version : null,
+    embedding: { separated: separateEmbedding },
+    operationValidator: { available: operationValidator },
+    attempts,
+  }
+}
+
 async function fetchJson(url, { token, timeoutMs, what } = {}) {
   const headers = { accept: 'application/json' }
   if (token) headers.authorization = `Bearer ${token}`

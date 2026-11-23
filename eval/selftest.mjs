@@ -25,8 +25,10 @@ import {
   fingerprintOf,
   fingerprintStats,
   fingerprintTree,
+  probeCapabilities,
   readFingerprint,
   resolveBank,
+  uniqueBankId,
   verifyFingerprint,
   writeFingerprint,
 } from './bank.mjs'
@@ -42,6 +44,8 @@ import {
   assertComplete,
   costOfRow,
   formatMemoryValue,
+  generalizationCheck,
+  memoryGate,
   memoryValue,
   mulberry32,
   pairedComparison,
@@ -270,10 +274,11 @@ function gitWorktreeCount(repo) {
  * Start a local fake Hindsight bank. Serves the modern pages/tree, the legacy
  * alias, and stats; records every request so tests can assert paths and auth.
  */
-async function startFakeBank({ bank, legacyOnly = false, stats } = {}) {
+async function startFakeBank({ bank, legacyOnly = false, stats, capabilities = null } = {}) {
   const state = {
     bank,
     legacyOnly,
+    capabilities,
     tree: {
       roots: [
         {
@@ -312,6 +317,10 @@ async function startFakeBank({ bank, legacyOnly = false, stats } = {}) {
     try {
       const pathname = new URL(request.url ?? '/', 'http://127.0.0.1').pathname
       state.requests.push({ pathname, authorization: request.headers.authorization ?? null })
+      if (pathname === '/health' && state.capabilities) {
+        respond(200, { status: 'ok', version: '1.2.0', ...state.capabilities })
+        return
+      }
       const encodedBank = encodeURIComponent(state.bank)
       const bankPrefix = `/v1/default/banks/${encodedBank}/`
       if (!pathname.startsWith(bankPrefix)) {
@@ -636,6 +645,38 @@ async function bankChecks(repoDir, tempRoot) {
         delete process.env.HINDSIGHT_BANK_ID
         delete process.env.HINDSIGHT_API_TOKEN
       }
+    })
+
+    check('uniqueBankId appends a readable timestamp and random suffix', () => {
+      const fixed = new Date('2026-11-23T12:01:02.345Z')
+      const first = uniqueBankId('coding-agent::demo', { now: fixed, random: () => 0.123456 })
+      matches(first, /^coding-agent::demo--eval-20261123-120102-[0-9a-z]{6}/, 'timestamp + random suffix')
+      const second = uniqueBankId('coding-agent::demo', { now: fixed, random: () => 0.123456 })
+      ok(first !== second, 'the process counter keeps repeated draws unique')
+      throws(() => uniqueBankId('  '), 'non-empty', 'empty base rejected')
+    })
+
+    await checkAsync('probeCapabilities reads separated embeddings and operation validator flags', async () => {
+      const capable = await startFakeBank({
+        bank: 'cap-bank',
+        capabilities: {
+          embedding: { separate_embeddings: true },
+          operation_validator: { available: true },
+        },
+      })
+      try {
+        const result = await probeCapabilities({ apiUrl: capable.apiUrl })
+        equal(result.ok, true, 'capability probe ok')
+        equal(result.version, '1.2.0', 'server version')
+        equal(result.embedding.separated, true, 'separated embeddings detected')
+        equal(result.operationValidator.available, true, 'operation validator detected')
+      } finally {
+        await capable.close()
+      }
+      const missing = await probeCapabilities({ apiUrl: fake.apiUrl })
+      equal(missing.ok, false, 'no capability endpoint is not reported as supported')
+      equal(missing.status, 404, 'all-404 status')
+      equal(missing.embedding.separated, null, 'unknown embedding capability')
     })
 
     check('canonicalJson sorts keys recursively and preserves arrays', () => {
@@ -990,6 +1031,41 @@ function statsChecks() {
     approx(arm.trimTax, 2 / 3, 1e-3, 'cut and omitted tasks are trim tax')
     approx(arm.distractionTax, 1 / 3, 1e-3, 'a regression without trim metadata is distraction tax')
     matches(formatMemoryValue(value), /arm\s+benefit\s+tax\s+trim\s+distract\s+net/, 'columns name both taxes')
+  })
+
+  check('memoryValue reports MIDR and memoryGate enforces the 5% ceiling', () => {
+    const rows = [
+      makeRow({ taskId: 't1', arm: 'A0', passed: true }),
+      makeRow({ taskId: 't2', arm: 'A0', passed: true }),
+      makeRow({ taskId: 't3', arm: 'A0', passed: true }),
+      makeRow({ taskId: 't4', arm: 'A0', passed: true }),
+      makeRow({ taskId: 't1', arm: 'A3', passed: true }),
+      makeRow({ taskId: 't2', arm: 'A3', passed: true }),
+      makeRow({ taskId: 't3', arm: 'A3', passed: true }),
+      makeRow({ taskId: 't4', arm: 'A3', passed: false }),
+    ]
+    const value = memoryValue(rows, { baseline: 'A0' })
+    approx(value.arms[0].midr, 0.25, 1e-4, 'MIDR is the regressed share')
+    const gate = memoryGate(value)
+    equal(gate.passed, false, '25% degradation fails the default 5% ceiling')
+    equal(gate.arms[0].degraded, 1, 'one degraded task')
+    equal(memoryGate(value, { threshold: 0.25 }).passed, true, 'a 25% ceiling admits it')
+    throws(() => memoryGate(value, { threshold: 1.2 }), 'between 0 and 1', 'invalid threshold rejected')
+    equal(memoryGate(null), null, 'no memory block -> no gate')
+    matches(formatMemoryValue(value), /midr/, 'MIDR column is rendered')
+  })
+
+  check('generalizationCheck warns without a held-out split and second family', () => {
+    const warning = generalizationCheck([{ id: 't1', set: 'screening' }, { id: 't2' }], { agent: 'claude' })
+    equal(warning.training, 1, 'screening counts as training')
+    equal(warning.heldout, 0, 'no held-out tasks')
+    ok(warning.warnings.some((line) => line.includes('training/held-out')), 'split warning')
+    ok(warning.warnings.some((line) => line.includes('single agent family')), 'family warning')
+    const good = generalizationCheck(
+      [{ id: 't1', set: 'training' }, { id: 't2', set: 'confirmation' }],
+      { agent: 'claude gpt' },
+    )
+    equal(good.warnings.length, 0, 'training/held-out + two families is clean')
   })
 
   check('assertComplete accepts a complete experiment including timeout rows', () => {
