@@ -1954,6 +1954,17 @@ writeFileSync(process.env.HINDSIGHT_DIAG_FILE, JSON.stringify({
 const foreignOnly = await tool.execute({ action: 'status' }, exec)
 assert.doesNotMatch(foreignOnly, /process\s+newest journal failure/, 'another harness failure is ignored')
 assert.doesNotMatch(foreignOnly, /failures to another server/, 'another harness failure is not counted as DSH foreign traffic')
+
+// A daemon restart is global evidence: it explains pre-restart failures without
+// pretending the current DSH process has completed a successful recall.
+writeFileSync(process.env.HINDSIGHT_DIAG_FILE, [
+  { ts: new Date(Date.now() - 5000).toISOString(), harness: 'dsh', event: 'pages_failed', error: 'GET http://127.0.0.1:9077/v1/default/banks/coding-agent%3A%3Afixture/pages/tree -> connection refused' },
+  { ts: new Date().toISOString(), harness: 'coding-agent', event: 'daemon_started', apiUrl: 'http://127.0.0.1:9077' },
+].map((entry) => JSON.stringify(entry)).join('\n'))
+const daemonActivity = summarizeActivity({ harness: 'dsh' })
+assert.equal(daemonActivity.lastSuccess, null, 'a daemon restart is not counted as a recall success')
+assert.equal(Date.parse(daemonActivity.lastDaemonStart?.ts) > 0, true, 'daemon_started is visible across harness names')
+assert.equal(daemonActivity.lastDaemonStart?.apiUrl, 'http://127.0.0.1:9077')
 writeFileSync(process.env.HINDSIGHT_DIAG_FILE, injectionJournal)
 
 // Tuner journal >256KB tail read (multi-byte UTF-8 boundary), delta/cap aggregation, and cross-process history status line.

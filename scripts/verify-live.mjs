@@ -168,6 +168,8 @@ async function main() {
         // A local injection is not recovery: a process still on the old config
         // fails its fetch and then injects its static guide within milliseconds.
         const recovered = Number.isFinite(succeeded) && Number.isFinite(newest) && succeeded > newest
+        const daemonStarted = Date.parse(activity.lastDaemonStart?.ts ?? '')
+        const restartedAfterFailure = Number.isFinite(daemonStarted) && Number.isFinite(newest) && daemonStarted > newest
         const seenOrigin = seen ? originOf(seen) : null
         if (seenOrigin && seenOrigin !== expectedOrigin && !recovered) {
           const recent = Number.isFinite(newest) && Date.now() - newest <= STALE_MS
@@ -212,7 +214,11 @@ async function main() {
             const stateText = bankStatus === 404 ? 'bank is not seeded yet' : 'bank has no pages yet'
             note('recall', `${injected} inject_ok event(s) recorded, but ${stateText} (static guide only) · ${diagPath()}`)
           } else if (onlyStaticGuide) {
-            fail('recall', `${injected} inject_ok event(s) in journal, but server recall/pages failed (static tool guide only, no project memory) · ${diagPath()}`)
+            if (restartedAfterFailure) {
+              note('recall', `${injected} inject_ok event(s) predate a daemon restart — no DSH turn has run since; start one session to confirm live recall · ${diagPath()}`)
+            } else {
+              fail('recall', `${injected} inject_ok event(s) in journal, but server recall/pages failed (static tool guide only, no project memory) · ${diagPath()}`)
+            }
           } else {
             pass('recall', `${injected} successful recall(s) from the DSH harness in the window · ${diagPath()}`)
           }
