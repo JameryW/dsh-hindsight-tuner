@@ -72,7 +72,7 @@ governance bugs were fixed would have measured noise.
 | Compaction safety | detect a shadowed injection from session events; re-inject the delivered text, labelled and counted | shipped |
 | Adaptive spend | per-turn tier from recent activity and the prompt signal (a failing step outranks a continuation or the one-turn cooldown), with reasons in status | shipped |
 | Diagnosis | endpoint/token/bank/routing/effective config/probe/journal classified into semantic classes, compatible integration lines, deprecated tool names | shipped |
-| Evaluation | A/B harness: isolated worktrees, leak-prevention audit, bank fingerprint verified before, between arms and after (session retain off), pinned plugin version and tuner-config hash, attempts-to-success, task-level statistics, paired memory benefit/tax, and written arm hints delivered through `eval/agents/claude-hint.mjs` | shipped |
+| Evaluation | A/B harness: isolated worktrees, leak-prevention audit, bank fingerprint verified before, between arms and after (session retain off), pinned plugin version and tuner-config hash, attempts-to-success, task-level statistics, paired memory benefit/tax, MIDR + generalization gates, and written arm hints delivered through `eval/agents/claude-hint.mjs` | shipped |
 
 Configuration stays opt-in at the plugin boundary for anything that changes
 model-visible text in a new way: the schema defaults are `budgetPolicy: off`,
@@ -193,7 +193,40 @@ These are treated as executable tests, not intentions:
    (`activity.classes`), so a fallback or timeout is never read as a recall;
    "configured Reflect" is not treated as "Reflect executed".
 
-## 7. Roadmap
+## 7. v0.20 memory-governance upgrades
+
+Four upgrades follow the 2026 evidence reviewed for this release. They are
+deliberately small: each adds a check to the existing governance path rather than
+changing the memory backend.
+
+- **P36 — evidence anchors.** Budgeted View adds `EVIDENCE_BONUS = 0.15` to a
+  block that carries a `commit`, `page`, or `path` anchor, exposes the collected
+  anchors as a `Sources:` footer, and sets `verificationNeeded` when a kept block
+  reads like a failure lesson without any anchor. The footer then tells the model
+  to check current code/tests before acting. A plausible lesson without evidence
+  is not promoted by prose alone.
+- **P37 — monotonic snapshot declarations.** Every delivered memory view starts
+  with `[snapshot #N — supersedes earlier memory-governor views]`, where `N`
+  increases per session; re-injection after compaction also receives a fresh
+  number. This prevents a compacted stale view from being read as current. The
+  status surface reports the cordis runtime version, isolate-realm readiness
+  (>= 4.1.0), and whether the root config has an `include` section, so a hot
+  reload cannot silently leave the plugin on an old boundary.
+- **P38 — evaluation-bank isolation and capability probing.** `uniqueBankId()`
+  appends a UTC timestamp plus random suffix to a bank name, and `--fresh-bank`
+  refuses to combine with a fixed `--bank` or `--verify-fingerprint`. A
+  crash-retry therefore cannot delete or reuse a newly created same-name bank.
+  `probeCapabilities()` reports separated embedding and operation-validator
+  support; when no capability endpoint exists it returns `ok: false` rather than
+  inventing a capability.
+- **P39 — MIDR gate and generalization check.** `memoryValue()` reports MIDR
+  (memory-induced degradation rate) as the share of shared tasks whose success
+  rate falls below the baseline. `memoryGate()` defaults to a 5% ceiling and the
+  A/B report fails the gate above it. `generalizationCheck()` warns when tasks
+  have no training/held-out split or when the experiment covers only one agent
+  family, so a tuned harness cannot claim broad generalization from one model.
+
+## 8. Roadmap
 
 | Version | Content | Gate |
 | --- | --- | --- |
@@ -202,6 +235,7 @@ These are treated as executable tests, not intentions:
 | 0.17 | Budgeted View: block selection, provenance footer, measured budget | after P1 shows memory value |
 | 0.18 | scenario-aware budget, `scenarioTiers` overrides (shipped opt-in; Pages/Recall policy optimization still after P2) | after P2 |
 | 0.19 | Oracle fact promotion, conflict detection, rollback/audit | after P3 confirms harm |
+| 0.20 | evidence-anchored selection, snapshot declarations, fresh eval banks/capability probe, MIDR + generalization gates | after the corresponding A/B gates |
 | 1.0 | unified memory governance for distributed DAG agents | only on real production demand |
 
 Decision tree: P0 retry structure solves most repeated failures → keep `R2` and
@@ -210,7 +244,7 @@ it → validate Budgeted View (P2). If pollution causes real harm → validate t
 promotion gate (P3). Build a memory runtime only if the existing stack proves
 insufficient.
 
-## 8. Deliberately not doing now
+## 9. Deliberately not doing now
 
 - Rewriting the Hindsight store or consolidation pipeline.
 - OpenViking TrieHI, a default Hy-Memory-30B-A3B extractor, a global

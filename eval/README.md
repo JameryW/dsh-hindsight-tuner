@@ -37,7 +37,11 @@ Useful flags: `--attempts N` (default 3, per-task `maxAttempts` wins),
 `--timeout ms` (default 600000), `--no-isolate`, `--keep-worktrees`,
 `--reset-between-attempts`, `--allow-unmet-requires`, `--worktree-root <dir>`,
 `--prices <file>`, `--bootstraps N` (default 4000), `--seed N` (default
-20260101), `--json`. Run `node eval/ab.mjs --help` for the complete list.
+20260101), `--midr-threshold <rate>` (default 0.05), `--fresh-bank`,
+`--probe-capabilities`, `--json`. Run `node eval/ab.mjs --help` for the complete list.
+`--fresh-bank` derives a unique timestamped evaluation bank and refuses to
+combine with `--bank` or `--verify-fingerprint`; `--probe-capabilities` records
+whether the server exposes separated Embedding and Operation Validator support.
 
 `--dry-run` prints the matrix (tasks, arms + env, repeats, attempts, worktree
 roots, bank/fingerprint actions) and exits 0 without spawning agents or touching
@@ -217,7 +221,12 @@ first pass. Attempt rows carry `passed`, `tokens`, `usage`, `durationMs`,
   never silently as trim). `regressedTaskIds` lists the tasks where the
   arm solved less than the baseline, so a positive net value cannot hide a
   regressed task; the metric report is emitted as `report.memory` and printed as a
-  `memory value vs <baseline>` block with `benefit/tax/trim/distract/net` columns.
+  `memory value vs <baseline>` block with `benefit/tax/trim/distract/net/midr` columns.
+- **MIDR (memory-induced degradation rate)** – the share of shared tasks where the
+  memory arm solved strictly less often than the baseline. `report.midr` is checked
+  against `--midr-threshold` (default 5%); any arm above the ceiling fails the gate.
+  The report also emits `report.generalization` warnings when tasks lack a
+  training/held-out split or the run covers only one agent family.
 - **Memory Precision (manual audit)** – of the memory statements actually
   injected into the agent context, the fraction that are relevant and correct
   for the task. This is a human audit: sample injected memories (e.g. 20 per

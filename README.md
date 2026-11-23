@@ -302,8 +302,13 @@ rewrites that config mid-experiment the harness fails instead of comparing
 drifted arms. The report's `memory` block splits the paired cost into benefit,
 total tax, and the tax that came from a damaged recall (`trim`/omitted view)
 versus one that came from distraction (regressions with no trim metadata), with
-the regressed task ids listed. A
-completeness check turns missing rows or overlapping attempts into an explicit
+the regressed task ids listed. It also reports **MIDR** (memory-induced
+degradation rate) and enforces a default 5% ceiling (`--midr-threshold`), plus
+warnings when tasks have no training/held-out split or cover only one agent
+family. `--fresh-bank` derives a unique, timestamped evaluation bank instead of
+reusing a name that a crash-retry could delete; `--probe-capabilities` records
+whether the server separates embedding and operation-validator capabilities.
+A completeness check turns missing rows or overlapping attempts into an explicit
 inclusion warning in the report; a completed experiment exits 0 even when every
 task failed. The harness never calls a model itself — you point it at an agent
 command.

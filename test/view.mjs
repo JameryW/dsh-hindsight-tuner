@@ -9,10 +9,12 @@
 import assert from 'node:assert/strict'
 import {
   DEFAULT_VIEW_CONTEXT_MESSAGES,
+  EVIDENCE_BONUS,
   budgetedView,
   createMatcher,
   evidenceHints,
   extractTerms,
+  needsEvidenceVerification,
   taskContextText,
   VIEW_POLICIES,
 } from '../lib/view.js'
@@ -135,6 +137,33 @@ check('evidenceHints keeps commit, page and path pointers', () => {
   assert.deepEqual(evidenceHints('commit 3f8a1c9 path `lib/tokens.js`'), ['commit 3f8a1c9', 'path lib/tokens.js'])
   assert.deepEqual(evidenceHints('pageId: kp-1a976de9'), ['page kp-1a976de9'])
   assert.deepEqual(evidenceHints('no pointers here'), [])
+})
+
+check('evidence-anchored blocks receive the +0.15 bonus and render Sources', () => {
+  assert.equal(EVIDENCE_BONUS, 0.15)
+  const context = 'Fix lib/tokens.js trimToBudget boundary'
+  const plain = '### Plain\n- lib/tokens.js trimToBudget has a boundary issue'
+  const anchored = '### Anchored\n- lib/tokens.js trimToBudget boundary (commit 3f8a1c9, path lib/tokens.js)'
+  const view = budgetedView({ text: `${plain}\n\n${anchored}`, contextText: context, budget: 120, count: estimateTokens })
+  assert.ok(view)
+  assert.ok(view.text.includes('Anchored'), 'the evidence-anchored block wins the tight budget')
+  assert.ok(/Sources: .*commit 3f8a1c9/.test(view.text), 'Sources footer exposes anchors')
+  assert.ok(view.sources.some((source) => source.startsWith('commit ')))
+})
+
+check('needsEvidenceVerification flags only unanchored failure lessons', () => {
+  assert.equal(needsEvidenceVerification('This approach failed with an error in the parser.'), true)
+  assert.equal(needsEvidenceVerification('This approach failed with an error in the parser; see commit 3f8a1c9.'), false)
+  assert.equal(needsEvidenceVerification('A neutral description of the module.'), false)
+  const view = budgetedView({
+    text: '### Lesson\n- the previous fix failed with an error in lib/tokens.js\n\n### Other\nunrelated prose about a retired service',
+    contextText: 'fix lib/tokens.js error',
+    budget: 200,
+    count: estimateTokens,
+  })
+  assert.ok(view)
+  assert.equal(view.verificationNeeded, true)
+  assert.match(view.text, /Verify: an unanchored failure lesson is included/)
 })
 
 check('budgetedView selects the matching block and never exceeds the budget', () => {
