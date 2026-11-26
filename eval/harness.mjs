@@ -344,6 +344,7 @@ export async function evaluate(options = {}) {
                 arm,
                 repeat,
                 attempt,
+                previousAttempts: runRows.slice(),
                 worktree: context && context.worktree ? context.worktree : null,
                 fingerprint: fingerprint ?? null,
               })

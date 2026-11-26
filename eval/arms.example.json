@@ -26,7 +26,7 @@
       "question": "Do Hindsight pages beat no memory and handwritten conventions, and how do they compare with reflect?",
       "primary": "A3:A1",
       "arms": ["A0", "A1", "A2", "A3"],
-      "notes": "Preregistered primary comparison for the memory-source gate is A3 (native pages) vs A1 (handwritten conventions)."
+      "notes": "Preregistered primary comparison for the memory-source gate is A3 (native pages) vs A1 (handwritten conventions). A3-C is an offline ablation and does not replace this primary."
     },
     {
       "id": "P2",
@@ -158,7 +158,8 @@
       "hypothesis": "Truncation lowers cost per solved node without lowering success versus native pages.",
       "env": {
         "HINDSIGHT_AUTO_INJECT": "pages",
-        "HINDSIGHT_PAGE_SEARCH_LIMIT": "12"
+        "HINDSIGHT_PAGE_SEARCH_LIMIT": "12",
+        "HINDSIGHT_TUNER_VIEW_POLICY": "truncate"
       },
       "hint": "pages injection; truncate view",
       "tunerSettings": {
@@ -177,6 +178,7 @@
       "env": {
         "HINDSIGHT_AUTO_INJECT": "pages",
         "HINDSIGHT_PAGE_SEARCH_LIMIT": "12",
+        "HINDSIGHT_TUNER_VIEW_POLICY": "budgeted",
         "HINDSIGHT_EVAL_HINT": "budgeted-view"
       },
       "hint": "pages injection; budgeted view policy",
@@ -186,6 +188,26 @@
         "raw.viewPolicy": "budgeted"
       },
       "requires": ["pin settings.viewPolicy=budgeted in the plugin profile config (or state.json) before the run"]
+    },
+    {
+      "name": "A3-C",
+      "gate": "P1",
+      "label": "pages plus cluster portals",
+      "description": "Same injection path and tuner settings as A3. The bank adds unowned single-linkage cluster pages drafted by eval/cluster-preflight.mjs. Run only after the screening preflight passes. This does not replace the A3:A1 primary.",
+      "hypothesis": "Cluster portals raise locality of the injected pages and lower cost per solved node versus A3 at non-inferior success, provided screening search slots and the token ratio allow it.",
+      "env": {
+        "HINDSIGHT_AUTO_INJECT": "pages"
+      },
+      "hint": "pages injection from the cluster-page bank",
+      "tunerSettings": {
+        "raw.autoInject": "pages",
+        "raw.viewPolicy": "truncate"
+      },
+      "requires": [
+        "copy the settled A3 bank, write unowned cluster pages, wait for extraction and a manual page refresh, then capture a separate fingerprint of that bank",
+        "screening-only tuning: run node eval/cluster-preflight.mjs on screening prompts and do not tune τ or page text from confirmation prompts",
+        "run A3 and A3-C as two experiments; one --verify-fingerprint covers one bank"
+      ]
     },
     {
       "name": "A4",

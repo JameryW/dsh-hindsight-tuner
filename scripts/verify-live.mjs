@@ -19,6 +19,7 @@ import {
   diagPath,
   effectiveConfig,
   effectiveServer,
+  findIntegration,
   optedOut,
   projectName,
   summarizeActivity,
@@ -157,14 +158,27 @@ async function main() {
         bankFailed = true
       }
 
+      let tuner = null
+      let tunerReadError = null
+      try {
+        tuner = summarizeTunerJournal({ windowHours: 24 })
+      } catch (error) {
+        tunerReadError = error
+      }
+
       let injected = 0
       let lastInjectAt = Number.NaN
       try {
         const activity = summarizeActivity({ expectedOrigin, harness: 'dsh' })
         const seen = activity.lastFailure?.endpoint ?? activity.lastEndpoint
         const newest = Date.parse(activity.lastFailure?.ts ?? '')
-        const succeeded = Date.parse(activity.lastSuccess?.ts ?? '')
-        // lastSuccess counts only server-confirmed work (pages/retain/reflect).
+        const extSucceeded = Date.parse(activity.lastSuccess?.ts ?? '')
+        const builtinSucceeded = Date.parse(tuner?.builtin?.lastSuccess?.ts ?? '')
+        const succeeded = Math.max(
+          Number.isFinite(extSucceeded) ? extSucceeded : -Infinity,
+          Number.isFinite(builtinSucceeded) ? builtinSucceeded : -Infinity,
+        )
+        // lastSuccess counts only server-confirmed work (pages/retain/reflect/recall).
         // A local injection is not recovery: a process still on the old config
         // fails its fetch and then injects its static guide within milliseconds.
         const recovered = Number.isFinite(succeeded) && Number.isFinite(newest) && succeeded > newest
@@ -193,11 +207,21 @@ async function main() {
         }
 
         const recent = activity.recent ?? {}
-        injected = recent.inject_ok ?? 0
-        lastInjectAt = activity.lastInject?.ts ? Date.parse(activity.lastInject.ts) : Number.NaN
+        const extInjected = recent.inject_ok ?? 0
+        const builtinInjected = tuner?.builtin?.injected ?? 0
+        injected = extInjected + builtinInjected
+        const extInjectAt = activity.lastInject?.ts ? Date.parse(activity.lastInject.ts) : Number.NaN
+        const builtinInjectAt = tuner?.builtin?.lastInject?.ts ? Date.parse(tuner.builtin.lastInject.ts) : Number.NaN
+        lastInjectAt = Math.max(
+          Number.isFinite(extInjectAt) ? extInjectAt : -Infinity,
+          Number.isFinite(builtinInjectAt) ? builtinInjectAt : -Infinity,
+        )
+        if (!Number.isFinite(lastInjectAt) || lastInjectAt === -Infinity) lastInjectAt = Number.NaN
         const realRecallOk = (recent.pages_ok ?? 0) + (recent.reflect_ok ?? 0) + (recent.recall_ok ?? 0) + (recent.inject_pages ?? 0)
-        const recallFailures = (recent.pages_failed ?? 0) + (recent.reflect_failed ?? 0) + (recent.recall_failed ?? 0) + (activity.authFailures ?? 0)
-        const onlyStaticGuide = injected > 0 && (
+          + (tuner?.builtin?.pagesOk ?? 0) + (tuner?.builtin?.recallOk ?? 0) + (tuner?.builtin?.reflectOk ?? 0)
+        const recallFailures = (recent.pages_failed ?? 0) + (recent.reflect_failed ?? 0) + (recent.recall_failed ?? 0)
+          + (activity.authFailures ?? 0) + (tuner?.builtin?.errors ?? 0)
+        const onlyStaticGuide = extInjected > 0 && builtinInjected === 0 && (
           bankStatus === 401
           || bankStatus === 403
           || (realRecallOk === 0 && (recallFailures > 0 || bankFailed))
@@ -219,6 +243,8 @@ async function main() {
             } else {
               fail('recall', `${injected} inject_ok event(s) in journal, but server recall/pages failed (static tool guide only, no project memory) · ${diagPath()}`)
             }
+          } else if (builtinInjected > 0 && extInjected === 0) {
+            pass('recall', `${builtinInjected} successful built-in recall(s) in the window · ${tuner.path}`)
           } else {
             pass('recall', `${injected} successful recall(s) from the DSH harness in the window · ${diagPath()}`)
           }
@@ -230,7 +256,7 @@ async function main() {
       }
 
       try {
-        const tuner = summarizeTunerJournal({ windowHours: 24 })
+        if (tunerReadError) throw tunerReadError
         const state = tunerState()
         const governed = tuner.tierSelected + tuner.capped + tuner.skipped + tuner.deltas + tuner.reentered + tuner.viewed
         // state.json only proves a tuner profile exists; it can be edited or
@@ -272,8 +298,10 @@ async function main() {
   }
 
   const failed = results.filter((result) => result.status === 'fail')
+  const integration = findIntegration()
+  const lane = integration.installed && integration.enabled !== false ? 'external' : 'builtin'
   if (json) {
-    console.log(JSON.stringify({ cwd, repo, passed: failed.length === 0, results }, null, 2))
+    console.log(JSON.stringify({ cwd, repo, lane, passed: failed.length === 0, results }, null, 2))
   } else {
     const mark = { pass: 'PASS', note: 'NOTE', fail: 'FAIL' }
     for (const result of results) console.log(`${mark[result.status].padEnd(5)} ${result.name.padEnd(8)} ${result.detail}`)

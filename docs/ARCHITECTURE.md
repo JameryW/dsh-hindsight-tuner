@@ -5,39 +5,41 @@ and the evidence gates that decide what gets built next. It is deliberately
 short: the README explains *how to use* the plugin, this file explains *why it is
 shaped this way* and what would have to be true to change that.
 
-## 1. Scope: memory governance, not memory storage
+## 1. Scope: memory governance + optional standalone lane, not a custom database
 
-The tuner does not store memories. It sits between the agent loop and the memory
-backend and decides, per turn:
+The tuner does not build or host its own memory database — Hindsight server
+remains the backend (Git cold start, Pages, Recall, consolidation and history
+stay there). Instead, `@jameryw/dsh-hindsight-tuner` owns the complete DSH-side
+lane and governance control plane in modular `lib/` units:
 
+- **standalone memory lane** (`lib/client.js`, `lib/memory-lane.js`): direct
+  Hindsight v1 REST client for `pages`/`recall`/`reflect` injection, native
+  `hindsight_*` tools, and `/hindsight seed` when no external integration bundle
+  is enabled (`memoryLane: auto`);
 - **whether** an injected recall is worth its tokens (repeat safety, staleness),
 - **which part** of it survives the budget (truncation or Budgeted View),
 - **how much** the turn may spend (hard cap, adaptive tiers, token accounting),
-- **what happened** (journal, status, diagnosis) so an experiment can be audited.
+- **what happened** (`lib/log.js`, `lib/format.js`, `lib/diagnostics.js`) so an
+  experiment or live session can be audited.
 
-Hindsight remains the backend: Git cold start, Pages, Recall, consolidation and
-history stay there. Rewriting that store, or building a new distributed memory
-runtime, is explicitly out of scope until the gates in §4 prove a gap.
+Rewriting the Hindsight server/store itself, or building a new distributed
+memory runtime, remains explicitly out of scope until the gates in §4 prove a gap.
 
 ```
 Agent / orchestrator (planner, workers, retries, DAG)
-        │  claims messages, asks for memory
+        │  claims messages, asks for memory / tools
         ▼
-dsh-hindsight-tuner — governance
-   budget · selection · repeat safety · provenance · diagnosis · eval harness
-        │  pages / recall / reflect
+dsh-hindsight-tuner — standalone lane + governance
+   lib/client · lib/memory-lane · lib/governor · lib/envelope · lib/view
+        │  pages / recall / reflect / retain (direct HTTP or wrapping external hook)
         ▼
-Hindsight — backend
+Hindsight Server — backend
    Git cold start · Pages · Recall · consolidation · history
-        │
-        ▼  (only if a gate fails for storage-level reasons)
-optional, evidence-gated: directory-affinity retrieval · fact promotion gate ·
-multi-agent shared governance · alternative backends
 ```
 
-The governing principle: **the backend owns storage and retrieval; the
-governance layer owns what is worth injecting, how much, and whether a memory may
-become a shared fact.**
+The governing principle: **the Hindsight server owns storage and retrieval; the
+single DSH bundle owns transport, tool exposure, what is worth injecting, how
+much, and whether a memory may become a shared fact.**
 
 ## 2. Why this boundary
 
@@ -64,15 +66,16 @@ governance bugs were fixed would have measured noise.
 
 | Concern | Mechanism | Status |
 | --- | --- | --- |
-| Hard per-turn cap | outermost `agent/pre-step`, re-registered on `agents` mount and `agent/created` / `agent/session-start` | shipped |
+| Standalone Hindsight lane | zero-dependency REST client (`lib/client.js`, with Hindsight v1 wire parity, `/knowledge-base` unrouted-404 fallback, live 401 token refresh, page-body LRU cache, singleflight GET dedupe, transient gateway retry, bank stats/import sync & `hindsight-embed`/`uvx` daemon auto-wake) + `lib/memory-lane.js` (`pages`/`recall`/`reflect` injection, automatic DSH `turn-stopping` session turn retention with secret redaction, 8 native `hindsight_*` tools, `/hindsight stats|pages|recall|reflect|retain|seed`) when external bundle is absent/disabled (`memoryLane: auto`) | shipped |
+| Hard per-turn cap | outermost `agent/pre-step` (`lib/governor.js`), re-registered on `agents` mount and `agent/created` / `agent/session-start` | shipped |
 | Budget across messages | weighted water-filling (`allocateBudget`): equal share by default, query-relevance weights keep task evidence before unrelated text; no hidden floor | shipped |
-| Over-budget payload | query-aware section selection rendered in original document order (prefix-cache safe), then structure-aware trim that names the dropped sections and the tools that recover them; fenced code measured denser; a long compact list is split between top-level items | shipped |
-| Over-budget selection | Budgeted View: block ranking against the task text (compound-identifier subwords, CJK n-grams, word-boundary prose terms), parent heading mounted with a selected child, provenance footer, measured result | shipped, opt-in |
-| Repeat safety | compare against delivered text; identical turns skipped; new blocks sent as a `new-facts delta`; history never removed; a cut or omitted Budgeted View does not count as a full repeat; the last full non-delta base is kept for compaction re-injection; a 20-minute pause resets stale cut state | shipped |
-| Compaction safety | detect a shadowed injection from session events; re-inject the delivered text, labelled and counted | shipped |
+| Over-budget payload | parent-preserving query-aware section selection rendered in original document order (prefix-cache safe), then structure-aware trim that names the dropped sections and recovery tools; zero-allocation fenced-code `fast` estimator and built-in zero-dependency `calibrated` BPE estimator | shipped |
+| Over-budget selection | Budgeted View (`lib/view.js`): block ranking with multi-level ancestor heading mounting, evidence anchors (`+0.15`), provenance `Sources:` footer, measured result | shipped, opt-in |
+| Repeat safety | compare against delivered text; identical turns skipped; new blocks sent as a `new-facts delta`; history never removed; a cut or omitted Budgeted View does not count as a full repeat; a 20-minute pause resets stale cut state | shipped |
+| Compaction safety | single $O(N)$ backwards scan of session events (`lastInjectionState`); re-inject delivered text with fresh monotonic snapshot header computed inside the cap | shipped |
 | Adaptive spend | per-turn tier from recent activity and the prompt signal (a failing step outranks a continuation or the one-turn cooldown), with reasons in status | shipped |
-| Diagnosis | endpoint/token/bank/routing/effective config/probe/journal classified into semantic classes, compatible integration lines, deprecated tool names | shipped |
-| Evaluation | A/B harness: isolated worktrees, leak-prevention audit, bank fingerprint verified before, between arms and after (session retain off), pinned plugin version and tuner-config hash, attempts-to-success, task-level statistics, paired memory benefit/tax, MIDR + generalization gates, and written arm hints delivered through `eval/agents/claude-hint.mjs` | shipped |
+| Diagnosis | pure-FS `.git`/worktree resolution, endpoint/token/bank/routing/effective config/probe/journal (`diag.jsonl` + built-in `tuner.jsonl`) | shipped |
+| Evaluation | A/B harness: isolated worktrees, leak-prevention audit, bank fingerprint verified before, between arms and after (session retain off), pinned plugin version and tuner-config hash, task-level statistics, paired memory benefit/tax, MIDR + generalization gates, and agent-configurable hint wrapper (`HINDSIGHT_EVAL_AGENT_BIN`) | shipped |
 
 Configuration stays opt-in at the plugin boundary for anything that changes
 model-visible text in a new way: the schema defaults are `budgetPolicy: off`,
@@ -244,6 +247,12 @@ it → validate Budgeted View (P2). If pollution causes real harm → validate t
 promotion gate (P3). Build a memory runtime only if the existing stack proves
 insufficient.
 
+A3-C is an ablation after that P1 primary, not a new runtime. An offline
+single-linkage cut (`eval/cluster-preflight.mjs`) drafts unowned bank pages.
+Screening prompts decide whether those pages enter search slots and whether
+their token ratio can pay for itself. Confirmation prompts do not tune the
+cut. `agent/pre-step` still only fetches and governs pages.
+
 ## 9. Deliberately not doing now
 
 - Rewriting the Hindsight store or consolidation pipeline.
@@ -253,6 +262,8 @@ insufficient.
 - A new TiKV/Qdrant/PostgreSQL memory service.
 - Treating the current three budget tiers or dedupe thresholds as optimal without
   ablation.
+- A nearest-neighbour graph or spanning tree inside `agent/pre-step`. Cluster
+  pages, when used, are drafted offline and judged as arm A3-C.
 
 The one-line summary: **Hindsight stores memory, the tuner governs memory,
 Budgeted View improves information per token, and real task A/B runs decide what

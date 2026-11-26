@@ -719,7 +719,7 @@ function relativeToRepo(repoRoot, dir) {
   return isOutsidePath(relPath) ? null : relPath
 }
 
-function buildEnvForRun(task, arm, attempt) {
+function buildEnvForRun(task, arm, attempt, previousAttempt = null) {
   const env = { ...process.env }
   let retainDeclared = false
   for (const source of [task.env, arm.env]) {
@@ -730,6 +730,16 @@ function buildEnvForRun(task, arm, attempt) {
   env.HINDSIGHT_HARNESS = 'eval'
   env.HINDSIGHT_ARM = arm.name
   env.HINDSIGHT_ATTEMPT = String(attempt)
+  if (attempt > 1 && previousAttempt) {
+    if (previousAttempt.failureSignature) {
+      env.HINDSIGHT_EVAL_PREV_SIGNATURE = String(previousAttempt.failureSignature)
+    }
+    const rawDetail = [previousAttempt.error, previousAttempt.note].filter(Boolean).join('\n').trim()
+    if (rawDetail) env.HINDSIGHT_EVAL_PREV_FAILURE = rawDetail.slice(0, 4000)
+  } else {
+    delete env.HINDSIGHT_EVAL_PREV_SIGNATURE
+    delete env.HINDSIGHT_EVAL_PREV_FAILURE
+  }
   // A/B arms must see a frozen bank: background consolidation between arms would
   // silently change the treatment. Arms that genuinely need retain can opt back
   // in through task.env/arm.env, which is recorded in the arm definition.
@@ -1007,7 +1017,7 @@ function prepareIsolatedConfigKeys(baseEnv, overrideEnv) {
 
 /** Create the per-run agent + check runner, isolating HINDSIGHT_CONFIG keys overridden by arm/task env. */
 export function createRunner(options) {
-  return async function runTask({ task, arm, attempt, worktree }) {
+  return async function runTask({ task, arm, attempt, previousAttempts, worktree }) {
     // A task may point at a subdirectory of its repository; the worktree is a
     // fresh checkout of the whole repo, so run relative to the recorded offset
     // instead of dropping the subdirectory.
@@ -1015,7 +1025,10 @@ export function createRunner(options) {
     if (options.resetBetweenAttempts && attempt > 1 && worktree) {
       resetWorktree(worktree)
     }
-    const baseEnv = buildEnvForRun(task, arm, attempt)
+    const previousAttempt = Array.isArray(previousAttempts) && previousAttempts.length > 0
+      ? previousAttempts[previousAttempts.length - 1]
+      : null
+    const baseEnv = buildEnvForRun(task, arm, attempt, previousAttempt)
     const armSetsConfig = arm?.env && Object.prototype.hasOwnProperty.call(arm.env, 'HINDSIGHT_CONFIG')
     const effectiveOverrides = {
       HINDSIGHT_HARNESS: baseEnv.HINDSIGHT_HARNESS,

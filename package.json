@@ -1,15 +1,15 @@
 {
   "name": "@jameryw/dsh-hindsight-tuner",
-  "version": "0.18.0",
+  "version": "0.20.0",
   "private": true,
   "type": "module",
-  "description": "Token-budgeted tuning and diagnostics for Hindsight project memory in DeepSeek Harness",
+  "description": "Self-contained Hindsight project memory engine, token-budgeted governor, and diagnostics for DeepSeek Harness",
   "license": "MIT",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "test": "node test/scenario.mjs && node test/view.mjs && node test/smoke.mjs && node test/integration.mjs && node eval/selftest.mjs",
+    "test": "node test/scenario.mjs && node test/view.mjs && node test/cluster-preflight.mjs && node test/smoke.mjs && node test/integration.mjs && node eval/selftest.mjs",
     "eval": "node eval/ab.mjs",
     "verify": "node scripts/verify-live.mjs"
   },

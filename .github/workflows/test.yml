@@ -21,23 +21,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      # The integration test loads the real Hindsight bundle. Without this step
-      # the test skips; with it, the budget is proven against the shipped hook.
-      # The install stays tolerant of an upstream outage, but the test step below
-      # is required, so a failed install fails the job instead of skipping green.
-      - name: Install the Hindsight integration
-        continue-on-error: true
-        run: npm install --no-save --no-package-lock --no-audit --no-fund @vectorize-io/hindsight-coding-agents@0.8.7
-      - name: Unit tests (selection + token helpers)
+      - name: Unit tests (scenario + view + tokens)
         run: |
           node test/scenario.mjs
           node test/view.mjs
       - name: Smoke test
         run: node test/smoke.mjs
-      - name: Integration test
-        env:
-          HINDSIGHT_INTEGRATION_REQUIRED: '1'
+      - name: Standalone integration test
         run: node test/integration.mjs
       - name: A/B harness self-test
         run: node eval/selftest.mjs
-

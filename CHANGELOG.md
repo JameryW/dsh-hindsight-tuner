@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.20.0
+
+- **A3-C screening preflight** (`eval/cluster-preflight.mjs`): an offline
+  single-linkage cut drafts unowned cluster pages and scores them against
+  screening search slots and per-attempt token ratio. Confirmation prompts do
+  not tune the cut. The injection path and the default tuner settings are
+  unchanged. P1's primary comparison remains A3 vs A1.
+- **Self-contained single-plugin Hindsight engine (`memoryLane: auto`)**:
+  - New `lib/client.js` (zero-dependency Hindsight v1 REST client aligned with
+    upstream wire contracts: `/pages/tree`, `/pages/search` with unrouted-404
+    `/knowledge-base` & lexical fallback, `/pages/:id` with LRU body caching,
+    singleflight `GET` deduplication, live `401` `tokenProvider` replay,
+    transient `502`/`503`/`504`/socket retry, `/memories/recall`, `/reflect`,
+    `/memories` with per-item `strategy`/`tags`/`observation_scopes`, `/stats`,
+    `/import` + `/config` sync, `serverMode: daemon` `hindsight-embed`/`uvx`
+    detached auto-wake, `/pages` initiative capture, and Git commit seeding)
+    and `lib/memory-lane.js`.
+  - Works completely standalone without `@vectorize-io/hindsight-coding-agents`:
+    automatically pulls `pages`, `recall`, or `reflect` context into
+    `agent/pre-step` (honouring `signal.aborted`, `toolGuideExtra`,
+    `HINDSIGHT_DISABLE_HOOKS`, and `manageBankConfig`), incrementally retains
+    completed non-subagent DSH session turns on `agent/turn-stopping` and
+    `agent/disposed` (supporting nested `assistant/message`, `tool/call` actions,
+    `inheritedEventCount`, `maxParallelRetains`, watermark deduplication, and
+    credential redaction via `redactSecrets`), registers all 8 native Hindsight
+    tools (`hindsight_search_pages`, `hindsight_list_pages`,
+    `hindsight_read_page` [with `page_id` & `id`], `hindsight_recall`,
+    `hindsight_reflect`, `hindsight_retain`, `hindsight_ingest_document`, and
+    `hindsight_capture_initiative`), and adds `/hindsight stats`,
+    `/hindsight pages`, `/hindsight recall`, `/hindsight reflect`,
+    `/hindsight retain`, and `/hindsight seed [--limit N]`.
+  - Automatically detects installed/enabled `@vectorize-io/hindsight-coding-agents`
+    and yields injection, retention & tool registration without double-injecting
+    when both are active; adds validated settings `memoryLane`, `builtinTools`,
+    `allowMemoryRetain`, and `autoSeed`.
+- **v0.20 governance & evaluation upgrades**:
+  - Built-in zero-dependency `tokenBudgetMode: calibrated` structural BPE
+    tokenizer (`estimateCalibratedTokens`) with strict prefix monotonicity so
+    accurate subword/number/CJK budgeting requires zero npm packages.
+  - Evidence anchors (`EVIDENCE_BONUS = 0.15`, `Sources:` footer, unanchored
+    failure-lesson verification warnings), monotonic `[snapshot #N]` headers,
+    forged `[snapshot #` escaping even when `verifyReminder: false`, and cap-safe
+    snapshot numbering on compaction re-entry.
+  - Fresh timestamped evaluation banks (`--fresh-bank`), capability probing
+    (`--probe-capabilities`), MIDR degradation gates (`--midr-threshold`),
+    training/held-out + agent-family (`dsh` included) generalization checks,
+    per-arm `HINDSIGHT_TUNER_*` policy environment overrides (`viewPolicy`,
+    `budgetPolicy`, `maxInjectTokens`, `tokenBudgetMode`, `repeatPolicy`,
+    `verifyReminder`, `memoryLane`), and built-in Gate P0 `R0`/`R1`/`R2`
+    (`raw-error` & `structured-pitfall`) retry feedback in `eval/ab.mjs` +
+    `eval/agents/claude-hint.mjs` (`HINDSIGHT_EVAL_AGENT_BIN`).
+- **Modularization & hot-path optimization**:
+  - Split `index.js` into focused modules (`lib/envelope.js`, `lib/governor.js`,
+    `lib/format.js`, `lib/client.js`, `lib/memory-lane.js`).
+  - Zero-allocation single-pass `estimateTokens`, `openFenceAt`,
+    `boundaryOffsets`, `collectDroppedHeadings`, `selectSectionsByQuery`, and
+    `substantiveLines` scans across `lib/tokens.js` and `lib/view.js`, plus
+    cached per-session substantive line sets and single-pass survivor
+    measurement in `lib/governor.js`.
+  - Single-syscall content-memoized `readConfigFile()` and `readState()` in
+    `lib/config-file.js`, single-tokenize `createMatcher`/`budgetedView` and
+    zero-split `blockHeading` in `lib/view.js`, revision/stat-memoized
+    `summarizeTunerJournal()` in `lib/log.js`, short-TTL `canonicalPath` /
+    profile directory memoization in `lib/diagnostics.js`, and bilingual DSH
+    Plugin Manager detail pages (`docs/DETAIL.md`, `docs/DETAIL.zh.md`).
+  - Fixed bare-heading orphan selection in `selectSectionsByQuery` and added
+    multi-level ancestor heading mounting in `budgetedView`.
+  - Pure-FS `.git` & linked-worktree resolution with unified `gitInfoCache` in
+    `lib/diagnostics.js`, single-pass $O(N)$ `lastInjectionState` shadow scanning
+    in `lib/governor.js`, built-in journal accounting in `lib/log.js` and
+    `scripts/verify-live.mjs`, and 100% zero-dependency `test/integration.mjs`
+    and CI workflow.
+
 ## 0.18.0
 
 - New opt-in `budgetPolicy: scenario` (defaults stay `off`/`adaptive`). It keeps

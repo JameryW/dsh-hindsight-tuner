@@ -5,7 +5,8 @@
  * The evaluation harness spawns the agent command with the task prompt on
  * stdin, so a hint cannot be appended to argv. This wrapper reads stdin, puts
  * `HINDSIGHT_EVAL_HINT` (when set) in front of the prompt, and then runs the
- * real `claude` CLI with the same arguments, piping the modified prompt to it.
+ * configured agent CLI (`HINDSIGHT_EVAL_AGENT_BIN`, default `claude`) with the
+ * same arguments, piping the modified prompt to it.
  *
  * Use it for the gate P0 arms R1/R2 and the P1 arm A1:
  *
@@ -22,10 +23,51 @@ import { fileURLToPath } from 'node:url'
 
 export const HINT_SEPARATOR = '\n\n---\n\n'
 
-/** Prefix `input` with `hint` unless the hint is empty; exported for tests. */
-export function hintedPrompt(input, hint) {
+const LOCALITY_PATTERN = /(?:file:\/\/\/?(?=[A-Za-z]:)|file:\/\/)?([A-Za-z0-9_./\\-]+(?:\/|\\)[A-Za-z0-9_./\\-]+\.(?:[cm]?[jt]sx?|py|go|rs|java|rb|cs|cpp|c|h)|[A-Za-z]:[\\/][A-Za-z0-9_./\\-]+\.(?:[cm]?[jt]sx?|py|go|rs|java|rb|cs|cpp|c|h)|[A-Za-z0-9_.-]+\.(?:[cm]?[jt]sx?|py|go|rs|java|rb|cs|cpp|c|h)):(\d+)(?::(\d+))?/
+const ASSERTION_PATTERN = /^(?:AssertionError|TypeError|ReferenceError|SyntaxError|Error|FAIL|not ok)\b[^\n]*/m
+
+/** Extract a compact (<=500 token) structured failure summary for Gate P0 arm R2. */
+export function extractStructuredPitfall(failureText, signature = null) {
+  const raw = String(failureText ?? '').trim()
+  if (!raw) return null
+  const assertionMatch = ASSERTION_PATTERN.exec(raw)
+  const localityMatch = LOCALITY_PATTERN.exec(raw)
+  const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  const assertion = (assertionMatch ? assertionMatch[0] : lines[0] ?? '').slice(0, 240)
+  const locality = localityMatch
+    ? `${localityMatch[1]}:${localityMatch[2]}${localityMatch[3] ? `:${localityMatch[3]}` : ''}`
+    : null
+  const summary = {
+    protocol: 'R2-structured-pitfall',
+    signature: signature || 'check-failed',
+    assertion,
+    locality,
+    pitfall: locality
+      ? `Inspect ${locality} first and address the failing condition (${assertion.slice(0, 120)}) before retrying.`
+      : `Address the failing check condition (${assertion.slice(0, 140)}) before retrying.`,
+  }
+  return `Structured failure feedback (previous attempt):\n${JSON.stringify(summary, null, 2)}`
+}
+
+/**
+ * Prefix `input` with `hint` unless the hint is empty/`none`.
+ * Supports Gate P0 dynamic modes (`raw-error` and `structured-pitfall`) using
+ * `HINDSIGHT_EVAL_PREV_FAILURE` populated on retry attempts 2..N.
+ */
+export function hintedPrompt(input, hint, options = {}) {
   const trimmed = typeof hint === 'string' ? hint.trim() : ''
-  if (trimmed === '') return input
+  if (trimmed === '' || trimmed === 'none') return input
+  const prevFailure = typeof options.prevFailure === 'string' ? options.prevFailure.trim() : ''
+  const prevSignature = typeof options.prevSignature === 'string' ? options.prevSignature.trim() : null
+  if (trimmed === 'raw-error') {
+    if (!prevFailure) return input
+    return `Previous attempt check output:\n${prevFailure.slice(0, 3000)}${HINT_SEPARATOR}${input}`
+  }
+  if (trimmed === 'structured-pitfall') {
+    const structured = extractStructuredPitfall(prevFailure, prevSignature)
+    if (!structured) return input
+    return `${structured}${HINT_SEPARATOR}${input}`
+  }
   return `${trimmed}${HINT_SEPARATOR}${input}`
 }
 
@@ -67,12 +109,16 @@ function invokedDirectly() {
 
 async function main() {
   const args = process.argv.slice(2)
+  const agentBin = process.env.HINDSIGHT_EVAL_AGENT_BIN?.trim() || 'claude'
   const input = await readStdin()
-  const prompt = hintedPrompt(input, process.env.HINDSIGHT_EVAL_HINT)
+  const prompt = hintedPrompt(input, process.env.HINDSIGHT_EVAL_HINT, {
+    prevFailure: process.env.HINDSIGHT_EVAL_PREV_FAILURE,
+    prevSignature: process.env.HINDSIGHT_EVAL_PREV_SIGNATURE,
+  })
   let retriedThroughShell = false
   let child = null
   const start = (shell) => {
-    const current = spawn('claude', args, {
+    const current = spawn(agentBin, args, {
       stdio: ['pipe', 'inherit', 'inherit'],
       shell,
       windowsHide: true,
@@ -80,17 +126,17 @@ async function main() {
     child = current
     current.on('error', (error) => {
       if (current !== child) return
-      // On Windows `claude` can be a `.cmd` shim that CreateProcess cannot run
+      // On Windows an agent CLI can be a `.cmd` shim that CreateProcess cannot run
       // directly; retry through the shell only after ENOENT + where.exe confirms
       // a shim exists so normal arguments are never shell-split unnecessarily.
       if (process.platform === 'win32' && !retriedThroughShell && error && error.code === 'ENOENT') {
         retriedThroughShell = true
-        if (resolvesOnWindows('claude')) {
+        if (resolvesOnWindows(agentBin)) {
           start(true)
           return
         }
       }
-      console.error(`claude-hint: failed to start claude: ${error.message}`)
+      console.error(`claude-hint: failed to start ${agentBin}: ${error.message}`)
       process.exit(127)
     })
     current.stdin.on('error', () => {})
@@ -98,7 +144,7 @@ async function main() {
     current.on('close', (code, signal) => {
       if (current !== child) return
       if (signal) {
-        console.error(`claude-hint: claude exited with signal ${signal}`)
+        console.error(`claude-hint: ${agentBin} exited with signal ${signal}`)
         process.exit(1)
       }
       process.exit(code ?? 1)

@@ -866,7 +866,7 @@ export function generalizationCheck(tasks, { agent = [] } = {}) {
     warnings.push('no explicit training/held-out split: declare task.set as screening/confirmation (or training/heldout)')
   }
   const agentText = Array.isArray(agent) ? agent.join(' ').toLowerCase() : String(agent ?? '').toLowerCase()
-  const families = ['claude', 'gpt', 'openai', 'deepseek', 'qwen', 'gemini', 'llama', 'mistral'].filter((family) =>
+  const families = ['claude', 'gpt', 'openai', 'deepseek', 'qwen', 'gemini', 'llama', 'mistral', 'dsh'].filter((family) =>
     agentText.includes(family),
   )
   if (families.length <= 1) {

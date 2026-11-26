@@ -141,7 +141,7 @@ that file, a custom arms JSON file, or an inline JSON array. Default arms are
 | Gate | Question | Arms | Preregistered primary |
 | --- | --- | --- | --- |
 | P0 | Failure-feedback protocol: does structured failure information reduce attempts? | R0 no hint, R1 raw error, R2 structured pitfall | `R2:R0` |
-| P1 | Memory source: do Hindsight Pages beat no memory and handwritten conventions? | A0 no memory, A1 handwritten conventions, A2 reflect, A3 pages | `A3:A1` |
+| P1 | Memory source: do Hindsight Pages beat no memory and handwritten conventions? | A0 no memory, A1 handwritten conventions, A2 reflect, A3 pages. A3-C is a later ablation, not the primary | `A3:A1` (A3-C vs A3 only after the screening preflight) |
 | P2 | Injection view/budget: truncation vs Budgeted View at equal memory | A3 native pages, A3-T tuner truncation, A3-V Budgeted View | `A3-V:A3` (secondary `A3-T` vs `A3`) |
 | P3 | Fact provenance: oracle-promoted facts vs raw session facts | A4 oracle-promoted facts, A5 raw session facts | `A4:A5` |
 
@@ -167,6 +167,12 @@ unlocks); a plan lists every arm's `hint`/`requires`.
   (see below).
 - **A4/A5** need two differently seeded banks; run each bank as its own
   experiment with its own fingerprint, or pin a per-arm `HINDSIGHT_BANK_ID`.
+- **A3-C** uses the same plugin settings as A3. The only difference is unowned
+  cluster pages in a copy of the bank. Draft and screen them with
+  `node eval/cluster-preflight.mjs <preflight.json>` (`eval/cluster-preflight.mjs`).
+  Screening prompts decide τ, membership, and page text. Confirmation prompts
+  do not. Fingerprint each bank separately, then compare the two reports with
+  `pairedComparison` as A3-C − A3. A3:A1 stays the P1 primary.
 - `HINDSIGHT_EVAL_HINT` is an eval-only convention for the agent command
   wrapper; it is not a plugin knob.
 

@@ -1,7 +1,7 @@
 {
   "meta": {
-    "title": "Hindsight 记忆调优",
-    "description": "用 /hindsight 查看 Hindsight 项目记忆是否可用、每轮注入多少 Token、当前生效的调优是什么。插件为单轮注入设置上限（maxInjectTokens，默认 3000），并把精简配置写入 ~/.hindsight/coding-agent.json：pages 优先注入、观测范围按来源隔离、7 秒注入超时、2000 Token 召回上限。默认只补齐缺失的键（除非要求覆盖），写入前会先备份；/hindsight revert 只删除本插件写过的键，并关闭自动调优（直到 /hindsight enable），因此重启后不会重新补齐。智能体工具默认只读，除非设置 allowAgentWrites；写入请使用用户执行的 /hindsight tune 或 /hindsight revert。执行 status 或 probe 时会向配置的 Hindsight 端点发起一次 GET 请求；插件自身的状态与日志位于 ~/.dsh/storages/dsh-hindsight-tuner。记忆本身由 @vectorize-io/hindsight-coding-agents 提供，缺少该 bundle 时插件会报告记忆层未安装。",
+    "title": "Hindsight 记忆与预算治理",
+    "description": "面向 DeepSeek Harness 的独立完整 Hindsight 项目记忆引擎、Token 预算治理与诊断插件，无需安装 @vectorize-io/hindsight-coding-agents 即可单独运行。在未安装或未启用外部 Hindsight 插件时（默认 `memoryLane: auto`），本插件直接提供 pages/recall/reflect 自动注入、敏感凭据自动脱敏的会话增量记忆留存、原生工具（`hindsight_search_pages`、`hindsight_list_pages`、`hindsight_read_page`、`hindsight_recall`、`hindsight_reflect`、`hindsight_retain`）以及 `/hindsight pages|recall|retain|seed` 交互命令；当外部插件同时启用时自动退回外层预算治理与诊断，避免重复注入。单轮注入严格受限于 `maxInjectTokens`（默认 3000），内置零依赖 `fast` 与 `calibrated` 结构化 BPE 分词估算，支持自适应/场景分层预算、重复跳过与增量 delta、上下文压缩后重注入与可信数据边界包裹，并在首次会话按需补齐 `~/.hindsight/coding-agent.json` 精简配置（写前备份，可用 `/hindsight revert` 精确撤销）。",
     "detail": "docs/DETAIL.zh.md"
   }
 }

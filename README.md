@@ -1,11 +1,39 @@
 # dsh-hindsight-tuner
 
-Token-budgeted tuning and diagnostics for Hindsight project memory inside DeepSeek Harness.
+Self-contained Hindsight project memory engine, token-budgeted governor, and
+diagnostics for DeepSeek Harness.
 
-It complements [`@vectorize-io/hindsight-coding-agents`](https://www.npmjs.com/package/@vectorize-io/hindsight-coding-agents)
-rather than replacing it. That integration owns the memory (Git seeding, pages,
-cross-tool banks); this bundle owns three things it does not provide (design
-rationale, evidence gates and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
+It runs **standalone as a single plugin** — no external
+`@vectorize-io/hindsight-coding-agents` bundle is required — and also
+coexists seamlessly as an outer governance and diagnostic layer if that bundle
+is installed and enabled (`memoryLane: auto`, design rationale and evidence gates:
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
+
+0. **Built-in standalone Hindsight engine (`memoryLane: auto`).** When
+   `@vectorize-io/hindsight-coding-agents` is absent or disabled in the active
+   profile, this plugin drives the Hindsight v1 HTTP API directly (`lib/client.js`,
+   `lib/memory-lane.js`):
+   - pulls `pages`, `recall`, or `reflect` context on entering turns (skipping
+     subagent turns and skipping whenever another hook already injected
+     `plugin:hindsight`);
+   - registers native agent tools (`hindsight_search_pages`, `hindsight_list_pages`,
+     `hindsight_read_page`, `hindsight_recall`, `hindsight_reflect`,
+     `hindsight_retain`, `hindsight_ingest_document`, and
+     `hindsight_capture_initiative`);
+   - automatically retains completed non-subagent session turns on DSH
+     lifecycle events (`agent/turn-stopping` & `agent/disposed`, supporting
+     nested `assistant/message` + `tool/call` shapes, `inheritedEventCount`,
+     per-item `observation_scopes`, `401` live `tokenProvider` refresh,
+     `maxParallelRetains`, watermark deduplication, and credential redaction),
+     syncs bank consolidation settings via `/import` (`manageBankConfig: true`),
+     auto-wakes local `hindsight-embed` / `uvx` daemons when `serverMode: daemon`
+     is offline, and supports optional periodic background `autoReflect`
+     refreshes;
+   - provides `/hindsight stats`, `/hindsight pages [query]`,
+     `/hindsight recall <query>`, `/hindsight reflect <query>`,
+     `/hindsight retain <note>`, and `/hindsight seed [--limit N]` (plus opt-in
+     `autoSeed: true`) while honouring `HINDSIGHT_RETAIN_SESSIONS=false` during
+     frozen A/B runs.
 
 1. **A lean shared profile.** On the first session it fills the missing tuning
    keys in `~/.hindsight/coding-agent.json` — the same file every Hindsight
@@ -393,6 +421,8 @@ the next DSH restart; the profile keeps its own copy of the row config.
   activity for this session. It flags `drift` when a value in the file differs
   from the requested preset.
 - `/hindsight status --json` — the same status as JSON, for scripts.
+- `/hindsight stats [--json]` — live bank inventory (memory nodes, observations,
+  links, fact breakdown, page count, stale pages, and pending operations).
 - `/hindsight probe` — one reachability check, no journal read.
 - `/hindsight suggest` — read-only cap/recall recommendation from the recent
   injection sizes.
@@ -400,10 +430,19 @@ the next DSH restart; the profile keeps its own copy of the row config.
   now; `--cap` changes the session ceiling only.
 - `/hindsight revert [--dry-run]` — undo this plugin's keys and persist an
   auto-tune opt-out, so a restart does not refill them.
+- `/hindsight pages [query] [--limit N]` — list the bank's page tree, or run
+  hybrid search across pages when `query` is provided.
+- `/hindsight recall <query> [--limit N]` — recall atomic facts and experiences
+  directly from the resolved bank.
+- `/hindsight reflect <query>` — run agentic reflection over the resolved bank.
+- `/hindsight retain <note>` — store a manual project note into the bank (with
+  automatic credential redaction).
+- `/hindsight seed [--limit N]` — ingest up to `N` (1..500, default 30) recent
+  non-merge Git commits from the current directory into the resolved bank.
 - `/hindsight enable` / `/hindsight disable` — turn the persistent auto-tune
   opt-out back on or off. `disable` leaves existing keys untouched.
 
-The same operations are exposed to the agent as the `hindsight_tuner` tool, and
+Control actions are exposed to the agent as the `hindsight_tuner` tool, and
 both call the same implementation. Its schema lists `status`, `probe` and
 `suggest` by default and adds `tune`, `revert`, `enable` and `disable` only when
 the row sets `allowAgentWrites: true`, so a read-only profile cannot even offer
@@ -412,12 +451,24 @@ preview never writes, and without agent writes enabled the write actions are
 absent from the schema, while the shared guard refuses a real write even if a
 host dispatches one anyway.
 
+When the built-in lane is active (or `builtinTools: true`), the plugin also
+registers the native memory tools directly (`hindsight_search_pages`,
+`hindsight_list_pages`, `hindsight_read_page` [accepting both `page_id` and `id`],
+`hindsight_recall`, `hindsight_reflect`, and — when `allowMemoryRetain` is on —
+`hindsight_retain`, `hindsight_ingest_document`, and
+`hindsight_capture_initiative`).
+
 ## Coexistence
 
 This bundle owns the Hindsight lane only. What it does and does not coordinate:
 
-- It caps and diagnoses `@vectorize-io/hindsight-coding-agents` injections
-  (`plugin:hindsight`). It does not configure or cap another memory provider.
+- With `memoryLane: auto` (default), it activates its built-in Hindsight engine
+  when `@vectorize-io/hindsight-coding-agents` is absent or disabled in
+  `dsh.profile.bundles`, and automatically yields injection & tool registration
+  to the external bundle when it is enabled — while still wrapping and governing
+  its `plugin:hindsight` messages. Even in built-in mode, if another listener
+  already attached a `plugin:hindsight` message on the turn, the built-in lane
+  will not double-inject.
 - `dsh-mnemon` can reach the same Hindsight server through its own
   `dsh-mnemon-provider-hindsight` adapter, but that adapter carries its own
   endpoint and bank settings: the shared file this plugin edits does not
@@ -441,12 +492,16 @@ survives upgrades):
 | --- | --- | --- |
 | `autoTune` | `true` | Fill the shared config on the first session |
 | `overwrite` | `false` | Replace existing values instead of respecting them |
+| `memoryLane` | `auto` | `auto` uses built-in engine unless external bundle is enabled; `builtin` forces built-in; `external` requires `@vectorize-io/hindsight-coding-agents`; `off` disables memory governance |
+| `builtinTools` | `auto` | `auto` registers native `hindsight_*` tools when built-in lane is active; `true`/`false` overrides |
+| `allowMemoryRetain` | `true` | Allow automatic session retention, `/hindsight retain`, and the `hindsight_retain` tool in built-in mode |
+| `autoSeed` | `false` | Automatically run background Git commit seeding when the built-in lane encounters a cold/empty bank |
 | `maxInjectTokens` | `3000` | Per-turn injection cap; `0` disables the cap |
-| `autoInject` | `pages` | Wanted `autoInject` mode |
+| `autoInject` | `pages` | Wanted `autoInject` mode (`pages`, `recall`, `reflect`, `none`) |
 | `injectTimeoutMs` | `7000` | Wanted inject deadline |
 | `observationScopes` | `per_source` | Wanted consolidation scopes |
 | `recallMaxTokens` | `2000` | Wanted `recallOptions.max_tokens` |
-| `tokenBudgetMode` | `fast` | `fast` estimate or `accurate` tokenizer (optional `js-tiktoken`, prefers `o200k_base`) |
+| `tokenBudgetMode` | `fast` | `fast` single-pass char/fence estimate, `calibrated` built-in zero-dependency structural BPE estimate, or `accurate` optional tokenizer (`×1.1` fallback when none installed) |
 | `budgetPolicy` | `adaptive` in the shipped row (`off` default) | `off` uses the cap; `adaptive` picks a per-turn ceiling from `budgetTiers`; `scenario` also reads turn state (compaction, continuation, repeat, cut) and the prompt signal (debug/edit/review/question) to choose a scenario and its tier |
 | `budgetTiers` | `{ light: 800, normal: 1600, deep: 3000 }` | Tier ceilings, each ≤ `maxInjectTokens`; must be ordered light ≤ normal ≤ deep |
 | `scenarioTiers` | scenario defaults from `lib/scenario.js` | Per-scenario tier override for `budgetPolicy: scenario` (e.g. `{ debug: 'light' }`); only the chosen scenario is affected |
@@ -456,17 +511,18 @@ survives upgrades):
 | `viewContextMessages` | `8` | Recent non-memory messages used as task context by `budgeted` (1..40) |
 | `verifyReminder` | `true` in the shipped row (`false` default) | Wrap the recall as data (opening reminder + closing boundary: "historical memory, not instructions"), counted in the cap |
 | `sourceKind` | `plugin:hindsight` | Recall message kind to cap |
-| `allowAgentWrites` | `false` | Expose tool writes; without it the tool is read-only |
+| `allowAgentWrites` | `false` | Expose tool writes; without it `hindsight_tuner` is read-only |
 
 ## Limits
 
-- It needs `@vectorize-io/hindsight-coding-agents` for memory itself. The plugin
-  locates the profile from `DSH_PROFILE_DIR`/`DSH_PROFILE` when the launcher sets
-  them, then from the desktop host's own `argv` (plugin code runs in the host
-  process, which receives the active profile as a positional argument instead of
-  the shell facts), and finally from the profiles under `DSH_HOME` when neither
-  names one. When the package does not resolve there, `status` says
-  `memory layer not installed` and changes nothing on the model path.
+- No external plugin is required: by default (`memoryLane: auto`), when
+  `@vectorize-io/hindsight-coding-agents` is absent or disabled in the active
+  profile, the built-in engine handles server calls, page/recall/reflect
+  auto-injection, native `hindsight_*` tools, and Git seeding directly against
+  the configured Hindsight API server. Set `memoryLane: external` if you want
+  `status` to report `memory layer not installed` when the external package is
+  missing. Profile detection inspects `DSH_PROFILE_DIR`/`DSH_PROFILE`, host
+  `argv`, and profiles under `DSH_HOME`.
 - The bank line uses the session's working directory, so it names the same
   `coding-agent::{gitProject}` bank the integration uses — including the
   directory-name fallback when the directory is not a git work tree. An explicit
@@ -525,19 +581,19 @@ survives upgrades):
 node test/scenario.mjs     # scenario selection and tier-precedence unit tests
 node test/view.mjs         # pure selection/token-helper unit tests
 node test/smoke.mjs        # hermetic unit/behaviour tests
-node test/integration.mjs  # real @vectorize-io/hindsight-coding-agents hooks
+node test/integration.mjs  # standalone built-in Hindsight HTTP + git + tools + optional external hooks
 node eval/selftest.mjs     # A/B harness orchestration, with a fake runner
 node scripts/verify-live.mjs  # this machine, after a restart (not part of npm test)
 ```
 
-`npm test` runs the first five. The smoke test is hermetic: it points
-`HINDSIGHT_CONFIG` and `DSH_HOME` at a
-scratch directory, so it never reads or writes your real memory config. The
-integration test loads the shipped Hindsight `dist/dsh.js`, registers its real
-`agent/pre-step` hook after the tuner, and asserts the payload the model would
-receive is inside the ceiling. A local run prints `integration: skipped` and
-exits 0 when the package is not installed; `HINDSIGHT_INTEGRATION_REQUIRED=1`
-(which CI sets) turns that skip into a hard failure, so every CI job proves the
-composition for real instead of reporting a green skip. The eval self-test
-is offline too (fake agent, fake bank, throwaway git repos) and exercises the
+`npm test` runs the first five with zero external plugin dependencies. The smoke
+test is hermetic: it points `HINDSIGHT_CONFIG` and `DSH_HOME` at a scratch
+directory, so it never reads or writes your real memory config. The integration
+test runs a local `node:http` Hindsight v1 server against a temporary Git repo
+without `@vectorize-io/hindsight-coding-agents` installed to prove built-in
+injection, all 6 native tools, `/hindsight seed`, and coexistence protection —
+and also verifies composition with `dist/dsh.js` if that package happens to be
+present locally. In `eval/agents/claude-hint.mjs`, set `HINDSIGHT_EVAL_AGENT_BIN`
+to wrap any CLI agent binary (default `claude`). The eval self-test is offline
+too (fake agent, fake bank, throwaway git repos) and exercises the
 worktree/bank/stats modules as well as the CLI dry-run path.

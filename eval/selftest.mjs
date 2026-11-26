@@ -1066,6 +1066,11 @@ function statsChecks() {
       { agent: 'claude gpt' },
     )
     equal(good.warnings.length, 0, 'training/held-out + two families is clean')
+    const dshAndClaude = generalizationCheck(
+      [{ id: 't1', set: 'training' }, { id: 't2', set: 'heldout' }],
+      { agent: ['dsh', 'claude'] },
+    )
+    equal(dshAndClaude.warnings.length, 0, 'dsh is recognized alongside claude as a distinct harness/family')
   })
 
   check('assertComplete accepts a complete experiment including timeout rows', () => {
@@ -2188,9 +2193,30 @@ async function abChecks(repoDir, tempRoot) {
     includes(changed.problems.join('\n'), 'changed during the experiment', 'problem names the mutation')
   })
 
-  check('the claude-hint wrapper prepends only a non-empty written hint', () => {
+  check('the claude-hint wrapper prepends only a non-empty written hint and supports R0/R1/R2 modes', () => {
     equal(hintedPrompt('do the task', ''), 'do the task', 'an empty hint passes the prompt through')
     equal(hintedPrompt('do the task', '   '), 'do the task', 'a blank hint passes the prompt through')
+    equal(hintedPrompt('do the task', 'none'), 'do the task', 'R0 none passes the prompt through unchanged')
+    equal(
+      hintedPrompt('do the task', 'raw-error'),
+      'do the task',
+      'R1 raw-error is a no-op on attempt 1 when no previous failure exists',
+    )
+    includes(
+      hintedPrompt('do the task', 'raw-error', { prevFailure: 'AssertionError: expected 2 to equal 3 at src/math.js:14:5' }),
+      'Previous attempt check output:\nAssertionError',
+      'R1 raw-error prepends raw failure output on retry',
+    )
+    const r2 = hintedPrompt('do the task', 'structured-pitfall', {
+      prevFailure: 'AssertionError: expected 2 to equal 3\n    at file:///repo/src/math.js:14:5',
+      prevSignature: 'check-exit-1',
+    })
+    includes(r2, '"protocol": "R2-structured-pitfall"', 'R2 structured-pitfall emits JSON pitfall summary')
+    includes(r2, '"locality": "/repo/src/math.js:14:5"', 'R2 extracts POSIX file:line:col locality')
+    const r2Win = hintedPrompt('do the task', 'structured-pitfall', {
+      prevFailure: 'Error: boom at file:///C:/repo/src/math.js:9:2',
+    })
+    includes(r2Win, '"locality": "C:/repo/src/math.js:9:2"', 'R2 extracts Windows drive locality')
     equal(
       hintedPrompt('do the task', ' Use cents. '),
       `Use cents.${HINT_SEPARATOR}do the task`,

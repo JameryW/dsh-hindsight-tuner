@@ -1,19 +1,25 @@
-# DSH bundle layer for Hindsight memory tuning.
+# DSH bundle layer for self-contained Hindsight memory & governance.
 #
-# The Hindsight integration itself is mounted by its own bundle row (`hindsight`).
-# This row adds the DSH-side control plane: a lean profile for the shared
-# ~/.hindsight/coding-agent.json, a per-turn injection budget, and /hindsight.
+# Works standalone as a single plugin (built-in Hindsight REST client,
+# pages/recall/reflect injection, native hindsight_* tools, and Git seeding)
+# without requiring @vectorize-io/hindsight-coding-agents. When that bundle is
+# also installed and enabled, `memoryLane: auto` automatically keeps the
+# built-in injection idle and wraps its recalls with budget governance.
 #
 # Everything here is tunable from this row's config; `autoTune: false` leaves the
-# shared config untouched and keeps the plugin read-only apart from the budget cap.
-# The agent tool is read-only unless `allowAgentWrites: true`; the user-facing
-# write paths are /hindsight tune and /hindsight revert.
+# shared ~/.hindsight/coding-agent.json untouched. The tuner tool is read-only
+# unless `allowAgentWrites: true`; user write paths are /hindsight tune and
+# /hindsight revert.
 - insert:
     - id: hindsight-tuner
       name: '@jameryw/dsh-hindsight-tuner'
       config:
         autoTune: true
         overwrite: false
+        memoryLane: auto
+        builtinTools: auto
+        allowMemoryRetain: true
+        autoSeed: false
         maxInjectTokens: 3000
         autoInject: pages
         injectTimeoutMs: 7000
