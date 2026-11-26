@@ -14,9 +14,10 @@
     singleflight `GET` deduplication, live `401` `tokenProvider` replay,
     transient `502`/`503`/`504`/socket retry, `/memories/recall`, `/reflect`,
     `/memories` with per-item `strategy`/`tags`/`observation_scopes`, `/stats`,
-    `/import` + `/config` sync, `serverMode: daemon` `hindsight-embed`/`uvx`
-    detached auto-wake, `/pages` initiative capture, and Git commit seeding)
-    and `lib/memory-lane.js`.
+    `/operations` & `/documents` sync inspection, idempotent cold-bank coding
+    manifest + core page taxonomy bootstrap, `hindsight-embed`/`uvx` detached
+    auto-wake, `/pages` initiative capture, and Git commit seeding) and
+    `lib/memory-lane.js`.
   - Works completely standalone without `@vectorize-io/hindsight-coding-agents`:
     automatically pulls `pages`, `recall`, or `reflect` context into
     `agent/pre-step` (honouring `signal.aborted`, `toolGuideExtra`,
@@ -24,13 +25,18 @@
     completed non-subagent DSH session turns on `agent/turn-stopping` and
     `agent/disposed` (supporting nested `assistant/message`, `tool/call` actions,
     `inheritedEventCount`, `maxParallelRetains`, watermark deduplication, and
-    credential redaction via `redactSecrets`), registers all 8 native Hindsight
+    credential redaction via `redactSecrets`), registers all 10 native Hindsight
     tools (`hindsight_search_pages`, `hindsight_list_pages`,
     `hindsight_read_page` [with `page_id` & `id`], `hindsight_recall`,
-    `hindsight_reflect`, `hindsight_retain`, `hindsight_ingest_document`, and
-    `hindsight_capture_initiative`), and adds `/hindsight stats`,
-    `/hindsight pages`, `/hindsight recall`, `/hindsight reflect`,
-    `/hindsight retain`, and `/hindsight seed [--limit N]`.
+    `hindsight_reflect`, `hindsight_sync_status`, `hindsight_diagnose`,
+    `hindsight_retain`, `hindsight_ingest_document`, and
+    `hindsight_capture_initiative`), and adds `/hindsight init [--limit N]`,
+    `/hindsight stats`, `/hindsight pages`, `/hindsight recall`,
+    `/hindsight reflect`, `/hindsight retain`, and `/hindsight seed [--limit N]`.
+  - Ships `tokenBudgetMode: calibrated` in `cordis.patch.yml` so new profiles
+    get zero-dependency BPE-grade token accounting without `js-tiktoken`, and
+    adds `HINDSIGHT_EVAL_AGENT_COMMAND` to `eval/ab.mjs` so evaluations no
+    longer require a hardcoded `claude` CLI default.
   - Automatically detects installed/enabled `@vectorize-io/hindsight-coding-agents`
     and yields injection, retention & tool registration without double-injecting
     when both are active; adds validated settings `memoryLane`, `builtinTools`,

@@ -16,10 +16,10 @@ is installed and enabled (`memoryLane: auto`, design rationale and evidence gate
    - pulls `pages`, `recall`, or `reflect` context on entering turns (skipping
      subagent turns and skipping whenever another hook already injected
      `plugin:hindsight`);
-   - registers native agent tools (`hindsight_search_pages`, `hindsight_list_pages`,
+   - registers 10 native agent tools (`hindsight_search_pages`, `hindsight_list_pages`,
      `hindsight_read_page`, `hindsight_recall`, `hindsight_reflect`,
-     `hindsight_retain`, `hindsight_ingest_document`, and
-     `hindsight_capture_initiative`);
+     `hindsight_sync_status`, `hindsight_diagnose`, `hindsight_retain`,
+     `hindsight_ingest_document`, and `hindsight_capture_initiative`);
    - automatically retains completed non-subagent session turns on DSH
      lifecycle events (`agent/turn-stopping` & `agent/disposed`, supporting
      nested `assistant/message` + `tool/call` shapes, `inheritedEventCount`,
@@ -29,7 +29,7 @@ is installed and enabled (`memoryLane: auto`, design rationale and evidence gate
      auto-wakes local `hindsight-embed` / `uvx` daemons when `serverMode: daemon`
      is offline, and supports optional periodic background `autoReflect`
      refreshes;
-   - provides `/hindsight stats`, `/hindsight pages [query]`,
+   - provides `/hindsight init [--limit N]`, `/hindsight stats`, `/hindsight pages [query]`,
      `/hindsight recall <query>`, `/hindsight reflect <query>`,
      `/hindsight retain <note>`, and `/hindsight seed [--limit N]` (plus opt-in
      `autoSeed: true`) while honouring `HINDSIGHT_RETAIN_SESSIONS=false` during
@@ -365,10 +365,11 @@ exit code is the ground truth. Arms are data: `A0` no memory, `A1` handwritten
 conventions, `A2` Reflect, `A3` Pages, `A3-T` Pages + tuner truncation, `A3-V`
 Pages + Budgeted View, plus the P0 (`R0`/`R1`/`R2`) and P3 (`A4`/`A5`) arms in
 `eval/arms.example.json`. Arms that carry a written `hint` (the P0 `R1`/`R2`
-failure feedback and `A1`) point `--agent-command` at
+failure feedback and `A1`) point `--agent-command` (or set
+`HINDSIGHT_EVAL_AGENT_COMMAND`) at
 `eval/agents/claude-hint.mjs`: it prepends that arm's `HINDSIGHT_EVAL_HINT` to
-the prompt it receives on stdin and then runs `claude`, passing the prompt
-through unchanged when no hint is set. `--prices` supplies cache-adjusted
+the prompt it receives on stdin and then runs `HINDSIGHT_EVAL_AGENT_BIN`
+(default `claude`), passing the prompt through unchanged when no hint is set. `--prices` supplies cache-adjusted
 input/output prices
 so the report's cost columns reflect real cost rather than raw token counts; the
 headline metrics are Attempts to Success and Cost per Solved Node, with Task
@@ -439,6 +440,10 @@ the next DSH restart; the profile keeps its own copy of the row config.
   automatic credential redaction).
 - `/hindsight seed [--limit N]` — ingest up to `N` (1..500, default 30) recent
   non-merge Git commits from the current directory into the resolved bank.
+- `/hindsight init [--limit N]` — idempotently initialize a standalone coding
+  bank: sync the coding manifest/strategies via `/import`, seed the 4 core page
+  templates (`Architecture`, `Conventions`, `Component Map`, `Key Decisions`) if
+  absent, and seed up to `N` recent Git commits.
 - `/hindsight enable` / `/hindsight disable` — turn the persistent auto-tune
   opt-out back on or off. `disable` leaves existing keys untouched.
 
@@ -452,9 +457,10 @@ absent from the schema, while the shared guard refuses a real write even if a
 host dispatches one anyway.
 
 When the built-in lane is active (or `builtinTools: true`), the plugin also
-registers the native memory tools directly (`hindsight_search_pages`,
+registers the 10 native memory tools directly (`hindsight_search_pages`,
 `hindsight_list_pages`, `hindsight_read_page` [accepting both `page_id` and `id`],
-`hindsight_recall`, `hindsight_reflect`, and — when `allowMemoryRetain` is on —
+`hindsight_recall`, `hindsight_reflect`, `hindsight_sync_status`,
+`hindsight_diagnose`, and — when `allowMemoryRetain` is on —
 `hindsight_retain`, `hindsight_ingest_document`, and
 `hindsight_capture_initiative`).
 
@@ -501,7 +507,7 @@ survives upgrades):
 | `injectTimeoutMs` | `7000` | Wanted inject deadline |
 | `observationScopes` | `per_source` | Wanted consolidation scopes |
 | `recallMaxTokens` | `2000` | Wanted `recallOptions.max_tokens` |
-| `tokenBudgetMode` | `fast` | `fast` single-pass char/fence estimate, `calibrated` built-in zero-dependency structural BPE estimate, or `accurate` optional tokenizer (`×1.1` fallback when none installed) |
+| `tokenBudgetMode` | `calibrated` in the shipped row (`fast` schema default) | `fast` single-pass char/fence estimate, `calibrated` built-in zero-dependency structural BPE estimate, or `accurate` optional tokenizer (`×1.1` fallback when none installed) |
 | `budgetPolicy` | `adaptive` in the shipped row (`off` default) | `off` uses the cap; `adaptive` picks a per-turn ceiling from `budgetTiers`; `scenario` also reads turn state (compaction, continuation, repeat, cut) and the prompt signal (debug/edit/review/question) to choose a scenario and its tier |
 | `budgetTiers` | `{ light: 800, normal: 1600, deep: 3000 }` | Tier ceilings, each ≤ `maxInjectTokens`; must be ordered light ≤ normal ≤ deep |
 | `scenarioTiers` | scenario defaults from `lib/scenario.js` | Per-scenario tier override for `budgetPolicy: scenario` (e.g. `{ debug: 'light' }`); only the chosen scenario is affected |
@@ -591,9 +597,10 @@ test is hermetic: it points `HINDSIGHT_CONFIG` and `DSH_HOME` at a scratch
 directory, so it never reads or writes your real memory config. The integration
 test runs a local `node:http` Hindsight v1 server against a temporary Git repo
 without `@vectorize-io/hindsight-coding-agents` installed to prove built-in
-injection, all 6 native tools, `/hindsight seed`, and coexistence protection —
+injection, all 10 native tools, `/hindsight init|seed`, and coexistence protection —
 and also verifies composition with `dist/dsh.js` if that package happens to be
-present locally. In `eval/agents/claude-hint.mjs`, set `HINDSIGHT_EVAL_AGENT_BIN`
-to wrap any CLI agent binary (default `claude`). The eval self-test is offline
+present locally. Set `HINDSIGHT_EVAL_AGENT_COMMAND` (or pass `--agent-command`) in
+`eval/ab.mjs` and `HINDSIGHT_EVAL_AGENT_BIN` in `eval/agents/claude-hint.mjs`
+to run evaluations against DSH or any custom CLI binary (default `claude`). The eval self-test is offline
 too (fake agent, fake bank, throwaway git repos) and exercises the
 worktree/bank/stats modules as well as the CLI dry-run path.

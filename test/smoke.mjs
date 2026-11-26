@@ -2861,6 +2861,8 @@ try {
       'hindsight_read_page',
       'hindsight_recall',
       'hindsight_reflect',
+      'hindsight_sync_status',
+      'hindsight_diagnose',
       'hindsight_retain',
       'hindsight_ingest_document',
       'hindsight_capture_initiative',
@@ -2868,6 +2870,24 @@ try {
     'standalone profile registers hindsight_tuner first followed by all built-in Hindsight tools',
   )
   for (const dispose of standaloneDyn.disposers) dispose()
+
+  const roStandaloneDyn = makeHarness()
+  apply(roStandaloneDyn.ctx, { autoTune: false, allowMemoryRetain: false })
+  assert.deepEqual(
+    roStandaloneDyn.tools.map((t) => t.name),
+    [
+      'hindsight_tuner',
+      'hindsight_search_pages',
+      'hindsight_list_pages',
+      'hindsight_read_page',
+      'hindsight_recall',
+      'hindsight_reflect',
+      'hindsight_sync_status',
+      'hindsight_diagnose',
+    ],
+    'read-only standalone profile keeps hindsight_sync_status and hindsight_diagnose while omitting write tools',
+  )
+  for (const dispose of roStandaloneDyn.disposers) dispose()
   try {
     assert.equal(installedBundles({ DSH_PROFILE_DIR: dynProfile }, []).bundles.length, 0, 'initially no memory bundles')
     assert.match(await dynTool.execute({ action: 'probe' }, {}), /not installed/, 'probe reports not installed before install')

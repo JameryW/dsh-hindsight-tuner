@@ -1519,6 +1519,17 @@ async function abChecks(repoDir, tempRoot) {
       '--no-reset-between-attempts',
     ])
     equal(disabled.resetBetweenAttempts, false, 'no-reset wins when last')
+
+    const envAgent = parseArgs(['--tasks', 't.json'], {
+      env: { HINDSIGHT_EVAL_AGENT_COMMAND: 'dsh -p --json' },
+    })
+    deepEqual(envAgent.agent, ['dsh', '-p', '--json'], 'HINDSIGHT_EVAL_AGENT_COMMAND overrides default agent CLI')
+    equal(envAgent.agentRaw, 'dsh -p --json', 'agentRaw preserves HINDSIGHT_EVAL_AGENT_COMMAND')
+
+    const cliOverridesEnv = parseArgs(['--tasks', 't.json', '--agent-command', 'node runner.mjs'], {
+      env: { HINDSIGHT_EVAL_AGENT_COMMAND: 'dsh -p --json' },
+    })
+    deepEqual(cliOverridesEnv.agent, ['node', 'runner.mjs'], 'explicit --agent-command wins over env default')
   })
 
   check('parseArgs rejects invalid usage', () => {

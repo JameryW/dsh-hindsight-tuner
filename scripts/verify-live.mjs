@@ -89,7 +89,7 @@ async function main() {
     config = read.config
     pass('config', `${read.path} present`)
   } else if (read.kind === 'missing') {
-    fail('config', `${read.path} does not exist; the integration has nothing to read`)
+    fail('config', `${read.path} does not exist; the integration has nothing to read (run /hindsight tune to create it)`)
   } else {
     fail('config', `${read.path} is ${read.kind}: ${read.error}`)
   }
@@ -249,7 +249,8 @@ async function main() {
             pass('recall', `${injected} successful recall(s) from the DSH harness in the window · ${diagPath()}`)
           }
         } else {
-          note('recall', `no successful recall from the DSH harness yet in the window · ${diagPath()} (start a session first)`)
+          const logHint = !activity.exists && tuner?.path ? tuner.path : diagPath()
+          note('recall', `no successful recall from the DSH harness yet in the window · ${logHint} (start a session first)`)
         }
       } catch (error) {
         fail('journal', `could not read ${diagPath()}: ${error.message}`)

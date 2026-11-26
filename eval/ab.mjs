@@ -146,7 +146,7 @@ Experiment:
   --midr-threshold <rate>     MIDR gate ceiling for memory arms (0..1, default 0.05)
   --timeout ms                Per agent/check process timeout (default ${DEFAULT_TIMEOUT_MS})
   --agent-command "<cmd>"     Agent command; JSON array for args with spaces
-                              (default: ${DEFAULT_AGENT.join(' ')})
+                              (default: env HINDSIGHT_EVAL_AGENT_COMMAND or ${DEFAULT_AGENT.join(' ')})
 
 Isolation:
   --no-isolate                Do not create git worktrees; run in task.cwd
@@ -300,7 +300,10 @@ function parseAgentCommand(value) {
   return parts
 }
 
-function defaultOptions() {
+function defaultOptions(env = process.env) {
+  const envAgent = typeof env?.HINDSIGHT_EVAL_AGENT_COMMAND === 'string' && env.HINDSIGHT_EVAL_AGENT_COMMAND.trim() !== ''
+    ? env.HINDSIGHT_EVAL_AGENT_COMMAND.trim()
+    : null
   return {
     help: false,
     tasks: null,
@@ -309,8 +312,8 @@ function defaultOptions() {
     timeoutMs: DEFAULT_TIMEOUT_MS,
     dryRun: false,
     arms: null,
-    agent: [...DEFAULT_AGENT],
-    agentRaw: DEFAULT_AGENT.join(' '),
+    agent: envAgent ? parseAgentCommand(envAgent) : [...DEFAULT_AGENT],
+    agentRaw: envAgent ?? DEFAULT_AGENT.join(' '),
     attempts: DEFAULT_ATTEMPTS,
     isolate: true,
     worktreeRoot: null,
@@ -346,9 +349,9 @@ function isKnownFlag(value) {
 }
 
 /** Parse CLI argv (without `node eval/ab.mjs`). Throws on invalid usage. */
-export function parseArgs(argv = []) {
+export function parseArgs(argv = [], { env = process.env } = {}) {
   if (!Array.isArray(argv)) throw new TypeError('parseArgs requires an array of arguments')
-  const options = defaultOptions()
+  const options = defaultOptions(env)
   let index = 0
   while (index < argv.length) {
     const token = String(argv[index])

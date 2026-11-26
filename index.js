@@ -8,6 +8,7 @@
  */
 
 import {
+  bootstrapCodingBank,
   fetchBankStats,
   listPages,
   recallMemories,
@@ -71,7 +72,7 @@ import { DEFAULT_VIEW_CONTEXT_MESSAGES } from './lib/view.js'
 const PLUGIN = 'hindsight-tuner'
 const ACTIONS = ['status', 'tune', 'revert', 'probe', 'suggest', 'enable', 'disable']
 const READ_ACTIONS = ['status', 'probe', 'suggest']
-const COMMAND_ACTIONS = [...ACTIONS, 'seed', 'pages', 'recall', 'reflect', 'retain', 'stats']
+const COMMAND_ACTIONS = [...ACTIONS, 'init', 'seed', 'pages', 'recall', 'reflect', 'retain', 'stats']
 
 export const TUNER_ENV_KEYS = Object.freeze({
   viewPolicy: 'HINDSIGHT_TUNER_VIEW_POLICY',
@@ -651,6 +652,66 @@ export function apply(ctx, rawConfig) {
       record({ event: 'autotune_enabled' })
       return 'Auto-tune enabled. It applies from this turn on; /hindsight tune applies the lean profile right away.'
     }
+    if (action === 'init') {
+      const integration = findIntegration()
+      const lane = resolveActiveLane(settings, integration)
+      if (lane === 'off') return 'Refused: memory governance is disabled (memoryLane: off).'
+      if (lane === 'missing-external') {
+        return 'Refused: memoryLane is set to external and @vectorize-io/hindsight-coding-agents is not installed.'
+      }
+      const target = resolveRuntimeTarget(cwd)
+      if (target.server.disabled) {
+        return target.isOptedOut
+          ? 'Refused: this directory is outside optInOnly/optInPaths.'
+          : 'Refused: Hindsight is disabled in the shared config (disabled: true).'
+      }
+      if (process.env.HINDSIGHT_RETAIN_SESSIONS === 'false' || target.effective.retainSessions === false) {
+        return 'Refused: session retention is disabled (HINDSIGHT_RETAIN_SESSIONS=false or retainSessions: false).'
+      }
+      const limit = options.limit ?? (Number.isFinite(target.effective.seedLimit) ? target.effective.seedLimit : 30)
+      if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+        return 'Refused: --limit must be an integer 1..500.'
+      }
+      const scopes = target.effective.observationScopes ?? settings.observationScopes
+      const boot = await bootstrapCodingBank({
+        apiUrl: target.server.apiUrl,
+        apiToken: target.server.token,
+        bankId: target.resolution.bank,
+        project: target.project.name,
+        config: { ...target.effective, observationScopes: scopes },
+      })
+      if (!boot.ok) return `Init failed (${boot.status}): ${boot.error}`
+
+      const tags = scopes === 'per_source' ? ['source:git', 'source:dsh', 'harness:dsh'] : ['source:git', 'harness:dsh']
+      const seedRes = await seedBankFromGit({
+        apiUrl: target.server.apiUrl,
+        apiToken: target.server.token,
+        bankId: target.resolution.bank,
+        cwd,
+        limit,
+        tags,
+        observationScopes: scopes,
+      })
+      if (!seedRes.ok && seedRes.reason !== 'not-git' && seedRes.reason !== 'empty') {
+        return `Init failed during git seed: ${seedRes.error}`
+      }
+      record({
+        event: 'builtin_init_ok',
+        bank: target.resolution.bank,
+        createdPages: boot.createdPages.length,
+        seeded: seedRes.ok ? seedRes.count : 0,
+      })
+      const parts = [
+        boot.configSynced ? 'bank manifest synced' : 'bank manifest ready',
+        boot.createdPages.length > 0
+          ? `created ${boot.createdPages.length} core page(s) (${boot.createdPages.map((p) => p.name).join(', ')})`
+          : `core pages already present (${boot.existingPages} total)`,
+        seedRes.ok
+          ? `seeded ${seedRes.count} git commit(s)`
+          : `git seed skipped (${seedRes.reason})`,
+      ]
+      return `Initialized bank ${target.resolution.bank}: ${parts.join(' · ')}.`
+    }
     if (action === 'seed') {
       const integration = findIntegration()
       const lane = resolveActiveLane(settings, integration)
@@ -975,7 +1036,7 @@ export function apply(ctx, rawConfig) {
     try {
       commandCtx.commands.register({
         name: 'hindsight',
-        description: 'Hindsight memory: status [--json] | stats [--json] | pages [query] [--limit N] | recall <query> [--limit N] | reflect <query> | retain <note> | seed [--limit N] | tune [--dry-run] [--overwrite] [--cap N] | revert [--dry-run] | probe | suggest | enable | disable',
+        description: 'Hindsight memory: status [--json] | stats [--json] | init [--limit N] | pages [query] [--limit N] | recall <query> [--limit N] | reflect <query> | retain <note> | seed [--limit N] | tune [--dry-run] [--overwrite] [--cap N] | revert [--dry-run] | probe | suggest | enable | disable',
         async handler(invocation) {
           const parts = String(invocation?.rawInput ?? '').trim().split(/\s+/).filter(Boolean)
           const action = parts.shift() || 'status'
@@ -990,8 +1051,8 @@ export function apply(ctx, rawConfig) {
           if ((flags.overwrite || flags.cap !== undefined) && action !== 'tune') {
             return { kind: 'error', text: 'Options --overwrite and --cap are only valid for tune.' }
           }
-          if (flags.limit !== undefined && !['seed', 'pages', 'recall'].includes(action)) {
-            return { kind: 'error', text: 'Option --limit is only valid for seed, pages, or recall.' }
+          if (flags.limit !== undefined && !['init', 'seed', 'pages', 'recall'].includes(action)) {
+            return { kind: 'error', text: 'Option --limit is only valid for init, seed, pages, or recall.' }
           }
           if (flags.dryRun && !['tune', 'revert'].includes(action)) {
             return { kind: 'error', text: 'Option --dry-run is only valid for tune or revert.' }
@@ -1010,7 +1071,7 @@ export function apply(ctx, rawConfig) {
               query: flags.positional.join(' '),
               json: flags.json === true,
             })
-            const isError = /^(?:Refused:|Seed failed:|Pages failed|Recall failed|Reflect failed|Retain failed|Stats failed)/.test(text)
+            const isError = /^(?:Refused:|Init failed|Seed failed:|Pages failed|Recall failed|Reflect failed|Retain failed|Stats failed)/.test(text)
             return { kind: isError ? 'error' : 'success', text }
           } catch (error) {
             return { kind: 'error', text: String(error?.message ?? error) }

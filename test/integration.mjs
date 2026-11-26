@@ -179,7 +179,7 @@ const mockServer = createServer((req, res) => {
       return
     }
 
-    if (route.startsWith('/pages/')) {
+    if (route.startsWith('/pages/') && route !== '/pages/folders' && req.method === 'GET') {
       const pageId = decodeURIComponent(route.slice('/pages/'.length))
       const page = pagesStore.find((entry) => entry.id === pageId)
       if (!page) {
@@ -230,6 +230,24 @@ const mockServer = createServer((req, res) => {
       return
     }
 
+    if (route === '/operations' && req.method === 'GET') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ operations: [] }))
+      return
+    }
+
+    if (route === '/documents' && req.method === 'GET') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ items: [{ id: 'doc-1' }], total: 1 }))
+      return
+    }
+
+    if (route === '/config' && req.method === 'GET') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ overrides: {} }))
+      return
+    }
+
     if (route === '/pages/folders' && req.method === 'POST') {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ id: 'folder-initiatives', name: parsedBody?.name ?? 'Initiatives' }))
@@ -237,13 +255,17 @@ const mockServer = createServer((req, res) => {
     }
 
     if (route === '/pages' && req.method === 'POST') {
-      const mintedId = 'kp-initiative-01'
+      const pageName = parsedBody?.name ?? 'Initiative'
+      const mintedId = parsedBody?.parent_id
+        ? 'kp-initiative-01'
+        : `kp-core-${pageName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
+      const mintedPath = parsedBody?.parent_id ? `Initiatives/${pageName}` : pageName
       pagesStore.push({
         id: mintedId,
-        name: parsedBody?.name ?? 'Initiative',
-        path: `Initiatives/${parsedBody?.name ?? 'Initiative'}`,
+        name: pageName,
+        path: mintedPath,
         description: parsedBody?.source_query ?? '',
-        content: `Tracking ${parsedBody?.name ?? 'Initiative'}`,
+        content: `Tracking ${pageName}`,
       })
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ page_id: mintedId, id: mintedId }))
@@ -344,7 +366,7 @@ try {
     repeatPolicy: 'skip',
   })
 
-  // Verify all 9 tools are registered in standalone mode (tuner first)
+  // Verify all 11 tools are registered in standalone mode (tuner first)
   assert.deepEqual(
     standalone.tools.map((t) => t.name),
     [
@@ -354,11 +376,13 @@ try {
       'hindsight_read_page',
       'hindsight_recall',
       'hindsight_reflect',
+      'hindsight_sync_status',
+      'hindsight_diagnose',
       'hindsight_retain',
       'hindsight_ingest_document',
       'hindsight_capture_initiative',
     ],
-    'standalone mode registers tuner + all 8 native Hindsight tools',
+    'standalone mode registers tuner + all 10 native Hindsight tools',
   )
 
   const standaloneEvents = []
@@ -423,6 +447,17 @@ try {
   const reflectOut = await callTool('hindsight_reflect', { query: 'How is budget enforced?' })
   assert.match(reflectOut, /Synthesized reflection/, 'hindsight_reflect returns synthesis')
 
+  const syncOut = await callTool('hindsight_sync_status', {})
+  assert.match(syncOut, /synced=yes/, 'hindsight_sync_status reports synchronized bank')
+  assert.match(syncOut, /active_operations:\s*0/, 'hindsight_sync_status counts active operations')
+
+  const diagOut = await callTool('hindsight_diagnose', {})
+  const diagParsed = JSON.parse(diagOut)
+  assert.equal(diagParsed.harness, 'dsh')
+  assert.equal(diagParsed.lane, 'builtin')
+  assert.equal(diagParsed.config.api_token_configured, true)
+  assert.ok(!diagOut.includes('standalone-test-token'), 'hindsight_diagnose never exposes secret apiToken values')
+
   const retainOut = await callTool('hindsight_retain', { content: 'Keep standalone mode tested', context: 'testing' })
   assert.match(retainOut, /Retained memory item into bank/, 'hindsight_retain writes to /memories')
   assert.equal(retainedBatches.length, 1)
@@ -470,6 +505,17 @@ try {
   assert.equal(retainedBatches.length, 4, 'seed sent 2 commits to /memories after retain, ingest, and initiative')
   assert.equal(retainedBatches[3].items.length, 2)
   assert.equal(retainedBatches[3].items[0].strategy, 'git')
+
+  const initCmdRes = await cmd.handler({ rawInput: 'init --limit 2', agent: { session } })
+  assert.equal(initCmdRes.kind, 'success')
+  assert.match(initCmdRes.text, /created 4 core page\(s\)/, '/hindsight init bootstraps missing core coding pages')
+  assert.match(initCmdRes.text, /seeded 2 git commit\(s\)/, '/hindsight init seeds recent git history')
+  assert.equal(pagesStore.length, 7, 'init added 4 core pages on top of initial 2 + 1 initiative page')
+
+  const initIdempotentRes = await cmd.handler({ rawInput: 'init --limit 1', agent: { session } })
+  assert.equal(initIdempotentRes.kind, 'success')
+  assert.match(initIdempotentRes.text, /core pages already present/, 'second /hindsight init is idempotent for core pages')
+  assert.equal(pagesStore.length, 7, 'idempotent init does not duplicate core pages')
 
   const statusText = await callTool('hindsight_tuner', { action: 'status' })
   assert.match(statusText, /lane\s+built-in Hindsight engine \(standalone · tools on\)/)
@@ -564,7 +610,7 @@ try {
   const cmdStats = await cmd.handler({ rawInput: 'stats', agent: { session } })
   assert.equal(cmdStats.kind, 'success')
   assert.match(cmdStats.text, /memories nodes 42 · observations 18 · links 65/)
-  assert.match(cmdStats.text, /pages\s+3 page\(s\)/)
+  assert.match(cmdStats.text, /pages\s+7 page\(s\)/)
 
   const cmdStatsJson = await cmd.handler({ rawInput: 'stats --json', agent: { session } })
   assert.equal(cmdStatsJson.kind, 'success')
@@ -676,14 +722,15 @@ try {
       pageTriggerType: 'threshold',
       toolGuideExtra: 'Extra guide: prefer pageId anchors.',
     }, null, 2))
+    const syncedBefore = syncedConfigs.length
     const syncTurn = await waterfall(standalone, 'agent/pre-step', {
       agent: { session: { header: { id: 'sync-cfg-session', cwd: repoDir, origin: 'main' } } },
     }, async () => ({ kind: 'enter', messages: [userTurn1] }))
     const syncText = injectedText(syncTurn.messages, 'manageBankConfig + toolGuideExtra turn')
     assert.ok(syncText.includes('Extra guide: prefer pageId anchors.'), 'toolGuideExtra appended on first turn')
-    await waitFor(() => syncedConfigs.length === 1, { label: 'manageBankConfig PATCH /config' })
-    assert.equal(syncedConfigs[0].observation_scopes, 'per_source')
-    assert.equal(syncedConfigs[0].page_trigger_type, 'threshold')
+    await waitFor(() => syncedConfigs.length === syncedBefore + 1, { label: 'manageBankConfig PATCH /config' })
+    assert.equal(syncedConfigs.at(-1).observation_scopes, 'per_source')
+    assert.equal(syncedConfigs.at(-1).page_trigger_type, 'threshold')
 
     // Reserve an unused local port and verify standalone `serverMode: 'daemon'` auto-wakes hindsight-embed
     const portFinder = createServer()

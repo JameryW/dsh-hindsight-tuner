@@ -25,7 +25,8 @@
         injectTimeoutMs: 7000
         observationScopes: per_source
         recallMaxTokens: 2000
-        tokenBudgetMode: fast
+        # calibrated: built-in zero-dependency BPE-calibrated estimator (no js-tiktoken required).
+        tokenBudgetMode: calibrated
         # adaptive: pick a per-turn ceiling from this table (never above
         # maxInjectTokens). off: every recall gets the full cap.
         budgetPolicy: adaptive
